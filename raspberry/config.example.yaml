@@ -1,0 +1,67 @@
+device: raspberrypi4
+interval_minutes: 15
+run_immediately: true
+server:
+  upload_url: https://monitor.example.com/api/v1/upload
+  api_key: CHANGE_ME
+  timeout_seconds: 30
+  verify_tls: true
+outbox_db: ./data/outbox.db
+collectors:
+  - type: mock
+    enabled: true
+    system: x1
+    values:
+      battery_soc: 82
+      grid_power: -1200
+      pv_power: 3400
+  - type: json_http
+    enabled: false
+    system: gardena
+    url: https://example/api/status
+    headers:
+      Authorization: Bearer CHANGE_ME
+    mapping:
+      mower_state: status.state
+      battery: status.battery.percent
+    metadata:
+      location: garden
+  - type: json_http
+    enabled: false
+    system: polygon
+    url: https://api.polygon.io/example
+    params:
+      apiKey: CHANGE_ME
+    mapping:
+      price: results.0.c
+  # Energomonitor cloud API collector. First create an API token in the
+  # Energomonitor application and run the discovery command documented in README.md.
+  - type: energomonitor
+    enabled: false
+    system: energomonitor
+    base_url: https://api.energomonitor.com/v1
+    access_token: CHANGE_ME_ENERGOMONITOR_TOKEN
+    feed_id: CHANGE_ME_FEED_ID
+    timeout_seconds: 20
+    lookback_seconds: 3600
+    stale_after_seconds: 1800
+    fail_on_stale: true
+    streams:
+      # Recommended: copy stable IDs from the discovery command.
+      power_w:
+        stream_id: CHANGE_ME_POWER_STREAM_ID
+        unit: W
+        decimals: 1
+      energy_kwh:
+        stream_id: CHANGE_ME_ENERGY_STREAM_ID
+        unit: kWh
+        decimals: 3
+      # A selector can be used temporarily when the stream ID is unknown.
+      # The collector will fail if zero or multiple streams match.
+      # room_temperature_c:
+      #   title: Living room temperature
+      #   medium: temperature
+      #   unit: °C
+      #   decimals: 1
+    metadata:
+      location: home
