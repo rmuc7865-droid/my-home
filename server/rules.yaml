@@ -1,0 +1,21 @@
+rules:
+  - name: Battery Low
+    system: x1
+    field: battery_soc
+    operator: ">="
+    value: 20
+    severity: critical
+    message: "X1 battery state of charge is below 20%."
+  - name: PV Data Present
+    system: x1
+    field: pv_power
+    operator: exists
+    severity: warning
+    message: "X1 PV power value is missing."
+  - name: Gardena Battery
+    system: gardena
+    field: battery
+    operator: ">="
+    value: 15
+    severity: warning
+    message: "Gardena battery is below 15%."
