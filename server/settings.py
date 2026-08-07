@@ -8,8 +8,8 @@ class Settings(BaseSettings):
 
     api_key: str = "CHANGE_ME"
     database_url: str = "sqlite:///./data/monitor.db"
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
+    telegram_bot_token: str = "8855552265:AAFqhSzXM_8Z9Bj72DAfoVu1NN5o8lwIEW8"
+    telegram_chat_id: str = "8655503365"
     alert_cooldown_minutes: int = 60
     rules_file: str = "server/rules.yaml"
 
