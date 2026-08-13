@@ -14,3 +14,4 @@ config/tickers.full.json
 config/international_tickers.json
 config/crypto_tickers.json
 config/unresolved_tickers.json
+config/watchlist_membership.json
