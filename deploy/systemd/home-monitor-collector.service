@@ -1,1 +1,16 @@
+[Unit]
+Description=Home Monitor Raspberry Pi Collector
+After=network-online.target
+Wants=network-online.target
 
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/opt/home-monitor
+Environment=PYTHONPATH=/opt/home-monitor
+ExecStart=/opt/home-monitor/.venv/bin/python -m raspberry.main --config /opt/home-monitor/raspberry/config.yaml
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
