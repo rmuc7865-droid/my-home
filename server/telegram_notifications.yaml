@@ -1,0 +1,27 @@
+dashboard_url: "https://dashboard.julys-consulting.com/"
+
+poll_seconds: 60
+
+recipients:
+  - name: "Robert"
+    watchlist: "robert"
+    bot_token_env: TELEGRAM_BOT_TOKEN_USER1
+    chat_id: "8655503365"
+
+  - name: "Gabi"
+    watchlist: "gabi"
+    bot_token_env: TELEGRAM_BOT_TOKEN_USER2
+    chat_id: "8370155930"
+
+buy:
+  enabled: true
+  highb_threshold_percent: 3.0
+  baseline_hours: 2
+  baseline_tolerance_minutes: 30
+
+sell:
+  enabled: true
+  rule1_tolerance_minutes: 30
+
+alerts:
+  enabled: true

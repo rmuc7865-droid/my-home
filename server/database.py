@@ -48,6 +48,23 @@ class Alert(Base):
     telegram_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     measurement: Mapped[Measurement] = relationship(back_populates="alerts")
 
+class SimulationTrade(Base):
+    __tablename__ = "simulation_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    ticker_name: Mapped[str] = mapped_column(String(256), default="")
+    buy_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    buy_price: Mapped[float] = mapped_column(Float)
+    sell_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    sell_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    relative_difference: Mapped[float | None] = mapped_column(Float, nullable=True)
+    absolute_difference: Mapped[float | None] = mapped_column(Float, nullable=True)
+    buy_telegram_sent: Mapped[bool] = mapped_column(Boolean, default=True)
+    sell_telegram_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)

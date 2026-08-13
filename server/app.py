@@ -4,13 +4,13 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from shared.models import UploadBatch, UploadResult
-from .database import Alert, Measurement, SessionLocal, init_db
+from shared.models import TradeSignal, UploadBatch, UploadResult
+from .database import Alert, Measurement, SimulationTrade, SessionLocal, init_db
 from .rules import evaluate_rule, load_rules
 from .settings import settings
 from .telegram import send_alert
@@ -115,7 +115,7 @@ async def upload(batch: UploadBatch, db: Session = Depends(get_db)) -> UploadRes
 @app.get("/api/v1/measurements", dependencies=[Depends(require_api_key)])
 def measurements(
     system: str | None = None,
-    limit: int = Query(default=500, ge=1, le=5000),
+    limit: int = Query(default=500, ge=1, le=50000),
     db: Session = Depends(get_db),
 ) -> list[dict]:
     statement = select(Measurement).order_by(desc(Measurement.timestamp)).limit(limit)
@@ -168,3 +168,160 @@ def acknowledge(alert_id: int, db: Session = Depends(get_db)) -> dict[str, bool]
     alert.acknowledged = True
     db.commit()
     return {"acknowledged": True}
+
+@app.post("/api/v1/simulation/signals", dependencies=[Depends(require_api_key)])
+def record_simulation_signal(
+    signal: TradeSignal = Body(...),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Record a BUY/SELL signal after its Telegram send attempt.
+
+    Only Telegram messages reported as successfully sent are included in simulation
+    results. SELL closes the oldest open BUY for the same ticker.
+    """
+    if not signal.telegram_sent:
+        return {"recorded": False, "reason": "telegram_not_sent"}
+
+    now = datetime.now(timezone.utc)
+    ticker = signal.ticker.upper().strip()
+    if signal.side == "BUY":
+        existing_open = db.scalar(
+            select(SimulationTrade)
+            .where(
+                SimulationTrade.ticker == ticker,
+                SimulationTrade.sell_time.is_(None),
+                SimulationTrade.buy_telegram_sent.is_(True),
+            )
+            .order_by(SimulationTrade.buy_time.asc())
+            .limit(1)
+        )
+        if existing_open:
+            return {
+                "recorded": False,
+                "reason": "already_open",
+                "trade_id": existing_open.id,
+                "ticker": ticker,
+            }
+
+        trade = SimulationTrade(
+            ticker=ticker,
+            ticker_name=signal.ticker_name.strip(),
+            buy_time=signal.timestamp,
+            buy_price=signal.price,
+            buy_telegram_sent=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(trade)
+        db.commit()
+        db.refresh(trade)
+        return {"recorded": True, "trade_id": trade.id, "status": "OPEN"}
+
+    trade = db.scalar(
+        select(SimulationTrade)
+        .where(
+            SimulationTrade.ticker == ticker,
+            SimulationTrade.sell_time.is_(None),
+            SimulationTrade.buy_telegram_sent.is_(True),
+        )
+        .order_by(SimulationTrade.buy_time.asc())
+        .limit(1)
+    )
+    if not trade:
+        raise HTTPException(status_code=409, detail=f"No open BUY found for {ticker}")
+    buy_time = trade.buy_time
+    if buy_time.tzinfo is None:
+        buy_time = buy_time.replace(tzinfo=timezone.utc)
+    if signal.timestamp < buy_time:
+        raise HTTPException(status_code=422, detail="SELL timestamp cannot be before BUY timestamp")
+
+    trade.sell_time = signal.timestamp
+    trade.sell_price = signal.price
+
+    trade.relative_difference = (
+        (
+            signal.price / trade.buy_price
+        ) - 1
+    ) * 100
+
+    if signal.absolute_difference_eur is not None:
+        trade.absolute_difference = (
+            signal.absolute_difference_eur
+        )
+    else:
+        trade.absolute_difference = (
+            signal.price - trade.buy_price
+        )
+
+    trade.sell_telegram_sent = True
+    trade.updated_at = now
+    if signal.ticker_name.strip() and not trade.ticker_name:
+        trade.ticker_name = signal.ticker_name.strip()
+    db.commit()
+    db.refresh(trade)
+    return {
+        "recorded": True,
+        "trade_id": trade.id,
+        "status": "CLOSED",
+        "relative_difference": trade.relative_difference,
+        "absolute_difference": trade.absolute_difference,
+    }
+
+
+@app.get("/api/v1/simulation/open-tickers", dependencies=[Depends(require_api_key)])
+def simulation_open_tickers(db: Session = Depends(get_db)) -> dict[str, list[str]]:
+    """Return tickers that already have a Telegram-sent BUY without a SELL.
+
+    BUY candidate generation should exclude these tickers before composing the
+    next Telegram BUY message. A ticker becomes eligible again after its SELL
+    signal closes the open trade.
+    """
+    tickers = list(
+        db.scalars(
+            select(SimulationTrade.ticker)
+            .where(
+                SimulationTrade.sell_time.is_(None),
+                SimulationTrade.buy_telegram_sent.is_(True),
+            )
+            .distinct()
+            .order_by(SimulationTrade.ticker.asc())
+        ).all()
+    )
+    return {"tickers": tickers}
+
+@app.get("/api/v1/simulation", dependencies=[Depends(require_api_key)])
+def simulation(
+    days: int = Query(default=365, ge=1, le=3660),
+    include_open: bool = Query(default=True),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    statement = (
+        select(SimulationTrade)
+        .where(
+            SimulationTrade.buy_time >= cutoff,
+            SimulationTrade.buy_telegram_sent.is_(True),
+        )
+        .order_by(desc(SimulationTrade.buy_time))
+    )
+    if not include_open:
+        statement = statement.where(
+            SimulationTrade.sell_time.is_not(None),
+            SimulationTrade.sell_telegram_sent.is_(True),
+        )
+    rows = db.scalars(statement).all()
+    return [
+        {
+            "id": row.id,
+            "Ticker": row.ticker,
+            "TickerName": row.ticker_name,
+            "BuyTime": row.buy_time,
+            "SellTime": row.sell_time,
+            "BuyPrice": row.buy_price,
+            "SellPrice": row.sell_price,
+            "RelativeDifference": row.relative_difference,
+            "AbsoluteDifference": row.absolute_difference,
+            "Status": "CLOSED" if row.sell_time is not None and row.sell_telegram_sent else "OPEN",
+        }
+        for row in rows
+    ]

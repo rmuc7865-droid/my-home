@@ -35,3 +35,29 @@ class UploadResult(BaseModel):
     accepted: int
     duplicates: int
     alerts_created: int
+
+class TradeSignal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    side: str
+    ticker: str = Field(min_length=1, max_length=32)
+    ticker_name: str = Field(default="", max_length=256)
+    timestamp: datetime
+    price: float = Field(gt=0)
+    absolute_difference_eur: float | None = None
+    telegram_sent: bool = True
+
+    @field_validator("side")
+    @classmethod
+    def side_must_be_buy_or_sell(cls, value: str) -> str:
+        normalized = value.upper().strip()
+        if normalized not in {"BUY", "SELL"}:
+            raise ValueError("side must be BUY or SELL")
+        return normalized
+
+    @field_validator("timestamp")
+    @classmethod
+    def signal_timestamp_must_be_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("timestamp must include a timezone")
+        return value.astimezone(timezone.utc)

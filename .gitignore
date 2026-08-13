@@ -1,1 +1,8 @@
 .env
+__pycache__/
+*.pyc
+*.bak
+*.before-*
+config/zero.csv
+config/zero.json
+config/watchlist_membership.json

@@ -1,43 +1,53 @@
 services:
-
   api:
-
     build: .
-
     command: uvicorn server.app:app --host 0.0.0.0 --port 8000
-
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     env_file: .env
-
     volumes:
-
       - monitor-data:/data
-
       - ./server/rules.yaml:/app/server/rules.yaml:ro
-
     restart: unless-stopped
-
     ports:
-
-      - "127.0.0.1:8000:8000"
+      - "100.78.241.4:8000:8000"
 
   dashboard:
-
     build: .
-
     command: streamlit run dashboard/streamlit_app.py --server.address 0.0.0.0 --server.port 8501
-
     env_file: .env
-
     depends_on:
-
       - api
-
     restart: unless-stopped
-
     ports:
-
       - "127.0.0.1:8501:8501"
 
-volumes:
+  telegram-notifier:
+    build: .
+    command: python -m server.telegram_notifier
+    env_file: .env
+    environment:
+      TELEGRAM_NOTIFICATIONS_CONFIG: /app/server/telegram_notifications.yaml
+      TELEGRAM_NOTIFICATIONS_STATE: /data/telegram_notifier_state.json
+    volumes:
+      - monitor-data:/data
+      - ./server/telegram_notifications.yaml:/app/server/telegram_notifications.yaml:ro
+      - ./config/watchlist_membership.json:/app/config/watchlist_membership.json:ro
+      - ./config/zero.json:/app/config/zero.json:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
+volumes:
   monitor-data:

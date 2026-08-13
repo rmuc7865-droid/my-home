@@ -1,0 +1,307 @@
+[
+  {
+    "Ticker": "PLTR",
+    "ISIN": "US69608A1088",
+    "Name": "Palantir"
+  },
+  {
+    "Ticker": "EXI2",
+    "ISIN": "DE0006289382",
+    "Name": "iShares Dow Jones Global Titans 50 UCITS ETF (DE)"
+  },
+  {
+    "Ticker": "INOD",
+    "ISIN": "US4576422053",
+    "Name": "Innodata Inc."
+  },
+  {
+    "Ticker": "CRSP",
+    "ISIN": "CH0334081137",
+    "Name": "CRISPR Therapeutics AG"
+  },
+  {
+    "Ticker": "ENR",
+    "ISIN": "DE000ENER6Y0",
+    "Name": "Siemens Energy AG"
+  },
+  {
+    "Ticker": "HOOD",
+    "ISIN": "US7707001027",
+    "Name": "Robinhood"
+  },
+  {
+    "Ticker": "KKR",
+    "ISIN": "US48251W1045",
+    "Name": "KKR & Co Inc."
+  },
+  {
+    "Ticker": "DEFI",
+    "ISIN": "CA2449161025",
+    "Name": "DeFi Technologies Inc Registered Shs"
+  },
+  {
+    "Ticker": "ORCL",
+    "ISIN": "US68389X1054",
+    "Name": "Oracle Corp."
+  },
+  {
+    "Ticker": "LDO",
+    "ISIN": "IT0003856405",
+    "Name": "Leonardo S.p.a."
+  },
+  {
+    "Ticker": "BAMI",
+    "ISIN": "IT0005218380",
+    "Name": "Banco BPM"
+  },
+  {
+    "Ticker": "GOOGL",
+    "ISIN": "US02079K3059",
+    "Name": "Alphabet A (ex Google)"
+  },
+  {
+    "Ticker": "META",
+    "ISIN": "US30303M1027",
+    "Name": "Meta Platforms (ex Facebook)"
+  },
+  {
+    "Ticker": "1211",
+    "ISIN": "CNE100000296",
+    "Name": "BYD Co. Ltd."
+  },
+  {
+    "Ticker": "BRK.B",
+    "ISIN": "US0846707026",
+    "Name": "Berkshire Hathaway Inc. B"
+  },
+  {
+    "Ticker": "6857",
+    "ISIN": "JP3122400009",
+    "Name": "Advantest Corp."
+  },
+  {
+    "Ticker": "COIN",
+    "ISIN": "US19260Q1076",
+    "Name": "Coinbase"
+  },
+  {
+    "Ticker": "BLK",
+    "ISIN": "US09290D1019",
+    "Name": "BlackRock Inc Registered Shs"
+  },
+  {
+    "Ticker": "NTNX",
+    "ISIN": "US67059N1081",
+    "Name": "Nutanix Inc (A)"
+  },
+  {
+    "Ticker": "1913",
+    "ISIN": "IT0003874101",
+    "Name": "Prada Spa"
+  },
+  {
+    "Ticker": "9983",
+    "ISIN": "JP3802300008",
+    "Name": "Fast Retailing Co. Ltd."
+  },
+  {
+    "Ticker": "GUBRA",
+    "ISIN": "DK0062266474",
+    "Name": "Gubra A-S Bearer and-or registered Shs"
+  },
+  {
+    "Ticker": "TTWO",
+    "ISIN": "US8740541094",
+    "Name": "Take Two"
+  },
+  {
+    "Ticker": "XYZ",
+    "ISIN": "US8522341036",
+    "Name": "Block (ex Square)"
+  },
+  {
+    "Ticker": "A1OS",
+    "ISIN": "DE0005110001",
+    "Name": "All for One Group AG"
+  },
+  {
+    "Ticker": "CRWD",
+    "ISIN": "US22788C1053",
+    "Name": "CrowdStrike"
+  },
+  {
+    "Ticker": "LLY",
+    "ISIN": "US5324571083",
+    "Name": "Eli Lilly"
+  },
+  {
+    "Ticker": "RDC",
+    "ISIN": "NL0012044747",
+    "Name": "Redcare Pharmacy (ex Shop Apotheke)"
+  },
+  {
+    "Ticker": "HUT",
+    "ISIN": "US44812J1043",
+    "Name": "Hut 8 Corp Registered Shs"
+  },
+  {
+    "Ticker": "MC",
+    "ISIN": "FR0000121014",
+    "Name": "LVMH Moet Hennessy Louis Vuitton S.A."
+  },
+  {
+    "Ticker": "IOS",
+    "ISIN": "DE000A3E00M1",
+    "Name": "IONOS"
+  },
+  {
+    "Ticker": "ARM",
+    "ISIN": "US0420682058",
+    "Name": "Arm Holdings"
+  },
+  {
+    "Ticker": "LMT",
+    "ISIN": "US5398301094",
+    "Name": "Lockheed Martin Corp."
+  },
+  {
+    "Ticker": "SWKS",
+    "ISIN": "US83088M1027",
+    "Name": "Skyworks Solutions Inc."
+  },
+  {
+    "Ticker": "SMHN",
+    "ISIN": "DE000A1K0235",
+    "Name": "SUSS MicroTec SE (ex SÜSS MicroTec)"
+  },
+  {
+    "Ticker": "LRCX",
+    "ISIN": "US5128073062",
+    "Name": "Lam Research Corp."
+  },
+  {
+    "Ticker": "COK",
+    "ISIN": "DE0005419105",
+    "Name": "CANCOM SE"
+  },
+  {
+    "Ticker": "R3NK",
+    "ISIN": "DE000RENK730",
+    "Name": "RENK"
+  },
+  {
+    "Ticker": "HXSCL",
+    "ISIN": "US78392B1070",
+    "Name": "SK hynix Inc (spons. GDRs)"
+  },
+  {
+    "Ticker": "ASML",
+    "ISIN": "NL0010273215",
+    "Name": "ASML NV"
+  },
+  {
+    "Ticker": "SSDIY",
+    "ISIN": "US7960542030",
+    "Name": "Samsung SDI Co. Ltd."
+  },
+  {
+    "Ticker": "NOVO-B",
+    "ISIN": "DK0062498333",
+    "Name": "Novo Nordisk"
+  },
+  {
+    "Ticker": "MSTR",
+    "ISIN": "US5949724083",
+    "Name": "Strategy (ex MicroStrategy)"
+  },
+  {
+    "Ticker": "AVGO",
+    "ISIN": "US11135F1012",
+    "Name": "Broadcom"
+  },
+  {
+    "Ticker": "ADE",
+    "ISIN": "DE000A1TNV91",
+    "Name": "Bitcoin Group SE"
+  },
+  {
+    "Ticker": "BTC",
+    "ISIN": "BTC",
+    "Name": "Bitcoin"
+  },
+  {
+    "Ticker": "QBTS",
+    "ISIN": "US26740W1099",
+    "Name": "D-Wave Quantum"
+  },
+  {
+    "Ticker": "GME",
+    "ISIN": "US36467W1099",
+    "Name": "GameStop Corp"
+  },
+  {
+    "Ticker": "NFLX",
+    "ISIN": "US64110L1061",
+    "Name": "Netflix Inc."
+  },
+  {
+    "Ticker": "AMZN",
+    "ISIN": "US0231351067",
+    "Name": "Amazon"
+  },
+  {
+    "Ticker": "HFG",
+    "ISIN": "DE000A161408",
+    "Name": "HelloFresh"
+  },
+  {
+    "Ticker": "JPM",
+    "ISIN": "US46625H1005",
+    "Name": "JPMorgan Chase & Co."
+  },
+  {
+    "Ticker": "MRVL",
+    "ISIN": "US5738741041",
+    "Name": "Marvell Technology"
+  },
+  {
+    "Ticker": "NET",
+    "ISIN": "US18915M1071",
+    "Name": "Cloudflare"
+  },
+  {
+    "Ticker": "SNOW",
+    "ISIN": "US8334451098",
+    "Name": "Snowflake"
+  },
+  {
+    "Ticker": "GOOG",
+    "ISIN": "US02079K1079",
+    "Name": "Alphabet C (ex Google)"
+  },
+  {
+    "Ticker": "HAG",
+    "ISIN": "DE000HAG0005",
+    "Name": "HENSOLDT"
+  },
+  {
+    "Ticker": "AAPL",
+    "ISIN": "US0378331005",
+    "Name": "Apple Inc."
+  },
+  {
+    "Ticker": "MSFT",
+    "ISIN": "US5949181045",
+    "Name": "Microsoft Corp."
+  },
+  {
+    "Ticker": "NVDA",
+    "ISIN": "US67066G1040",
+    "Name": "NVIDIA Corp."
+  },
+  {
+    "Ticker": "TSLA",
+    "ISIN": "US88160R1014",
+    "Name": "Tesla"
+  }
+]
