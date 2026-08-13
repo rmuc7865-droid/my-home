@@ -8,6 +8,7 @@ Type=simple
 User=admin
 WorkingDirectory=/opt/home-monitor
 Environment=PYTHONPATH=/opt/home-monitor
+EnvironmentFile=-/opt/home-monitor/.env
 ExecStart=/opt/home-monitor/.venv/bin/python -m raspberry.main --config /opt/home-monitor/raspberry/config.yaml
 Restart=on-failure
 RestartSec=10
