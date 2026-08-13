@@ -1,15 +1,15 @@
-device: raspberrypi4
+device: pi1
 interval_minutes: 15
 run_immediately: true
 server:
-  upload_url: https://monitor.example.com/api/v1/upload
+  upload_url: http://100.78.241.4:8000/api/v1/upload
   api_key: CHANGE_ME
   timeout_seconds: 30
-  verify_tls: true
-outbox_db: ./data/outbox.db
+  verify_tls: false
+outbox_db: /opt/home-monitor/data/outbox.db
 collectors:
   - type: mock
-    enabled: true
+    enabled: false
     system: x1
     values:
       battery_soc: 82
@@ -26,14 +26,29 @@ collectors:
       battery: status.battery.percent
     metadata:
       location: garden
-  - type: json_http
-    enabled: false
+  - type: polygon
+    enabled: true
     system: polygon
-    url: https://api.polygon.io/example
-    params:
-      apiKey: CHANGE_ME
-    mapping:
-      price: results.0.c
+    ticker_file: /opt/home-monitor/config/tickers.json
+    base_url: https://api.polygon.io
+    api_key_env: POLYGON_API_KEY
+    multiplier: 15
+    timespan: minute
+    adjusted: true
+    timeout_seconds: 30
+    liquidity_target_eur: 10000
+    liquidity_participation_rate: 0.10
+    liquidity_window_seconds: 1800
+  - type: massive_crypto
+    enabled: true
+    system: crypto
+    ticker_file: /opt/home-monitor/config/crypto_tickers.json
+    base_url: https://api.polygon.io
+    api_key_env: POLYGON_API_KEY
+    multiplier: 15
+    timespan: minute
+    timeout_seconds: 30
+
   # Energomonitor cloud API collector. First create an API token in the
   # Energomonitor application and run the discovery command documented in README.md.
   - type: energomonitor

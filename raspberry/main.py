@@ -17,6 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("collector")
 
 
@@ -38,10 +39,18 @@ class CollectorService:
             )
             for result in results:
                 if isinstance(result, Exception):
-                    logger.exception("Collector failed", exc_info=result)
-                else:
-                    self.outbox.add(result)
-                    logger.info("Collected %s record %s", result.system, result.record_id)
+                    logger.error("Collector failed: %s",
+                                 result,
+                                 exc_info=(type(result), result, result.__traceback__),
+                                )
+                    continue
+                records = result if isinstance(result, list) else [result]
+                for record in records:
+                    self.outbox.add(record)
+                    logger.debug("Collected %s record %s",
+                                record.system,
+                                record.record_id,
+                               )
             await self.flush_outbox()
 
     async def flush_outbox(self) -> None:
