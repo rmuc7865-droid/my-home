@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
+import json
 import math
 import httpx
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import altair as alt
 
 API_URL = os.getenv("MONITOR_API_URL", "http://api:8000")
 API_KEY = os.getenv("MONITOR_API_KEY", "CHANGE_ME")
@@ -17,73 +20,744 @@ LOCAL_TIMEZONE = "Europe/Berlin"
 st.set_page_config(page_title="Home Monitor", page_icon="🏠", layout="wide")
 st.title("🏠 Home Monitor")
 
+@st.cache_data(ttl=300)
+def load_alerts_cached():
+    return api_get(
+        "/api/v1/alerts",
+        {
+            "limit": 500,
+        },
+    )
+
+@st.cache_data(ttl=30)
+def load_simulation_cached():
+    payload = api_get(
+        "/api/v1/simulation",
+        {
+            "days": 0,
+            "include_open": True,
+        },
+    )
+
+    if isinstance(payload, dict):
+        return (
+            payload.get("trades")
+            or payload.get("rows")
+            or payload.get("items")
+            or []
+        )
+
+    return payload or []
 
 def api_get(path: str, params: dict | None = None):
     response = httpx.get(f"{API_URL}{path}", headers=HEADERS, params=params, timeout=20)
     response.raise_for_status()
     return response.json()
 
+@st.cache_data(ttl=300)
+def load_measurement_df_cached():
+    measurements = api_get(
+        "/api/v1/measurements",
+        {
+            "limit": 50000,
+        },
+    )
+
+    measurement_rows = []
+
+    for record in measurements:
+        metadata = (
+            record.get("metadata")
+            or {}
+        )
+
+        ticker = metadata.get(
+            "ticker"
+        )
+
+        if not ticker:
+            ticker = record["system"]
+
+        asset_type = metadata.get(
+            "asset_type"
+        )
+
+        if not asset_type:
+            if record["system"] == "crypto":
+                asset_type = "crypto"
+            elif record["system"] == "polygon":
+                asset_type = "stock"
+            else:
+                asset_type = "other"
+
+        base = {
+            "id": record["id"],
+            "system": record["system"],
+            "device": record["device"],
+            "ticker": ticker,
+            "asset_type": asset_type,
+            "timestamp": pd.to_datetime(
+                record["timestamp"],
+                utc=True,
+            ),
+            "received_at": pd.to_datetime(
+                record.get("received_at"),
+                utc=True,
+            ),
+            "eur_usd": metadata.get(
+                "eur_usd"
+            ),
+        }
+
+        measurement_rows.append(
+            {
+                **base,
+                **record["measurements"],
+            }
+        )
+
+    return pd.DataFrame(
+        measurement_rows
+    )
 
 def api_post(path: str):
     response = httpx.post(f"{API_URL}{path}", headers=HEADERS, timeout=20)
     response.raise_for_status()
     return response.json()
 
-
 try:
-    measurements = api_get("/api/v1/measurements", {"limit": 5000})
-    alerts = api_get("/api/v1/alerts", {"limit": 500})
+    df = load_measurement_df_cached()
+    alerts = load_alerts_cached()
+
 except Exception as exc:
-    st.error(f"Cannot reach monitoring API: {exc}")
+    st.error(
+        f"Cannot reach monitoring API: {exc}"
+    )
     st.stop()
 
-measurement_rows: list[dict] = []
+alerts_df = pd.DataFrame(alerts)
 
-for record in measurements:
-    metadata = record.get("metadata") or {}
+def load_ticker_names() -> dict[str, str]:
+    path = Path("/app/config/zero.json")
 
-    ticker = metadata.get("ticker")
+    if not path.exists():
+        return {}
 
-    if not ticker:
-        ticker = record["system"]
+    try:
+        payload = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return {}
 
-    asset_type = metadata.get("asset_type")
+    names = {}
 
-    if not asset_type:
-        if record["system"] == "crypto":
-            asset_type = "crypto"
-        elif record["system"] == "polygon":
-            asset_type = "stock"
-        else:
-            asset_type = "other"
+    if isinstance(payload, list):
+        rows = payload
 
-    base = {
-        "id": record["id"],
-        "system": record["system"],
-        "device": record["device"],
-        "ticker": ticker,
-        "asset_type": asset_type,
-        "timestamp": pd.to_datetime(
-            record["timestamp"],
-            utc=True,
-        ),
-        "received_at": pd.to_datetime(
-            record.get("received_at"),
-            utc=True,
-        ),
-        "eur_usd": metadata.get("eur_usd"),
-    }
+    elif isinstance(payload, dict):
+        rows = (
+            payload.get("tickers")
+            or payload.get("instruments")
+            or payload.get("rows")
+            or []
+        )
 
+    else:
+        rows = []
 
-    measurement_rows.append(
-        {
-            **base,
-            **record["measurements"],
-        }
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        ticker = str(
+            row.get("ticker")
+            or row.get("Ticker")
+            or ""
+        ).strip().upper()
+
+        name = str(
+            row.get("name")
+            or row.get("Name")
+            or ticker
+        ).strip()
+
+        if ticker:
+            names[ticker] = name or ticker
+
+    return names
+
+TICKER_NAMES = load_ticker_names()
+
+def build_trade_analysis(
+    measurements_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    reference_time,
+    period,
+) -> pd.DataFrame:
+    if measurements_df.empty:
+        return pd.DataFrame()
+
+    reference_time = pd.to_datetime(
+        reference_time,
+        utc=True,
     )
 
-df = pd.DataFrame(measurement_rows)
-alerts_df = pd.DataFrame(alerts)
+    start_time = (
+        reference_time
+        - period
+    )
+
+    tolerance = pd.Timedelta(
+        30,
+        unit="min",
+    )
+
+    history_start = (
+        start_time
+        - pd.Timedelta(
+            2,
+            unit="h",
+        )
+        - tolerance
+    )
+
+    #
+    # Market data required for the visible period
+    # plus the 2-hour CloseB baseline.
+    #
+    market = measurements_df[
+        measurements_df[
+            "asset_type"
+        ].isin(
+            ["stock", "crypto"]
+        )
+    ][
+        [
+            "ticker",
+            "timestamp",
+            "close",
+            "id",
+        ]
+    ].copy()
+
+    market["timestamp"] = pd.to_datetime(
+        market["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+
+    market["close"] = pd.to_numeric(
+        market["close"],
+        errors="coerce",
+    )
+
+    market = market[
+        (market["timestamp"] >= history_start)
+        & (
+            market["timestamp"]
+            <= reference_time
+        )
+    ].dropna(
+        subset=[
+            "ticker",
+            "timestamp",
+            "close",
+        ]
+    )
+
+    if market.empty:
+        return pd.DataFrame()
+
+    market["ticker"] = (
+        market["ticker"]
+        .astype(str)
+        .str.upper()
+    )
+
+    market["timepoint"] = (
+        market["timestamp"]
+        .dt.round("15min")
+    )
+
+    #
+    # One current observation per ticker/timepoint.
+    #
+    current = (
+        market[
+            market["timepoint"]
+            >= start_time
+        ]
+        .sort_values(
+            [
+                "ticker",
+                "timepoint",
+                "timestamp",
+                "id",
+            ]
+        )
+        .drop_duplicates(
+            subset=[
+                "ticker",
+                "timepoint",
+            ],
+            keep="last",
+        )
+        .copy()
+    )
+
+    if current.empty:
+        return pd.DataFrame()
+
+    #
+    # All 15-minute points where real market
+    # measurements exist. OPEN curve will only
+    # have nodes at these times.
+    #
+    market_timepoints = (
+        current["timepoint"]
+        .drop_duplicates()
+        .sort_values()
+    )
+
+    #
+    # -----------------------------
+    # Curve 1: CloseB >= 2%
+    # -----------------------------
+    #
+    # Find the measurement nearest to 2 hours
+    # before each current timepoint, within
+    # +/-30 minutes.
+    #
+    closeb_parts = []
+
+    for ticker, ticker_current in (
+        current.groupby(
+            "ticker",
+            sort=False,
+        )
+    ):
+        history = market[
+            market["ticker"] == ticker
+        ][
+            [
+                "timestamp",
+                "close",
+            ]
+        ].sort_values(
+            "timestamp"
+        )
+
+        if history.empty:
+            continue
+
+        work = ticker_current[
+            [
+                "ticker",
+                "timepoint",
+                "close",
+            ]
+        ].copy()
+
+        work = work.rename(
+            columns={
+                "close": "current_price",
+            }
+        )
+
+        work["baseline_target"] = (
+            work["timepoint"]
+            - pd.Timedelta(
+                2,
+                unit="h",
+            )
+        )
+
+        work = work.sort_values(
+            "baseline_target"
+        )
+
+        #
+        # Previous baseline candidate.
+        #
+        backward = pd.merge_asof(
+            work,
+            history.rename(
+                columns={
+                    "timestamp": (
+                        "baseline_timestamp"
+                    ),
+                    "close": (
+                        "baseline_price"
+                    ),
+                }
+            ).sort_values(
+                "baseline_timestamp"
+            ),
+            left_on="baseline_target",
+            right_on="baseline_timestamp",
+            direction="backward",
+            tolerance=tolerance,
+        )
+
+        backward = backward.rename(
+            columns={
+                "baseline_timestamp": (
+                    "backward_timestamp"
+                ),
+                "baseline_price": (
+                    "backward_price"
+                ),
+            }
+        )
+
+        #
+        # Following baseline candidate.
+        #
+        forward = pd.merge_asof(
+            work,
+            history.rename(
+                columns={
+                    "timestamp": (
+                        "baseline_timestamp"
+                    ),
+                    "close": (
+                        "baseline_price"
+                    ),
+                }
+            ).sort_values(
+                "baseline_timestamp"
+            ),
+            left_on="baseline_target",
+            right_on="baseline_timestamp",
+            direction="forward",
+            tolerance=tolerance,
+        )
+
+        forward = forward.rename(
+            columns={
+                "baseline_timestamp": (
+                    "forward_timestamp"
+                ),
+                "baseline_price": (
+                    "forward_price"
+                ),
+            }
+        )
+
+        matched = backward[
+            [
+                "ticker",
+                "timepoint",
+                "current_price",
+                "baseline_target",
+                "backward_timestamp",
+                "backward_price",
+            ]
+        ].copy()
+
+        matched[
+            "forward_timestamp"
+        ] = pd.to_datetime(
+            forward[
+                "forward_timestamp"
+            ].reset_index(
+                drop=True
+            ),
+            utc=True,
+            errors="coerce",
+        )
+
+        matched[
+            "forward_price"
+        ] = (
+            forward[
+                "forward_price"
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
+
+        #
+        # Ensure all datetime columns use the
+        # same UTC-aware dtype before subtraction.
+        #
+        matched["baseline_target"] = pd.to_datetime(
+            matched["baseline_target"],
+            utc=True,
+            errors="coerce",
+        )
+
+        matched["backward_timestamp"] = pd.to_datetime(
+            matched["backward_timestamp"],
+            utc=True,
+            errors="coerce",
+        )
+
+        matched["forward_timestamp"] = pd.to_datetime(
+            matched["forward_timestamp"],
+            utc=True,
+            errors="coerce",
+        )
+
+        backward_distance = (
+            matched["baseline_target"]
+            - matched["backward_timestamp"]
+        ).abs()
+
+        forward_distance = (
+            matched["forward_timestamp"]
+            - matched["baseline_target"]
+        ).abs()
+
+        #
+        # Prefer the earlier point if both
+        # candidates are equally distant,
+        # matching the previous implementation.
+        #
+        use_backward = (
+            matched[
+                "backward_timestamp"
+            ].notna()
+            & (
+                matched[
+                    "forward_timestamp"
+                ].isna()
+                | (
+                    backward_distance
+                    <= forward_distance
+                )
+            )
+        )
+
+        matched["baseline_price"] = (
+            matched["forward_price"]
+        )
+
+        matched.loc[
+            use_backward,
+            "baseline_price",
+        ] = matched.loc[
+            use_backward,
+            "backward_price",
+        ]
+
+        valid = (
+            matched[
+                "baseline_price"
+            ].notna()
+            & (
+                matched[
+                    "baseline_price"
+                ] > 0
+            )
+        )
+
+        matched = matched[
+            valid
+        ].copy()
+
+        if matched.empty:
+            continue
+
+        matched["CloseB"] = (
+            matched["current_price"]
+            / matched["baseline_price"]
+            - 1.0
+        ) * 100.0
+
+        closeb_parts.append(
+            matched[
+                [
+                    "ticker",
+                    "timepoint",
+                    "CloseB",
+                ]
+            ]
+        )
+
+    if closeb_parts:
+        closeb_df = pd.concat(
+            closeb_parts,
+            ignore_index=True,
+        )
+    else:
+        closeb_df = pd.DataFrame(
+            columns=[
+                "ticker",
+                "timepoint",
+                "CloseB",
+            ]
+        )
+
+    qualifying = closeb_df[
+        closeb_df["CloseB"] >= 2.0
+    ].copy()
+
+    closeb_summary = (
+        qualifying.groupby(
+            "timepoint"
+        )["ticker"]
+        .agg(
+            lambda values:
+            sorted(
+                set(values)
+            )
+        )
+    )
+
+    #
+    # CloseB curve gets a node at every
+    # 15-minute point in the selected period,
+    # including zero-count points.
+    #
+    all_timepoints = pd.date_range(
+        start=start_time,
+        end=reference_time,
+        freq="15min",
+        tz="UTC",
+    )
+
+    result_rows = []
+
+    for timepoint in all_timepoints:
+        tickers = (
+            closeb_summary.get(
+                timepoint,
+                [],
+            )
+        )
+
+        result_rows.append(
+            {
+                "Time": timepoint,
+                "Series": "CloseB ≥ 2%",
+                "Count": len(tickers),
+                "Tickers": (
+                    ", ".join(tickers)
+                    if tickers
+                    else "—"
+                ),
+            }
+        )
+
+    #
+    # -----------------------------
+    # Curve 2: OPEN trades
+    # -----------------------------
+    #
+    # Only create OPEN points where real market
+    # data exists, preserving gaps.
+    #
+    trades = trades_df.copy()
+
+    if not trades.empty:
+        trades["BuyTime"] = pd.to_datetime(
+            trades["BuyTime"],
+            utc=True,
+            errors="coerce",
+        )
+
+        trades["SellTime"] = pd.to_datetime(
+            trades["SellTime"],
+            utc=True,
+            errors="coerce",
+        )
+
+        trades["Ticker"] = (
+            trades["Ticker"]
+            .astype(str)
+            .str.upper()
+        )
+
+    open_map = {
+        timepoint: set()
+        for timepoint in market_timepoints
+    }
+
+    #
+    # There are relatively few trades, so looping
+    # over trades is much cheaper than looping
+    # over every timepoint and every trade.
+    #
+    for _, trade in trades.iterrows():
+        buy_time = trade.get(
+            "BuyTime"
+        )
+
+        sell_time = trade.get(
+            "SellTime"
+        )
+
+        ticker = str(
+            trade.get("Ticker")
+            or ""
+        )
+
+        if (
+            not ticker
+            or pd.isna(buy_time)
+        ):
+            continue
+
+        active_points = market_timepoints[
+            market_timepoints
+            >= buy_time
+        ]
+
+        if pd.notna(sell_time):
+            active_points = active_points[
+                active_points
+                < sell_time
+            ]
+
+        for timepoint in active_points:
+            open_map[
+                timepoint
+            ].add(
+                ticker
+            )
+
+    for timepoint in market_timepoints:
+        tickers = sorted(
+            open_map.get(
+                timepoint,
+                set(),
+            )
+        )
+
+        result_rows.append(
+            {
+                "Time": timepoint,
+                "Series": "OPEN",
+                "Count": len(tickers),
+                "Tickers": (
+                    ", ".join(tickers)
+                    if tickers
+                    else "—"
+                ),
+            }
+        )
+
+    return pd.DataFrame(
+        result_rows
+    )
+
+@st.cache_data(ttl=300)
+def build_trade_analysis_cached(
+    _measurements_df: pd.DataFrame,
+    _trades_df: pd.DataFrame,
+    reference_time,
+) -> pd.DataFrame:
+    return build_trade_analysis(
+        measurements_df=_measurements_df,
+        trades_df=_trades_df,
+        reference_time=reference_time,
+        period=pd.Timedelta(days=7),
+    )
 
 def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
     if data.empty:
@@ -141,6 +815,10 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
 
         row = {
             "Ticker": ticker,
+            "TickerName": TICKER_NAMES.get(
+                str(ticker).upper(),
+                ticker,
+            ),
             "Type": latest["asset_type"],
             "_timestamp": latest_time,
             #"Time": latest_time.strftime("%H:%M"),
@@ -246,8 +924,21 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
         )
     return result
 
-page = st.sidebar.radio("Page", ["Live Overview", "Alerts", "Historical Trends", "Simulation", "System Health"])
-if st.sidebar.button("Refresh now", use_container_width=True):
+@st.cache_data(ttl=300)
+def build_live_overview_cached(
+    _data: pd.DataFrame,
+    data_version,
+) -> pd.DataFrame:
+    return build_live_overview(
+        _data
+    )
+
+page = st.sidebar.radio("Page", ["Live Overview", "Historical Trends", "Simulation", "Trade Analysis", "System Health", "Alerts"])
+if st.sidebar.button(
+    "Refresh now",
+    use_container_width=True,
+):
+    st.cache_data.clear()
     st.rerun()
 
 local_now = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
@@ -257,6 +948,12 @@ st.sidebar.caption(
 )
 
 if page == "Live Overview":
+    market_df = df[
+        df["asset_type"].isin(
+            ["stock", "crypto"]
+        )
+    ].copy()
+
     if df.empty:
         st.info("No measurements received yet.")
 
@@ -273,7 +970,9 @@ if page == "Live Overview":
         # Determine currently tracked assets using collection
         # time, not market-bar time.
         #
-        newest_received = df["received_at"].max()
+        newest_received = (
+            market_df["received_at"].max()
+        )
 
         active_cutoff = (
             newest_received
@@ -281,16 +980,20 @@ if page == "Live Overview":
         )
 
         latest_received = (
-            df.groupby("ticker")["received_at"]
+            market_df.groupby("ticker")[
+                "received_at"
+            ]
             .max()
         )
-
+ 
         active_tickers = latest_received[
             latest_received >= active_cutoff
         ].index
 
-        active_df = df[
-            df["ticker"].isin(active_tickers)
+        active_df = market_df[
+            market_df["ticker"].isin(
+                active_tickers
+            )
         ].copy()
 
         live = build_live_overview(active_df)
@@ -337,9 +1040,9 @@ if page == "Live Overview":
 
         cols[4].metric(
             "Measurements",
-            len(df),
+            len(market_df),
         )
-
+ 
         #
         # Latest values
         #
@@ -350,7 +1053,7 @@ if page == "Live Overview":
 
         else:
             display_live = live.copy()
-
+            
             def format_sell_time(row):
                 value = row["SellTime"]
 
@@ -433,6 +1136,7 @@ if page == "Live Overview":
                 display_live[
                     [
                         "Ticker",
+                        "TickerName",
                         "Type",
                         "Time",
                         "Price",
@@ -466,6 +1170,15 @@ if page == "Live Overview":
             "BuyQty is the minimum whole-share quantity whose estimated "
             "value is at least €10,000 using the ECB EUR/USD reference rate."
         )
+        st.caption(
+            "OpenB, LowB, HighB and CloseB describe the "
+            "approximately 2-hour price block ending at Time. "
+            "All four values are percentage changes relative "
+            "to the baseline price approximately 2 hours earlier. "
+            "OpenB is the start of the block, LowB is the minimum "
+            "price during the block, HighB is the maximum price, "
+            "and CloseB is the latest Price collected at Time."
+        )
 
 elif page == "Alerts":
     if alerts_df.empty:
@@ -489,12 +1202,29 @@ elif page == "Alerts":
                 st.error(str(exc))
 
 elif page == "Historical Trends":
-    if df.empty:
+    trends_df = df[
+        df["asset_type"].isin(
+            ["stock", "crypto"]
+        )
+    ].copy()
+
+    if trends_df.empty:
         st.info("No historical data available.")
 
     else:
-        historical = df.copy()
-        ranking_df = build_live_overview(historical)
+        historical = trends_df.copy()
+        data_version = (
+            historical["timestamp"].max()
+        )
+
+        data_version = (
+            historical["timestamp"].max()
+        )
+
+        ranking_df = build_live_overview_cached(
+            historical,
+            data_version,
+        )        
 
         if not ranking_df.empty:
             ranked_assets = ranking_df["Ticker"].tolist()
@@ -519,11 +1249,57 @@ elif page == "Historical Trends":
         else:
             control_cols = st.columns(4)
 
+            #
+            # Current Simulation OPEN positions
+            #
+            open_position_tickers = []
+            open_buy_times = {}
+
+            try:
+                simulation_trades = (
+                    load_simulation_cached()
+                )
+
+                for trade in simulation_trades:
+                    if trade.get("SellTime"):
+                        continue
+
+                    ticker = str(
+                        trade.get("Ticker") or ""
+                    ).strip().upper()
+
+                    buy_time = pd.to_datetime(
+                        trade.get("BuyTime"),
+                        utc=True,
+                        errors="coerce",
+                    )
+
+                    if ticker:
+                        open_position_tickers.append(
+                            ticker
+                        )
+
+                        if pd.notna(buy_time):
+                            open_buy_times[
+                                ticker
+                            ] = buy_time
+
+                open_position_tickers = sorted(
+                    set(open_position_tickers)
+                )
+
+            except Exception as exc:
+                st.warning(
+                    "Cannot load Simulation OPEN positions: "
+                    f"{exc}"
+                )
+
             asset_mode = control_cols[0].selectbox(
                 "Assets",
                 [
                     "Single",
                     "Top K",
+                    "OPEN positions",
                     "All",
                     "Custom",
                 ],
@@ -551,6 +1327,28 @@ elif page == "Historical Trends":
                     "Selected from the current Live Overview ranking: "
                     + ", ".join(selected_assets)
                 )
+
+            elif asset_mode == "OPEN positions":
+                selected_assets = [
+                    ticker
+                    for ticker
+                    in open_position_tickers
+                    if ticker
+                    in available_assets
+                ]
+                if selected_assets:
+                    st.caption(
+                        "Current Simulation OPEN positions: "
+                        + ", ".join(
+                            selected_assets
+                        )
+                    )
+                else:
+                    st.info(
+                        "There are currently no OPEN "
+                        "Simulation positions with "
+                        "Historical Trends data."
+                    )
 
             elif asset_mode == "All":
                 selected_assets = ranked_assets
@@ -653,7 +1451,7 @@ elif page == "Historical Trends":
 
                 norm = control_cols[3].radio(
                     "Norm",
-                    ["Absolute", "Relative"],
+                    ["Relative", "Absolute"],
                     horizontal=True,
                 )
 
@@ -772,6 +1570,53 @@ elif page == "Historical Trends":
                         y_column = "Relative %"
                         y_label = f"{metric} change (%)"
 
+                    #
+                    # Load currently OPEN Simulation trades.
+                    # Their Historical Trends nodes at/after
+                    # BuyTime will be highlighted in green.
+                    #
+                    open_buy_times = {}
+
+                    try:
+                        simulation_rows = (
+                            load_simulation_cached()
+                        )
+
+                        simulation_df = pd.DataFrame(
+                            simulation_rows
+                        )
+                        simulation_trades = (
+                            load_simulation_cached()
+                        )
+                        for trade in simulation_trades:
+                            if trade.get("SellTime"):
+                                continue
+
+                            ticker = str(
+                                trade.get("Ticker")
+                                or ""
+                            ).strip().upper()
+
+                            buy_time = pd.to_datetime(
+                                trade.get("BuyTime"),
+                                utc=True,
+                                errors="coerce",
+                            )
+
+                            if (
+                                ticker
+                                and pd.notna(buy_time)
+                            ):
+                                open_buy_times[
+                                    ticker
+                                ] = buy_time
+
+                    except Exception as exc:
+                        st.warning(
+                            "Cannot load OPEN trades for "
+                            f"chart highlighting: {exc}"
+                        )
+
                     figure = px.line(
                         chart_df,
                         x="Local Time",
@@ -779,11 +1624,68 @@ elif page == "Historical Trends":
                         color="ticker",
                         markers=True,
                         title=(
-                            f"{metric} — "
+                            f"{metric} — " 
                             f"{len(selected_assets)} asset(s) "
                             f"({range_label}, {norm})"
                         ),
                     )
+                    #
+                    # Highlight observations belonging to
+                    # currently OPEN trades.
+                    #
+                    open_points_parts = []
+
+                    for ticker, buy_time in (
+                        open_buy_times.items()
+                    ):
+                        ticker_points = chart_df[
+                            (
+                                chart_df["ticker"]
+                                .astype(str)
+                                .str.upper()
+                                == ticker
+                            )
+                            & (
+                                chart_df["timestamp"]
+                                >= buy_time
+                            )
+                        ].copy()
+
+                        if not ticker_points.empty:
+                            open_points_parts.append(
+                                ticker_points
+                            )
+
+                    if open_points_parts:
+                        open_points = pd.concat(
+                            open_points_parts,
+                            ignore_index=True,
+                        )
+
+                        figure.add_scatter(
+                            x=open_points[
+                                "Local Time"
+                            ],
+                            y=open_points[
+                                y_column
+                            ],
+                            mode="markers",
+                            marker={
+                                "color": "green",
+                                "size": 9,
+                            },
+                            name="OPEN position",
+                            customdata=open_points[
+                                ["ticker"]
+                            ],
+                            hovertemplate=(
+                                "<b>%{customdata[0]}</b>"
+                                "<br>OPEN position"
+                                "<br>%{x}"
+                                "<br>%{y:.2f}"
+                                "<extra></extra>"
+                            ),
+                        )
 
                     figure.update_layout(
                         xaxis_title="Local time",
@@ -804,7 +1706,7 @@ elif page == "Historical Trends":
                         "Local Time"
                     ].iloc[-1]
 
-                    info_cols = st.columns(4)
+                    info_cols = st.columns(3)
 
                     info_cols[0].metric(
                         "Points",
@@ -825,103 +1727,869 @@ elif page == "Historical Trends":
                         ),
                     )
 
-                    if norm == "Relative":
-                        latest_relative = chart_df[
-                            "Relative %"
-                        ].iloc[-1]
-
-                        info_cols[3].metric(
-                            "Change",
-                            f"{latest_relative:+.2f}%",
-                        )
-
-                    else:
-                        latest_value = chart_df[
-                            metric
-                        ].iloc[-1]
-
-                        info_cols[3].metric(
-                            "Latest",
-                            f"{latest_value:,.4f}",
-                        )
-
 elif page == "Simulation":
     st.subheader("Simulation")
+
     st.caption(
-        "BUY/SELL results proposed by the system and sent to Telegram during the last year. "
+        "BUY/SELL results proposed by the system and sent to Telegram. "
         "Open BUY signals remain visible until a corresponding SELL is recorded."
     )
-    try:
-        simulation_rows = api_get("/api/v1/simulation", {"days": 365, "include_open": True})
-    except Exception as exc:
-        st.error(f"Cannot load simulation data: {exc}")
-    else:
-        simulation_df = pd.DataFrame(simulation_rows)
-        if simulation_df.empty:
-            st.info("No BUY/SELL simulation records are available for the last year yet.")
-        else:
-            simulation_df["BuyTime"] = pd.to_datetime(simulation_df["BuyTime"], utc=True)
-            simulation_df["SellTime"] = pd.to_datetime(simulation_df["SellTime"], utc=True, errors="coerce")
 
-            closed = simulation_df[simulation_df["Status"] == "CLOSED"].copy()
-            open_count = int((simulation_df["Status"] == "OPEN").sum())
-            wins = int((closed["RelativeDifference"] > 0).sum()) if not closed.empty else 0
-            win_rate = (wins / len(closed) * 100.0) if len(closed) else 0.0
-            total_abs = closed["AbsoluteDifference"].sum() if not closed.empty else 0.0
-            avg_rel = closed["RelativeDifference"].mean() if not closed.empty else 0.0
+    try:
+        simulation_rows = load_simulation_cached()
+    except Exception as exc:
+        st.error(
+            f"Cannot load simulation data: {exc}"
+        )
+    else:
+        simulation_df = pd.DataFrame(
+            simulation_rows
+        )
+        if simulation_df.empty:
+            st.info(
+                "No BUY/SELL simulation records "
+                "are available yet."
+            )
+
+        else:
+            #
+            # Normalize timestamps.
+            #
+            simulation_df["BuyTime"] = pd.to_datetime(
+                simulation_df["BuyTime"],
+                utc=True,
+                errors="coerce",
+            )
+
+            simulation_df["SellTime"] = pd.to_datetime(
+                simulation_df["SellTime"],
+                utc=True,
+                errors="coerce",
+            )
+
+            #
+            # Numeric columns.
+            #
+            for column in [
+                "BuyPriceEUR",
+                "SellPriceEUR",
+                "RelativeDifference",
+            ]:
+                if column in simulation_df.columns:
+                    simulation_df[column] = (
+                        pd.to_numeric(
+                            simulation_df[column],
+                            errors="coerce",
+                        )
+                    )
+
+            #
+            # Correct known incomplete ticker names.
+            #
+            ticker_name_overrides = {
+                "COIN": "Coinbase",
+            }
+
+            if "TickerName" in simulation_df.columns:
+                simulation_df["TickerName"] = (
+                    simulation_df.apply(
+                        lambda row:
+                        ticker_name_overrides.get(
+                            row["Ticker"],
+                            row["TickerName"],
+                        )
+                        if (
+                            pd.isna(row["TickerName"])
+                            or str(row["TickerName"]).strip()
+                            == str(row["Ticker"]).strip()
+                        )
+                        else row["TickerName"],
+                        axis=1,
+                    )
+                )
+
+            #
+            # Use exactly the same idea as Live Overview
+            # to determine the newest current market-data
+            # timestamp.
+            #
+            reference_time = pd.Timestamp.now(
+                tz="UTC"
+            )
+
+            current_price_map = {}
+
+            if not df.empty:
+                newest_received = (
+                    df["received_at"].max()
+                )
+
+                active_cutoff = (
+                    newest_received
+                    - pd.Timedelta(minutes=30)
+                )
+
+                latest_received = (
+                    df.groupby("ticker")[
+                        "received_at"
+                    ]
+                    .max()
+                )
+
+                active_tickers = (
+                    latest_received[
+                        latest_received
+                        >= active_cutoff
+                    ].index
+                )
+
+                active_df = df[
+                    df["ticker"].isin(
+                        active_tickers
+                    )
+                ].copy()
+
+                if not active_df.empty:
+                    reference_time = (
+                        active_df[
+                            "timestamp"
+                        ].max()
+                    )
+
+                    live_now = (
+                        build_live_overview(
+                            active_df
+                        )
+                    )
+
+                    if not live_now.empty:
+                        current_price_map = (
+                            live_now
+                            .dropna(
+                                subset=["Ticker"]
+                            )
+                            .drop_duplicates(
+                                subset=["Ticker"],
+                                keep="first",
+                            )
+                            .set_index("Ticker")[
+                                "Price"
+                            ]
+                            .to_dict()
+                        )
+
+            #
+            # Period selector.
+            #
+            period = st.selectbox(
+                "Period",
+                [
+                    "Day",
+                    "Week",
+                    "Month",
+                    "Year",
+                    "All",
+                ],
+                index=4,
+            )
+
+            period_delta = {
+                "Day": pd.Timedelta(days=1),
+                "Week": pd.Timedelta(days=7),
+                "Month": pd.Timedelta(days=30),
+                "Year": pd.Timedelta(days=365),
+                "All": None,
+            }[period]
+
+            if period_delta is None:
+                cutoff_time = None
+
+            else:
+                cutoff_time = (
+                    reference_time
+                    - period_delta
+                )
+
+            #
+            # Closed trades belong to a period according
+            # to SellTime.
+            #
+            closed_all = simulation_df[
+                simulation_df["Status"]
+                == "CLOSED"
+            ].copy()
+
+            if cutoff_time is None:
+                closed_period = (
+                    closed_all.copy()
+                )
+
+            else:
+                closed_period = closed_all[
+                    (
+                        closed_all[
+                            "SellTime"
+                        ] >= cutoff_time
+                    )
+                    & (
+                        closed_all[
+                            "SellTime"
+                        ] <= reference_time
+                    )
+                ].copy()
+
+            #
+            # Open trades belong to a period according
+            # to BuyTime.
+            #
+            open_all = simulation_df[
+                simulation_df["Status"]
+                == "OPEN"
+            ].copy()
+
+            if cutoff_time is None:
+                open_period = (
+                    open_all.copy()
+                )
+
+            else:
+                open_period = open_all[
+                    (
+                        open_all[
+                            "BuyTime"
+                        ] >= cutoff_time
+                    )
+                    & (
+                        open_all[
+                            "BuyTime"
+                        ] <= reference_time
+                    )
+                ].copy()
+
+            #
+            # Summary statistics.
+            #
+            closed_count = len(
+                closed_period
+            )
+
+            open_count = len(
+                open_period
+            )
+
+            wins = (
+                int(
+                    (
+                        closed_period[
+                            "RelativeDifference"
+                        ] > 0
+                    ).sum()
+                )
+                if closed_count
+                else 0
+            )
+
+            win_rate = (
+                wins
+                / closed_count
+                * 100.0
+                if closed_count
+                else 0.0
+            )
+
+            avg_return = (
+                closed_period[
+                    "RelativeDifference"
+                ].mean()
+                if closed_count
+                else 0.0
+            )
 
             cols = st.columns(4)
-            cols[0].metric("Closed trades", len(closed))
-            cols[1].metric("Open trades", open_count)
-            cols[2].metric("Win rate", f"{win_rate:.1f}%")
-            cols[3].metric("Total difference", f"€{total_abs:,.2f}")
-            st.caption(f"Average relative difference across closed trades: {avg_rel:.2f}%")
 
-            ticker_options = ["All"] + sorted(simulation_df["Ticker"].dropna().unique().tolist())
-            selected_ticker = st.selectbox("Ticker", ticker_options)
-            status_filter = st.multiselect("Status", ["OPEN", "CLOSED"], default=["OPEN", "CLOSED"])
-            shown = simulation_df.copy()
+            cols[0].metric(
+                "Closed trades",
+                closed_count,
+            )
+
+            cols[1].metric(
+                "Open trades",
+                open_count,
+            )
+
+            cols[2].metric(
+                "Win rate",
+                f"{win_rate:.1f}%",
+            )
+
+            cols[3].metric(
+                "Average return",
+                f"{avg_return:+.2f}%",
+            )
+            reference_local = (
+                reference_time.tz_convert(
+                    LOCAL_TIMEZONE
+                )
+            )
+
+            st.caption(
+                "Win rate = percentage of closed "
+                "trades with a positive RelDiff. "
+                "Average return = arithmetic mean "
+                "of RelDiff for closed trades. "
+                f"Period reference: "
+                f"{reference_local.strftime('%Y-%m-%d %H:%M %Z')}."
+            )
+
+            #
+            # Apply period to table as well.
+            #
+            shown = pd.concat(
+                [
+                    closed_period,
+                    open_period,
+                ],
+                ignore_index=True,
+            )
+
+            #
+            # User filters.
+            #
+            ticker_options = (
+                ["All"]
+                + sorted(
+                    shown["Ticker"]
+                    .dropna()
+                    .unique()
+                    .tolist()
+                )
+            )
+
+            selected_ticker = st.selectbox(
+                "Ticker",
+                ticker_options,
+            )
+
+            status_filter = st.multiselect(
+                "Status",
+                [
+                    "OPEN",
+                    "CLOSED",
+                ],
+                default=[
+                    "OPEN",
+                    "CLOSED",
+                ],
+            )
+
             if selected_ticker != "All":
-                shown = shown[shown["Ticker"] == selected_ticker]
+                shown = shown[
+                    shown["Ticker"]
+                    == selected_ticker
+                ]
+
             if status_filter:
-                shown = shown[shown["Status"].isin(status_filter)]
+                shown = shown[
+                    shown["Status"].isin(
+                        status_filter
+                    )
+                ]
+
             else:
                 shown = shown.iloc[0:0]
+
+            #
+            # Current EUR price from Live Overview.
+            #
+            shown = shown.copy()
+
+            shown["CurrPriceEUR"] = (
+                shown["Ticker"].map(
+                    current_price_map
+                )
+            )
+            shown["CurrRelDiff"] = pd.NA
+
+            buy_price_eur_numeric = pd.to_numeric(
+                shown["BuyPriceEUR"],
+                errors="coerce",
+            )
+
+            current_price_eur_numeric = pd.to_numeric(
+                shown["CurrPriceEUR"],
+                errors="coerce",
+            )
+
+            valid_prices = (
+                buy_price_eur_numeric.notna()
+                & current_price_eur_numeric.notna()
+                & (buy_price_eur_numeric > 0)
+            )
+
+            shown.loc[
+                valid_prices,
+                "CurrRelDiff",
+            ] = (
+                (
+                    current_price_eur_numeric[
+                        valid_prices
+                    ]
+                    /
+                    buy_price_eur_numeric[
+                        valid_prices
+                    ]
+                )
+                - 1.0
+            ) * 100.0
+
+
+            #
+            # Display column names.
+            #
+            shown["RelDiff"] = (
+                shown[
+                    "RelativeDifference"
+                ]
+            )
+
+            #
+            # Local CEST/CET timestamps.
+            #
+            shown["BuyTime"] = (
+                shown["BuyTime"]
+                .dt.tz_convert(
+                    LOCAL_TIMEZONE
+                )
+                .dt.strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            )
+
+            shown["SellTime"] = (
+                shown["SellTime"]
+                .dt.tz_convert(
+                    LOCAL_TIMEZONE
+                )
+                .dt.strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            )
+
+            shown["SellTime"] = (
+                shown["SellTime"]
+                .fillna("—")
+            )
+
+            #
+            # Human-readable formatting.
+            #
+            shown["RelDiff"] = (
+                shown["RelDiff"].map(
+                    lambda value:
+                    f"{float(value):+.2f}%"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+
+            shown["BuyPrice"] = (
+                shown["BuyPrice"].map(
+                    lambda value:
+                    f"{float(value):,.2f}"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+
+            shown["SellPrice"] = (
+                shown["SellPrice"].map(
+                    lambda value:
+                    f"{float(value):,.2f}"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+
+            shown["CurrPriceEUR"] = (
+                shown["CurrPriceEUR"].map(
+                    lambda value:
+                    f"{float(value):,.2f}"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+            shown["CurrRelDiff"] = (
+                shown["CurrRelDiff"].map(
+                    lambda value:
+                    f"{float(value):+.2f}%"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
 
             required_columns = [
                 "Ticker",
                 "TickerName",
                 "BuyTime",
+                "BuyPriceEUR",
+                "CloseB>0",
+                "CloseB>2",
                 "SellTime",
-                "RelativeDifference",
-                "AbsoluteDifference",
+                "SellPriceEUR",
+                "RelDiff",
+                "CurrPriceEUR",
+                "CurrRelDiff",
+                "SellReason",
                 "Status",
             ]
-            display = shown[required_columns].copy()
-            display["RelativeDifference"] = display["RelativeDifference"].map(
-                lambda value: None if pd.isna(value) else round(float(value), 2)
+
+            display = shown[
+                required_columns
+            ].copy()
+
+            display = display.sort_values(
+                by="BuyTime",
+                ascending=False,
             )
-            display["AbsoluteDifference"] = display["AbsoluteDifference"].map(
-                lambda value: None if pd.isna(value) else round(float(value), 2)
-            )
+
             st.dataframe(
                 display,
                 use_container_width=True,
                 hide_index=True,
-                column_config={
-                    "RelativeDifference": st.column_config.NumberColumn("RelativeDifference (%)", format="%.2f%%"),
-                    "AbsoluteDifference": st.column_config.NumberColumn("AbsoluteDifference (EUR)", format="€ %.2f"),
-                },
             )
+
+            st.caption(
+                "SellReason: "
+                "Rule1 = after at least 48 hours, SELL if all observed prices "
+                "during the first 48 hours after BuyTime remained within ±1% "
+                "of BuyPrice; "
+                "Rule2 = SELL if CurrentPrice is at least 2% below BuyPrice; "
+                "Rule3 = SELL if CurrentPrice is at least 2% below the highest "
+                "previously observed price after BuyTime; "
+                "multiple rules may appear together, e.g. Rule2+Rule3. "
+                "CloseB>0 = number of Live Overview tickers with CloseB > 0% "
+                "at BuyTime; "
+                "CloseB>2 = number of Live Overview tickers with CloseB > 2% "
+                "at BuyTime."
+            )
+            st.caption(
+                "Rule4 = BUY US-tickers after 14:00 and German-tickers after 12:00;"
+                "Rule5 = SELL US-tickers before 21:30 and German-tickers before 17:30."
+            )
+
+            st.caption(
+                "LegacyRule1 = historical SELL created under the previous "
+                "Rule1 definition; under the current strategy no "
+                "Rule1/Rule2/Rule3 condition existed at that SellTime. "
+            )
+
+elif page == "Trade Analysis":
+    st.header("Trade Analysis")
+
+    range_label = st.selectbox(
+        "Range",
+        [
+            "7 days",
+            "12 hours",
+            "6 hours",
+            "2 hours",
+        ],
+        index=0,
+    )
+
+    range_map = {
+        "7 days": pd.Timedelta(days=7),
+        "12 hours": pd.Timedelta(hours=12),
+        "6 hours": pd.Timedelta(hours=6),
+        "2 hours": pd.Timedelta(hours=2),
+    }
+
+    st.caption(
+        f"Selected period: {range_label}. "
+        "Each node represents a 15-minute timepoint. "
+        "CloseB ≥ 2% shows the number of market tickers whose "
+        "price was at least 2% above its approximately 2-hour "
+        "baseline. OPEN shows the number of Simulation tickers "
+        "that were open at that time. OPEN nodes are omitted "
+        "when no market data exists for that timepoint."
+    )
+
+    market_df = df[
+        df["asset_type"].isin(
+            ["stock", "crypto"]
+        )
+    ].copy()
+
+    reference_time = (
+        pd.to_datetime(
+            market_df["timestamp"],
+            utc=True,
+        ).max()
+    )
+
+    try:
+        simulation_rows = load_simulation_cached()
+    except Exception as exc:
+        st.error(
+            f"Cannot load simulation data: {exc}"
+        )
+
+    else:
+        simulation_df = pd.DataFrame(
+            simulation_rows
+        )
+
+        if simulation_df.empty:
+            st.info(
+                "No BUY/SELL simulation records "
+                "are available yet."
+            )
+
+        else:
+            full_analysis_df = (
+                build_trade_analysis_cached(
+                    df,
+                    simulation_df,
+                    reference_time,
+                )
+            )
+
+            analysis_start = (
+                reference_time
+                - range_map[range_label]
+            )
+
+            analysis_df = full_analysis_df[
+                pd.to_datetime(
+                    full_analysis_df["Time"],
+                    utc=True,
+                )
+                >= analysis_start
+            ].copy()
+
+            if analysis_df.empty:
+                st.info(
+                    "No Trade Analysis data available."
+                )
+
+            else:
+                analysis_df["TimeLocal"] = (
+                    pd.to_datetime(
+                        analysis_df["Time"],
+                        utc=True,
+                    )
+                    .dt.tz_convert(
+                        LOCAL_TIMEZONE
+                    )
+                )
+
+                base = alt.Chart(
+                    analysis_df
+                ).encode(
+                    x=alt.X(
+                        "TimeLocal:T",
+                        title="Time",
+                    ),
+                    y=alt.Y(
+                        "Count:Q",
+                        title="Number of tickers",
+                        scale=alt.Scale(
+                            zero=True,
+                        ),
+                    ),
+                    color=alt.Color(
+                        "Series:N",
+                        title="",
+                    ),
+                )
+
+                lines = base.mark_line()
+
+                points = base.mark_circle(
+                    size=55,
+                ).encode(
+                    tooltip=[
+                        alt.Tooltip(
+                            "TimeLocal:T",
+                            title="Time",
+                            format=(
+                                "%Y-%m-%d %H:%M"
+                            ),
+                        ),
+                        alt.Tooltip(
+                            "Series:N",
+                            title="Series",
+                        ),
+                        alt.Tooltip(
+                            "Count:Q",
+                            title="Count",
+                        ),
+                        alt.Tooltip(
+                            "Tickers:N",
+                            title="Tickers",
+                        ),
+                    ]
+                )
+
+                chart = (
+                    lines
+                    + points
+                ).properties(
+                    height=500,
+                ).interactive()
+
+                st.altair_chart(
+                    chart,
+                    use_container_width=True,
+                )
 
 elif page == "System Health":
     if df.empty:
-        st.warning("No systems have reported data.")
-    else:
-        now = pd.Timestamp.now(tz="UTC")
-        latest = df.groupby("system")["timestamp"].max().reset_index()
-        latest["age_minutes"] = (now - latest["timestamp"]).dt.total_seconds() / 60
-        latest["status"] = latest["age_minutes"].apply(
-            lambda age: "OK" if age <= 30 else ("STALE" if age <= 120 else "OFFLINE")
+        st.warning(
+            "No systems have reported data."
         )
-        st.dataframe(latest, use_container_width=True, hide_index=True)
+
+    else:
+        now = pd.Timestamp.now(
+            tz="UTC"
+        )
+
+        latest = (
+            df.groupby("system")
+            .agg(
+                last_market_time=(
+                    "timestamp",
+                    "max",
+                ),
+                last_received_time=(
+                    "received_at",
+                    "max",
+                ),
+            )
+            .reset_index()
+        )
+
+        latest[
+            "collector_age_minutes"
+        ] = (
+            (
+                now
+                - latest[
+                    "last_received_time"
+                ]
+            )
+            .dt.total_seconds()
+            / 60
+        )
+
+        latest[
+            "market_age_minutes"
+        ] = (
+            (
+                now
+                - latest[
+                    "last_market_time"
+                ]
+            )
+            .dt.total_seconds()
+            / 60
+        )
+
+        def health_status(age):
+            if pd.isna(age):
+                return "UNKNOWN"
+
+            if age <= 30:
+                return "OK"
+
+            if age <= 120:
+                return "STALE"
+
+            return "OFFLINE"
+
+        latest[
+            "CollectorStatus"
+        ] = (
+            latest[
+                "collector_age_minutes"
+            ]
+            .apply(
+                health_status
+            )
+        )
+
+        latest[
+            "MarketStatus"
+        ] = (
+            latest[
+                "market_age_minutes"
+            ]
+            .apply(
+                health_status
+            )
+        )
+
+        latest[
+            "LastReceived"
+        ] = (
+            latest[
+                "last_received_time"
+            ]
+            .dt.tz_convert(
+                LOCAL_TIMEZONE
+            )
+            .dt.strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        )
+
+        latest[
+            "LastMarketData"
+        ] = (
+            latest[
+                "last_market_time"
+            ]
+            .dt.tz_convert(
+                LOCAL_TIMEZONE
+            )
+            .dt.strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        )
+        active_system_cutoff = (
+            now - pd.Timedelta(hours=24)
+        )
+
+        latest = latest[
+            latest["last_received_time"]
+            >= active_system_cutoff
+        ].copy()
+
+        display_health = latest[
+            [
+                "system",
+                "CollectorStatus",
+                "MarketStatus",
+                "LastReceived",
+                "LastMarketData",
+            ]
+        ].copy()
+
+        st.dataframe(
+            display_health,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "CollectorStatus is based on when "
+            "the server last received a record. "
+            "MarketStatus is based on the timestamp "
+            "of the latest market observation. "
+            "If CollectorStatus is OK but MarketStatus "
+            "is STALE or OFFLINE, the collector and "
+            "network connection are working; check the "
+            "upstream market-data provider or the age "
+            "of the provider's latest bar."
+        )
+

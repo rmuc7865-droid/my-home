@@ -208,6 +208,9 @@ def record_simulation_signal(
             ticker_name=signal.ticker_name.strip(),
             buy_time=signal.timestamp,
             buy_price=signal.price,
+            buy_price_eur=signal.price_eur,
+            closeb_gt0_count=signal.closeb_gt0_count,
+            closeb_gt2_count=signal.closeb_gt2_count,
             buy_telegram_sent=True,
             created_at=now,
             updated_at=now,
@@ -237,6 +240,16 @@ def record_simulation_signal(
 
     trade.sell_time = signal.timestamp
     trade.sell_price = signal.price
+    trade.sell_price_eur = signal.price_eur
+    trade.sell_reason = signal.sell_reason
+
+    if (
+        trade.buy_price_eur is None
+        and signal.buy_price_eur is not None
+    ):
+        trade.buy_price_eur = (
+            signal.buy_price_eur
+        )
 
     trade.relative_difference = (
         (
@@ -291,19 +304,31 @@ def simulation_open_tickers(db: Session = Depends(get_db)) -> dict[str, list[str
 
 @app.get("/api/v1/simulation", dependencies=[Depends(require_api_key)])
 def simulation(
-    days: int = Query(default=365, ge=1, le=3660),
+    days: int = Query(default=365, ge=0, le=3660),
     include_open: bool = Query(default=True),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     statement = (
         select(SimulationTrade)
         .where(
-            SimulationTrade.buy_time >= cutoff,
             SimulationTrade.buy_telegram_sent.is_(True),
         )
         .order_by(desc(SimulationTrade.buy_time))
     )
+
+    #
+    # days=0 means all available simulation history.
+    #
+    if days > 0:
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(days=days)
+        )
+
+        statement = statement.where(
+            SimulationTrade.buy_time
+            >= cutoff
+        )    
     if not include_open:
         statement = statement.where(
             SimulationTrade.sell_time.is_not(None),
@@ -316,12 +341,22 @@ def simulation(
             "Ticker": row.ticker,
             "TickerName": row.ticker_name,
             "BuyTime": row.buy_time,
-            "SellTime": row.sell_time,
             "BuyPrice": row.buy_price,
+            "BuyPriceEUR": row.buy_price_eur,
+            "CloseB>0": row.closeb_gt0_count,
+            "CloseB>2": row.closeb_gt2_count,
+            "SellTime": row.sell_time,
             "SellPrice": row.sell_price,
+            "SellPriceEUR": row.sell_price_eur,
             "RelativeDifference": row.relative_difference,
             "AbsoluteDifference": row.absolute_difference,
-            "Status": "CLOSED" if row.sell_time is not None and row.sell_telegram_sent else "OPEN",
+            "SellReason": row.sell_reason,
+            "Status": (
+                "CLOSED"
+                if row.sell_time is not None
+                and row.sell_telegram_sent
+                else "OPEN"
+            ),
         }
         for row in rows
     ]

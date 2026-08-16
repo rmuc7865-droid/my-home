@@ -6,6 +6,8 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from datetime import time as dt_time
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
@@ -54,6 +56,13 @@ ZERO_JSON_PATH = Path(
     os.getenv(
         "ZERO_JSON_PATH",
         "/app/config/zero.json",
+    )
+)
+
+INSTRUMENTS_JSON_PATH = Path(
+    os.getenv(
+        "INSTRUMENTS_JSON_PATH",
+        "/app/config/instruments.json",
     )
 )
 
@@ -162,6 +171,78 @@ def save_state(state: dict) -> None:
         )
 
     temporary.replace(STATE_PATH)
+
+def load_ticker_market_regions() -> dict[str, str]:
+    if not INSTRUMENTS_JSON_PATH.exists():
+        logger.warning(
+            "Instrument file not found: %s",
+            INSTRUMENTS_JSON_PATH,
+        )
+        return {}
+
+    try:
+        rows = json.loads(
+            INSTRUMENTS_JSON_PATH.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        logger.exception(
+            "Cannot read instrument file: %s",
+            INSTRUMENTS_JSON_PATH,
+        )
+        return {}
+
+    result = {}
+
+    for row in rows:
+        ticker = str(
+            row.get("Ticker") or ""
+        ).strip().upper()
+
+        region = str(
+            row.get("MarketRegion") or ""
+        ).strip().upper()
+
+        if ticker and region:
+            result[ticker] = region
+
+    return result
+
+def market_region_for_row(
+    ticker: str,
+    row,
+    market_regions: dict[str, str],
+) -> str | None:
+    #
+    # Explicit configuration always wins.
+    #
+    explicit = market_regions.get(
+        ticker.upper()
+    )
+
+    if explicit:
+        return explicit
+
+    asset_type = str(
+        row.get("asset_type") or ""
+    ).lower()
+
+    system = str(
+        row.get("system") or ""
+    ).lower()
+
+    if asset_type == "crypto":
+        return "CRYPTO"
+
+    #
+    # Current Polygon stock collector represents
+    # US-market symbols.
+    #
+    if system == "polygon":
+        return "US"
+
+    return None
 
 def load_ticker_names() -> dict[str, str]:
     if not ZERO_JSON_PATH.exists():
@@ -366,6 +447,60 @@ def send_to_all_recipients(
 
     return sent_count
 
+def parse_hhmm(value: str) -> dt_time:
+    return dt_time.fromisoformat(
+        str(value)
+    )
+
+def inside_trading_window(
+    timestamp,
+    market_config: dict,
+    kind: str,
+) -> bool:
+    timestamp = pd.to_datetime(
+        timestamp,
+        utc=True,
+    )
+
+    timezone_name = str(
+        market_config["timezone"]
+    )
+
+    local_time = (
+        timestamp
+        .tz_convert(
+            ZoneInfo(timezone_name)
+        )
+        .time()
+    )
+
+    start = parse_hhmm(
+        market_config[
+            f"{kind}_start"
+        ]
+    )
+
+    end = parse_hhmm(
+        market_config[
+            f"{kind}_end"
+        ]
+    )
+
+    if start <= end:
+        return (
+            start
+            <= local_time
+            <= end
+        )
+
+    #
+    # Also supports a window crossing midnight.
+    #
+    return (
+        local_time >= start
+        or local_time <= end
+    )
+
 def calculate_latest_highb(
     df: pd.DataFrame,
     baseline_hours: float,
@@ -504,9 +639,25 @@ def calculate_latest_highb(
                 "ticker": ticker,
                 "latest_time": latest_time,
                 "highb": float(highb),
-                "closeb": float(closeb)
-                if closeb is not None
-                else None,
+                "closeb": (
+                    float(closeb)
+                    if closeb is not None
+                    else None
+                ),
+                "system": latest.get(
+                    "system"
+                ),
+                "asset_type": latest.get(
+                    "asset_type"
+                ),
+                "sell_time_seconds": (
+                    pd.to_numeric(
+                        latest.get(
+                            "sell_time_seconds"
+                        ),
+                        errors="coerce",
+                    )
+                ),
             }
         )
 
@@ -575,6 +726,24 @@ def evaluate_buy(
         ),
     )
 
+    closeb_gt0_count = sum(
+        1
+        for row in highb_rows
+        if (
+            row.get("closeb") is not None
+            and row["closeb"] > 0
+        )
+    )
+
+    closeb_gt2_count = sum(
+        1
+        for row in highb_rows
+        if (
+            row.get("closeb") is not None
+            and row["closeb"] > 2
+        )
+    )
+
     threshold = float(
         rule.get(
             "highb_threshold_percent",
@@ -585,10 +754,23 @@ def evaluate_buy(
     matching = [
         row
         for row in highb_rows
-        if row["highb"] > threshold
+        if (
+            row["highb"] > threshold
+            and row.get("closeb") is not None
+            and row["closeb"] > 0
+        )
     ]
 
     ticker_names = load_ticker_names()
+
+    market_regions = (
+        load_ticker_market_regions()
+    )
+
+    trading_windows = (
+        config.get("trading_windows")
+        or {}
+    )
 
     matching.sort(
         key=lambda row: (
@@ -617,15 +799,165 @@ def evaluate_buy(
             for ticker in (open_payload or [])
         }
 
-    eligible = [
+    excluded_open = [
         row
         for row in matching
         if str(row["ticker"]).upper()
-        not in open_tickers
+        in open_tickers
     ]
 
+    if excluded_open:
+        logger.info(
+            "BUY excluded open tickers: %s",
+            ", ".join(
+                (
+                    f"{row['ticker']} "
+                    f"HighB={row['highb']:+.2f}% "
+                    f"CloseB={row['closeb']:+.2f}%"
+                )
+                for row in excluded_open
+            ),
+        )
+
+    eligible = [
+        row
+        for row in matching
+        if row["ticker"] not in open_tickers
+    ]
+
+    trading_eligible = []
+
+    for row in eligible:
+        ticker = str(
+            row["ticker"]
+        ).strip().upper()
+
+        market_region = market_region_for_row(
+            ticker,
+            row,
+            market_regions,
+        )
+
+        if not market_region:
+            logger.warning(
+                "BUY skipped %s: "
+                "market region unknown",
+                ticker,
+            )
+            continue
+
+        market_config = trading_windows.get(
+            market_region
+        )
+
+        if not market_config:
+            logger.warning(
+                "BUY skipped %s: "
+                "no trading-window config for %s",
+                ticker,
+                market_region,
+            )
+            continue
+
+        if not inside_trading_window(
+            row["latest_time"],
+            market_config,
+            "buy",
+        ):
+            logger.info(
+                "BUY skipped %s: outside %s "
+                "preferred BUY window",
+                ticker,
+                market_region,
+            )
+            continue
+
+        max_sell_time = market_config.get(
+            "max_buy_sell_time_seconds"
+        )
+
+        sell_time_seconds = row.get(
+            "sell_time_seconds"
+        )
+
+        if max_sell_time is not None:
+            sell_time_numeric = pd.to_numeric(
+                sell_time_seconds,
+                errors="coerce",
+            )
+
+            if (
+                pd.isna(sell_time_numeric)
+                or sell_time_numeric
+                > float(max_sell_time)
+            ):
+                logger.info(
+                    "BUY skipped %s: SellTime=%r "
+                    "exceeds %s seconds",
+                    ticker,
+                    sell_time_seconds,
+                    max_sell_time,
+                )
+                continue
+
+        trading_eligible.append(row)
+
+    highb_count = len(highb_rows)
+
+    threshold_count = sum(
+        1
+        for row in highb_rows
+        if row["highb"] > threshold
+    )
+
+    positive_closeb_count = sum(
+        1
+        for row in highb_rows
+        if (
+            row["highb"] > threshold
+            and row.get("closeb") is not None
+            and row["closeb"] > 0
+        )
+    )
+
+    open_excluded_count = (
+        len(matching)
+        - len(eligible)
+    )
+
+    logger.info(
+        "BUY evaluation: total=%d HighB>%.2f%%=%d "
+        "CloseB>0=%d open_excluded=%d "
+        "eligible=%d trading_eligible=%d",
+        len(highb_rows),
+        threshold,
+        len([
+            row
+            for row in highb_rows
+            if row["highb"] > threshold
+        ]),
+        len(matching),
+        len(excluded_open),
+        len(eligible),
+        len(trading_eligible),
+    )
+
     # Global BUY list: maximum 6 tickers.
-    selected = eligible[:6]
+    selected = trading_eligible[:6]
+    #selected = eligible[:6]
+
+    if selected:
+        logger.info(
+            "BUY selected: %s",
+            ", ".join(
+                (
+                    f"{row['ticker']} "
+                    f"HighB={row['highb']:+.2f}% "
+                    f"CloseB={row['closeb']:+.2f}%"
+                )
+                for row in selected
+            ),
+        )
 
     if not selected:
         return
@@ -791,6 +1123,26 @@ def evaluate_buy(
             utc=True,
         )
 
+        buy_eur_usd = eur_usd_near_time(
+            ticker_rows,
+            buy_time,
+        )
+
+        buy_price_eur = None
+
+        if buy_eur_usd is not None:
+            buy_price_eur = (
+                float(buy_price)
+                / float(buy_eur_usd)
+            )
+        else:
+            logger.warning(
+                "BUY %s: EUR conversion unavailable "
+                "(FX=%r)",
+                ticker,
+                buy_eur_usd,
+            )
+
         if isinstance(
             buy_time,
             pd.Timestamp,
@@ -817,6 +1169,17 @@ def evaluate_buy(
                     ),
                     "price": float(
                         buy_price
+                    ),
+                    "price_eur": (
+                        float(buy_price_eur)
+                        if buy_price_eur is not None
+                        else None
+                    ),
+                    "closeb_gt0_count": (
+                        closeb_gt0_count
+                    ),
+                    "closeb_gt2_count": (
+                        closeb_gt2_count
                     ),
                     "telegram_sent": True,
                 },
@@ -846,10 +1209,30 @@ def evaluate_buy(
 
 def sell_rule_1_stable_48h(
     ticker_df: pd.DataFrame,
+    buy_time,
+    buy_price: float,
     latest_time,
-    tolerance_minutes: int = 30,
 ) -> bool:
     if ticker_df.empty:
+        return False
+
+    buy_time = pd.to_datetime(
+        buy_time,
+        utc=True,
+    )
+
+    latest_time = pd.to_datetime(
+        latest_time,
+        utc=True,
+    )
+
+    # Rule1 cannot trigger before 48 hours
+    period_end = (
+        buy_time
+        + pd.Timedelta(48, unit="h",)
+    )
+
+    if latest_time < period_end:
         return False
 
     work = ticker_df[
@@ -877,89 +1260,110 @@ def sell_rule_1_stable_48h(
         )
     )
 
-    if work.empty:
+    # Only inspect the first 48h after BUY
+    holding = work[
+        (work["timestamp"] > buy_time)
+        & (work["timestamp"] <= period_end)
+    ].copy()
+
+    if holding.empty:
         return False
 
-    latest_time = pd.to_datetime(
-        latest_time,
-        utc=True,
-    )
+    first_time = holding["timestamp"].min()
+    last_time = holding["timestamp"].max()
 
-    baseline_target = (
-        latest_time
-        - pd.Timedelta(
-            48,
-            unit="h",
-        )
-    )
-
-    tolerance = pd.Timedelta(
-        tolerance_minutes,
+    coverage_tolerance = pd.Timedelta(
+        30,
         unit="min",
     )
 
-    baseline_candidates = work[
-        (
-            work["timestamp"]
-            >= baseline_target - tolerance
-        )
-        &
-        (
-            work["timestamp"]
-            <= baseline_target + tolerance
-        )
-    ].copy()
-
-    if baseline_candidates.empty:
+    if first_time > (
+        buy_time + coverage_tolerance
+    ):
         return False
 
-    baseline_candidates["distance"] = (
-        baseline_candidates["timestamp"]
-        - baseline_target
-    ).abs()
-
-    baseline_row = (
-        baseline_candidates
-        .sort_values(
-            ["distance", "timestamp"]
-        )
-        .iloc[0]
-    )
-
-    baseline_time = baseline_row["timestamp"]
-    baseline_price = float(
-        baseline_row["close"]
-    )
-
-    if baseline_price <= 0:
+    if last_time < (
+        period_end - coverage_tolerance
+    ):
         return False
 
-    window = work[
-        (
-            work["timestamp"]
-            >= baseline_time
-        )
-        &
-        (
-            work["timestamp"]
-            <= latest_time
-        )
-    ].copy()
-
-    if window.empty:
-        return False
-
-    lower = baseline_price * 0.98
-    upper = baseline_price * 1.02
+    lower = float(buy_price) * 0.99
+    upper = float(buy_price) * 1.01
 
     return bool(
-        window["close"]
+        holding["close"]
         .between(
             lower,
             upper,
             inclusive="both",
         )
         .all()
+    )
+
+def sell_rule_3_drop_from_peak(
+    ticker_df: pd.DataFrame,
+    buy_time,
+    latest_time,
+    current_price: float,
+) -> bool:
+    if ticker_df.empty:
+        return False
+
+    buy_time = pd.to_datetime(
+        buy_time,
+        utc=True,
+    )
+
+    latest_time = pd.to_datetime(
+        latest_time,
+        utc=True,
+    )
+
+    work = ticker_df[
+        ["timestamp", "close"]
+    ].copy()
+
+    work["timestamp"] = pd.to_datetime(
+        work["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+
+    work["close"] = pd.to_numeric(
+        work["close"],
+        errors="coerce",
+    )
+
+    work = (
+        work
+        .dropna(subset=["timestamp", "close"])
+        .sort_values("timestamp")
+        .drop_duplicates(
+            subset=["timestamp"],
+            keep="last",
+        )
+    )
+
+    # Previous observations strictly after BUY
+    # and strictly before the current observation.
+    after_buy = work[
+        (work["timestamp"] > buy_time)
+        & (work["timestamp"] < latest_time)
+    ].copy()
+
+    if after_buy.empty:
+        return False
+
+    peak_price = float(
+        after_buy["close"].max()
+    )
+
+    if peak_price <= 0:
+        return False
+
+    return (
+        float(current_price)
+        <= 0.98 * peak_price
     )
 
 def evaluate_sell(
@@ -1027,10 +1431,19 @@ def evaluate_sell(
 
     ticker_names = load_ticker_names()
 
-    tolerance_minutes = int(
+    market_regions = (
+        load_ticker_market_regions()
+    )
+
+    trading_windows = (
+        config.get("trading_windows")
+        or {}
+    )
+
+    rule2_max_data_age_minutes = int(
         rule.get(
-            "rule1_tolerance_minutes",
-            8,
+            "rule2_max_data_age_minutes",
+            30,
         )
     )
 
@@ -1143,24 +1556,130 @@ def evaluate_sell(
             continue
 
         #
-        # SELL Rule 1
+        # SELL Rule 1:
+        # after at least 48 hours, sell if all observed
+        # prices during the first 48 hours after BuyTime
+        # stayed within +/-1% of BuyPrice.
         #
         rule1_triggered = (
             sell_rule_1_stable_48h(
                 ticker_df=ticker_df,
+                buy_time=buy_time,
+                buy_price=float(buy_price),
                 latest_time=latest_time,
-                tolerance_minutes=tolerance_minutes,
             )
         )
 
         #
         # SELL Rule 2:
-        # current Price < 98% of Price(BuyTime)
+        # current price <= 98% of BuyPrice.
         #
         rule2_triggered = (
             float(current_price)
-            < 0.98 * float(buy_price)
+            <= 0.98 * float(buy_price)
         )
+
+        #
+        # SELL Rule 3:
+        # current price <= 98% of the highest
+        # previously observed price after BuyTime.
+        #
+        rule3_triggered = (
+            sell_rule_3_drop_from_peak(
+                ticker_df=ticker_df,
+                buy_time=buy_time,
+                latest_time=latest_time,
+                current_price=float(current_price),
+            )
+        )
+
+        inside_sell_window = False
+
+        market_region = market_region_for_row(
+            ticker,
+            latest_row,
+            market_regions,
+        )
+
+        market_config = (
+            trading_windows.get(
+                market_region
+            )
+            if market_region
+            else None
+        )
+
+        if market_config:
+            inside_sell_window = (
+                inside_trading_window(
+                    latest_time,
+                    market_config,
+                    "sell",
+                )
+            )
+
+        if not market_config:
+            logger.warning(
+                "SELL %s: market region/config unavailable "
+                "(region=%r)",
+                ticker,
+                market_region,
+            )
+
+        normal_exit_triggered = (
+            rule1_triggered
+            or rule3_triggered
+        )
+
+        if (
+            normal_exit_triggered
+            and not rule2_triggered
+            and not inside_sell_window
+        ):
+            logger.info(
+                "SELL deferred %s: Rule1/Rule3 "
+                "outside %s preferred SELL window",
+                ticker,
+                market_region or "UNKNOWN",
+            )
+            continue
+
+        if (
+            rule2_triggered
+            and not inside_sell_window
+        ):
+            now_utc = pd.Timestamp.now(
+                tz="UTC"
+            )
+
+            data_age = (
+                now_utc - latest_time
+            )
+
+            max_age = pd.Timedelta(
+                rule2_max_data_age_minutes,
+                unit="min",
+            )
+
+            if data_age > max_age:
+                logger.info(
+                    "SELL deferred %s: Rule2 triggered "
+                    "outside preferred window but market "
+                    "data age %s exceeds %d minutes",
+                    ticker,
+                    data_age,
+                    rule2_max_data_age_minutes,
+                )
+                continue
+
+            logger.warning(
+                "SELL %s: Rule2 triggered outside "
+                "%s preferred SELL window; using fresh "
+                "market data age=%s",
+                ticker,
+                market_region or "UNKNOWN",
+                data_age,
+            )
 
         buy_eur_usd = eur_usd_near_time(
             ticker_rows,
@@ -1172,6 +1691,8 @@ def evaluate_sell(
             latest_time,
         )
 
+        buy_price_eur = None
+        sell_price_eur = None
         absolute_difference_eur = None
 
         if (
@@ -1203,7 +1724,8 @@ def evaluate_sell(
 
         logger.info(
             "SELL check %s: buy=%.4f current=%.4f "
-            "relative=%+.2f%% rule1=%s rule2=%s",
+            "relative=%+.2f%% "
+            "rule1=%s rule2=%s rule3=%s",
             ticker,
             float(buy_price),
             float(current_price),
@@ -1214,13 +1736,52 @@ def evaluate_sell(
             ) * 100.0,
             rule1_triggered,
             rule2_triggered,
+            rule3_triggered,
         )
 
         if not (
             rule1_triggered
             or rule2_triggered
+            or rule3_triggered
         ):
             continue
+
+        #
+        # Rule1 and Rule3 are normal exits and should
+        # wait for the preferred market SELL window.
+        #
+        normal_exit_triggered = (
+            rule1_triggered
+            or rule3_triggered
+        )
+
+        if (
+            normal_exit_triggered
+            and not rule2_triggered
+            and not inside_sell_window
+        ):
+            logger.info(
+                "SELL deferred %s: Rule1/Rule3 "
+                "outside %s preferred SELL window",
+                ticker,
+                market_region or "UNKNOWN",
+            )
+            continue
+
+        sell_reasons = []
+
+        if rule1_triggered:
+            sell_reasons.append("Rule1")
+
+        if rule2_triggered:
+            sell_reasons.append("Rule2")
+
+        if rule3_triggered:
+            sell_reasons.append("Rule3")
+
+        sell_reason = "+".join(
+            sell_reasons
+        )
 
         relative_difference = (
             float(current_price)
@@ -1250,7 +1811,8 @@ def evaluate_sell(
             f"{date_text} SELL "
             f"{ticker} "
             f"{ticker_name} "
-            f"{relative_difference:+.2f}%\n"
+            f"{relative_difference:+.2f}% "
+            f"{sell_reason}\n"
             f"{config['dashboard_url']}"
         )
 
@@ -1283,6 +1845,17 @@ def evaluate_sell(
                     "price": float(
                         current_price
                     ),
+                    "price_eur": (
+                        float(sell_price_eur)
+                        if sell_price_eur is not None
+                        else None
+                    ),
+                    "buy_price_eur": (
+                        float(buy_price_eur)
+                        if buy_price_eur is not None
+                        else None
+                    ),
+                    "sell_reason": sell_reason,
                     "absolute_difference_eur": (
                         float(absolute_difference_eur)
                         if absolute_difference_eur is not None
@@ -1294,11 +1867,12 @@ def evaluate_sell(
 
             logger.info(
                 "Simulation SELL %s: %s "
-                "(rule1=%s rule2=%s absolute_eur=%s)",
+                "(rule1=%s rule2=%s rule3=%s absolute_eur=%s)",
                 ticker,
                 result,
                 rule1_triggered,
                 rule2_triggered,
+                rule3_triggered,
                 (
                     f"{absolute_difference_eur:+.2f}"
                     if absolute_difference_eur is not None

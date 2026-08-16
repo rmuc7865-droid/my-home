@@ -22,7 +22,8 @@
   {
     "Ticker": "ENR",
     "ISIN": "DE000ENER6Y0",
-    "Name": "Siemens Energy AG"
+    "Name": "Siemens Energy AG",
+    "MarketRegion": "DE"
   },
   {
     "Ticker": "HOOD",

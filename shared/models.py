@@ -44,6 +44,32 @@ class TradeSignal(BaseModel):
     ticker_name: str = Field(default="", max_length=256)
     timestamp: datetime
     price: float = Field(gt=0)
+
+    price_eur: float | None = Field(
+        default=None,
+        gt=0,
+    )
+
+    buy_price_eur: float | None = Field(
+        default=None,
+        gt=0,
+    )
+
+    closeb_gt0_count: int | None = Field(
+        default=None,
+        ge=0,
+    )
+
+    closeb_gt2_count: int | None = Field(
+        default=None,
+        ge=0,
+    )
+
+    sell_reason: str | None = Field(
+        default=None,
+        max_length=64,
+    )
+
     absolute_difference_eur: float | None = None
     telegram_sent: bool = True
 

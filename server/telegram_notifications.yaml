@@ -22,6 +22,32 @@ buy:
 sell:
   enabled: true
   rule1_tolerance_minutes: 30
+  rule2_max_data_age_minutes: 30
+
+trading_windows:
+  US:
+    timezone: "America/New_York"
+    buy_start: "09:45"
+    buy_end: "15:50"
+    sell_start: "09:35"
+    sell_end: "15:55"
+    max_buy_sell_time_seconds: 120
+
+  DE:
+    timezone: "Europe/Berlin"
+    buy_start: "09:15"
+    buy_end: "17:20"
+    sell_start: "09:05"
+    sell_end: "17:25"
+    max_buy_sell_time_seconds: 120
+
+  CRYPTO:
+    timezone: "UTC"
+    buy_start: "00:00"
+    buy_end: "23:59"
+    sell_start: "00:00"
+    sell_end: "23:59"
+    max_buy_sell_time_seconds: null
 
 alerts:
   enabled: true
