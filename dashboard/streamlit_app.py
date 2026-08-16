@@ -11,6 +11,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import altair as alt
+import yaml
+
+from shared.trading_decisions import (
+    evaluate_sell_history,
+    format_duration,
+    trading_window_info,
+)
 
 API_URL = os.getenv("MONITOR_API_URL", "http://api:8000")
 API_KEY = os.getenv("MONITOR_API_KEY", "CHANGE_ME")
@@ -191,6 +198,65 @@ def load_ticker_names() -> dict[str, str]:
 
 TICKER_NAMES = load_ticker_names()
 
+
+def load_trading_config() -> dict:
+    path = Path("/app/server/telegram_notifications.yaml")
+    if not path.exists():
+        path = Path(__file__).resolve().parents[1] / "server" / "telegram_notifications.yaml"
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def load_market_regions() -> dict[str, str]:
+    path = Path("/app/config/instruments.json")
+    if not path.exists():
+        path = Path(__file__).resolve().parents[1] / "config" / "instruments.json"
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    result = {}
+    for row in rows if isinstance(rows, list) else []:
+        ticker = str(row.get("Ticker") or row.get("ticker") or "").strip().upper()
+        region = str(row.get("MarketRegion") or "").strip().upper()
+        isin = str(row.get("ISIN") or "").strip().upper()
+        if not region:
+            if isin.startswith("US"):
+                region = "US"
+            elif isin.startswith("DE"):
+                region = "DE"
+        if ticker and region:
+            result[ticker] = region
+    return result
+
+
+TRADING_CONFIG = load_trading_config()
+TRADING_WINDOWS = TRADING_CONFIG.get("trading_windows") or {}
+MARKET_REGIONS = load_market_regions()
+BUY_CONFIG = TRADING_CONFIG.get("buy") or {}
+BUY_MIN_CLOSEB_COUNT = int(BUY_CONFIG.get("minimum_closeb_count", BUY_CONFIG.get("minimum_closeb_ge2_count", 6)))
+BUY_MIN_CLOSEB_PERCENT = float(BUY_CONFIG.get("minimum_closeb_percent", 2.0))
+SELL_CONFIG = TRADING_CONFIG.get("sell") or {}
+
+
+def market_region_for_ticker(ticker: str, asset_type: str) -> str | None:
+    if str(asset_type).lower() == "crypto":
+        return "CRYPTO"
+    return MARKET_REGIONS.get(str(ticker).upper())
+
+
+def format_local_timestamp(value) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return (
+        pd.to_datetime(value, utc=True)
+        .tz_convert(LOCAL_TIMEZONE)
+        .strftime("%Y-%m-%d %H:%M")
+    )
+
+
 def build_trade_analysis(
     measurements_df: pd.DataFrame,
     trades_df: pd.DataFrame,
@@ -324,7 +390,7 @@ def build_trade_analysis(
 
     #
     # -----------------------------
-    # Curve 1: CloseB >= 2%
+    # Curve 1: CloseB >= configured C2 percentage
     # -----------------------------
     #
     # Find the measurement nearest to 2 hours
@@ -594,7 +660,7 @@ def build_trade_analysis(
         )
 
     qualifying = closeb_df[
-        closeb_df["CloseB"] >= 2.0
+        closeb_df["CloseB"] >= BUY_MIN_CLOSEB_PERCENT
     ].copy()
 
     closeb_summary = (
@@ -634,7 +700,7 @@ def build_trade_analysis(
         result_rows.append(
             {
                 "Time": timepoint,
-                "Series": "CloseB ≥ 2%",
+                "Series": f"CloseB ≥ {BUY_MIN_CLOSEB_PERCENT:g}%",
                 "Count": len(tickers),
                 "Tickers": (
                     ", ".join(tickers)
@@ -792,6 +858,7 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
 
         buy_qty = None
         buy_value_eur = None
+        price_eur = None
 
         if (
             latest["asset_type"] == "stock"
@@ -834,7 +901,43 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
             "LowB": None,
             "HighB": None,
             "CloseB": None,
+            "MarketRegion": market_region_for_ticker(ticker, latest["asset_type"]),
+            "CanBuy": False,
+            "BuyInfo": "",
+            "ShouldSell": False,
+            "CanSellNow": False,
+            "BoughtBefore": None,
+            "SellTiming": "",
+            "SellInfo": "",
         }
+
+        market_config = TRADING_WINDOWS.get(row["MarketRegion"]) if row["MarketRegion"] else None
+        if pd.notna(price) and float(price) > 0:
+            decision = evaluate_sell_history(
+                ticker_df=ticker_df,
+                latest_time=latest_time,
+                current_price=float(price),
+                movement_percent=float(SELL_CONFIG.get("movement_percent", 1.1)),
+                c5_hours=float(SELL_CONFIG.get("c5_hours", 24.0)),
+            )
+            row["ShouldSell"] = decision.should_sell
+            row["BoughtBefore"] = decision.bought_before
+            if market_config:
+                sell_window = trading_window_info(
+                    pd.Timestamp.now(tz="UTC"),
+                    market_config,
+                    "sell",
+                )
+                row["CanSellNow"] = sell_window.is_open
+                if sell_window.is_open:
+                    row["SellTiming"] = f"RemainingTime={format_duration(sell_window.remaining_time)}"
+                else:
+                    row["SellTiming"] = f"FirstNextSellTime={format_local_timestamp(sell_window.first_next_time)}"
+            row["SellInfo"] = (
+                f"C4={decision.c4_satisfied} (> {float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% drop from peak; MaxTime={format_local_timestamp(decision.max_time)}); "
+                f"C5={decision.c5_satisfied} (full {float(SELL_CONFIG.get('c5_hours', 24.0)):g}h within +/-{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% of current price; LastOneProcTime={format_local_timestamp(decision.last_one_proc_time)}); "
+                f"{row['SellTiming']}"
+            )
 
         candidate_rows = ticker_df[
             (
@@ -917,6 +1020,30 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
     result = pd.DataFrame(rows)
 
     if not result.empty:
+        closeb_ge2_count = int(
+            (pd.to_numeric(result["CloseB"], errors="coerce") >= BUY_MIN_CLOSEB_PERCENT).sum()
+        )
+        c2_satisfied = closeb_ge2_count >= BUY_MIN_CLOSEB_COUNT
+        for index, current in result.iterrows():
+            market_region = current.get("MarketRegion")
+            market_config = TRADING_WINDOWS.get(market_region) if market_region else None
+            c1_satisfied = False
+            remaining_text = "—"
+            if market_config:
+                buy_window = trading_window_info(
+                    current["_timestamp"],
+                    market_config,
+                    "buy",
+                )
+                c1_satisfied = buy_window.is_open
+                if buy_window.is_open:
+                    remaining_text = format_duration(buy_window.remaining_time)
+            result.at[index, "CanBuy"] = bool(c1_satisfied and c2_satisfied)
+            result.at[index, "BuyInfo"] = (
+                f"C1={c1_satisfied} (RemainingTime={remaining_text}); "
+                f"C2={c2_satisfied} (CloseB>={BUY_MIN_CLOSEB_PERCENT:g}%: {closeb_ge2_count}/{BUY_MIN_CLOSEB_COUNT})"
+            )
+
         result = result.sort_values(
             by=["_timestamp", "CloseB"],
             ascending=[False, False],
@@ -1113,6 +1240,8 @@ if page == "Live Overview":
                 )
             )
 
+            display_live["BoughtBefore"] = display_live["BoughtBefore"].map(format_local_timestamp)
+
             for column in [
                 "OpenB",
                 "HighB",
@@ -1147,6 +1276,13 @@ if page == "Live Overview":
                         "LowB",
                         "HighB",
                         "CloseB",
+                        "CanBuy",
+                        "BuyInfo",
+                        "ShouldSell",
+                        "CanSellNow",
+                        "BoughtBefore",
+                        "SellTiming",
+                        "SellInfo",
                     ]
                 ],
                 use_container_width=True,
@@ -1178,6 +1314,15 @@ if page == "Live Overview":
             "OpenB is the start of the block, LowB is the minimum "
             "price during the block, HighB is the maximum price, "
             "and CloseB is the latest Price collected at Time."
+        )
+        st.caption(
+            "ZERO decision support: CanBuy = C1 and C2. C1 checks the configured BUY window; "
+            f"C2 requires at least {BUY_MIN_CLOSEB_COUNT} live tickers with CloseB >= {BUY_MIN_CLOSEB_PERCENT:g}%. "
+            f"C4 is satisfied after a drop of more than {float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% from the sampled peak since InitTime. "
+            f"C5 is satisfied after a full {float(SELL_CONFIG.get('c5_hours', 24.0)):g} hours when every sampled price stays within +/-{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% of the current price. "
+            "ShouldSell = C4 or C5. "
+            "CanSellNow only indicates whether the configured SELL window is open now. "
+            "If it is closed, SellTiming shows FirstNextSellTime; otherwise it shows RemainingTime."
         )
 
 elif page == "Alerts":
@@ -1818,6 +1963,7 @@ elif page == "Simulation":
             )
 
             current_price_map = {}
+            decision_maps = {}
 
             if not df.empty:
                 newest_received = (
@@ -1877,6 +2023,24 @@ elif page == "Simulation":
                             ]
                             .to_dict()
                         )
+                        live_index = (
+                            live_now
+                            .dropna(subset=["Ticker"])
+                            .drop_duplicates(subset=["Ticker"], keep="first")
+                            .set_index("Ticker")
+                        )
+                        for decision_column in [
+                            "CanBuy",
+                            "BuyInfo",
+                            "ShouldSell",
+                            "CanSellNow",
+                            "BoughtBefore",
+                            "SellTiming",
+                            "SellInfo",
+                        ]:
+                            if decision_column in live_index.columns:
+                                decision_maps[decision_column] = live_index[decision_column].to_dict()
+
 
             #
             # Period selector.
@@ -2103,6 +2267,11 @@ elif page == "Simulation":
             #
             shown = shown.copy()
 
+            for decision_column, mapping in decision_maps.items():
+                shown[decision_column] = shown["Ticker"].map(mapping)
+            if "BoughtBefore" in shown.columns:
+                shown["BoughtBefore"] = shown["BoughtBefore"].map(format_local_timestamp)
+
             shown["CurrPriceEUR"] = (
                 shown["Ticker"].map(
                     current_price_map
@@ -2227,6 +2396,16 @@ elif page == "Simulation":
                 )
             )
 
+            for column, default_value in {
+                "CanBuy": False,
+                "ShouldSell": False,
+                "CanSellNow": False,
+                "BoughtBefore": "—",
+                "SellTiming": "—",
+            }.items():
+                if column not in shown.columns:
+                    shown[column] = default_value
+
             required_columns = [
                 "Ticker",
                 "TickerName",
@@ -2239,6 +2418,11 @@ elif page == "Simulation":
                 "RelDiff",
                 "CurrPriceEUR",
                 "CurrRelDiff",
+                "CanBuy",
+                "ShouldSell",
+                "CanSellNow",
+                "BoughtBefore",
+                "SellTiming",
                 "SellReason",
                 "Status",
             ]
@@ -2307,8 +2491,8 @@ elif page == "Trade Analysis":
     st.caption(
         f"Selected period: {range_label}. "
         "Each node represents a 15-minute timepoint. "
-        "CloseB ≥ 2% shows the number of market tickers whose "
-        "price was at least 2% above its approximately 2-hour "
+        f"CloseB ≥ {BUY_MIN_CLOSEB_PERCENT:g}% shows the number of market tickers whose "
+        f"price was at least {BUY_MIN_CLOSEB_PERCENT:g}% above its approximately 2-hour "
         "baseline. OPEN shows the number of Simulation tickers "
         "that were open at that time. OPEN nodes are omitted "
         "when no market data exists for that timepoint."
