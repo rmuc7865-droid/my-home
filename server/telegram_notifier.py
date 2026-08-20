@@ -1457,7 +1457,11 @@ def evaluate_sell(
         )
 
         if not decision.should_sell:
-            advisories.pop(ticker, None)
+            # Keep any closed-market advisory marker for this open holding.
+            # A SELL condition can flicker between polling cycles as fresh
+            # measurements arrive. Clearing the marker here would allow the
+            # same closed-session advisory to be sent again if the condition
+            # becomes true before trading opens.
             continue
 
         # BoughtBefore is an applicability cutoff for a holding. A freshly
@@ -1471,7 +1475,10 @@ def evaluate_sell(
                 buy_time,
                 decision.bought_before,
             )
-            advisories.pop(ticker, None)
+            # As above, do not clear a previously-sent closed-market marker
+            # merely because the current SELL decision is not applicable.
+            # The marker is removed when the holding is actually closed (or
+            # disappears from the open-trade list).
             continue
 
         market_region = market_region_for_row(
@@ -1532,11 +1539,12 @@ def evaluate_sell(
         if not window.is_open:
             next_text = local_text(window.first_next_time)
 
-            # Suppress repeated closed-market SELL advisories.
-            # BoughtBefore and market measurements may change every cycle,
-            # but they must not trigger another Telegram message while the
-            # SELL reason and next actionable sell time remain unchanged.
-            advisory_key = f"{sell_reason}|{next_text}"
+            # Suppress repeated closed-market SELL advisories for the whole
+            # closed session. The SELL reason (C4/C5) and market measurements
+            # may change between polling cycles, but there is still no new
+            # action the user can take until FirstNextSellTime. Therefore the
+            # deduplication key depends only on that next actionable time.
+            advisory_key = f"closed_until|{next_text}"
             if advisories.get(ticker) == advisory_key:
                 logger.info(
                     "SELL %s closed-market advisory already sent; suppressing duplicate",
