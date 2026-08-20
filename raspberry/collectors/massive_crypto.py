@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 
+from shared.market_data import market_bar_record_id
 from shared.models import MeasurementRecord
 from .base import Collector
 
@@ -153,6 +154,14 @@ class MassiveCryptoCollector(Collector):
                 measurements[output_name] = bar[key]
 
         return MeasurementRecord(
+            record_id=market_bar_record_id(
+                provider="massive",
+                system=self.system,
+                ticker=ticker,
+                multiplier=self.multiplier,
+                timespan=self.timespan,
+                timestamp=timestamp,
+            ),
             system=self.system,
             timestamp=timestamp,
             measurements=measurements,

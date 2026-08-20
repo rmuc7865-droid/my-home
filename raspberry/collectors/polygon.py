@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 
+from shared.market_data import market_bar_record_id
 from shared.models import MeasurementRecord
 from .base import Collector
 
@@ -267,6 +268,15 @@ class PolygonCollector(Collector):
         #        measurements[output_name] = bar[massive_name]
 
         #return MeasurementRecord(
+            record_id=market_bar_record_id(
+                provider="massive",
+                system=self.system,
+                ticker=ticker,
+                multiplier=self.multiplier,
+                timespan=self.timespan,
+                timestamp=timestamp,
+                variant=f"adjusted={self.adjusted}",
+            ),
             system=self.system,
             timestamp=timestamp,
             measurements=measurements,
