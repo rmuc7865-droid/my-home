@@ -6,6 +6,7 @@ from .energomonitor import EnergomonitorCollector
 from .mock import MockCollector
 from .polygon import PolygonCollector
 from .massive_crypto import MassiveCryptoCollector
+from .twelve_data import TwelveDataCollector
 
 def build_collectors(configs: list[dict]) -> list[Collector]:
     collectors: list[Collector] = []
@@ -23,6 +24,8 @@ def build_collectors(configs: list[dict]) -> list[Collector]:
             collectors.append(PolygonCollector(config))
         elif collector_type == "massive_crypto":
             collectors.append(MassiveCryptoCollector(config))
+        elif collector_type == "twelve_data":
+            collectors.append(TwelveDataCollector(config))
         else:
             raise ValueError(f"Unsupported collector type: {collector_type}")
     return collectors

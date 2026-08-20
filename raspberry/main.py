@@ -87,12 +87,14 @@ async def async_main(config_path: str, once: bool) -> None:
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(
-        service.run_cycle,
-        "interval",
-        minutes=config.get("interval_minutes", 15),
-        max_instances=1,
-        coalesce=True,
+    service.run_cycle,
+    "cron",
+    minute="2,17,32,47",
+    second=0,
+    max_instances=1,
+    coalesce=True,
     )
+
     scheduler.start()
     if config.get("run_immediately", True):
         await service.run_cycle()
