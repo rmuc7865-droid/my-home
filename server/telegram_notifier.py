@@ -728,13 +728,6 @@ def evaluate_buy(
         )
     )
 
-    threshold = float(
-        rule.get(
-            "highb_threshold_percent",
-            3.0,
-        )
-    )
-
     minimum_closeb_count = int(
         rule.get(
             "minimum_closeb_count",
@@ -755,8 +748,7 @@ def evaluate_buy(
         row
         for row in highb_rows
         if (
-            row["highb"] > threshold
-            and row.get("closeb") is not None
+            row.get("closeb") is not None
             and row["closeb"] > 0
         )
     ]
@@ -774,7 +766,7 @@ def evaluate_buy(
 
     matching.sort(
         key=lambda row: (
-            -row["highb"],
+            -row["closeb"],
             row["ticker"],
         )
     )
@@ -912,38 +904,16 @@ def evaluate_buy(
 
     highb_count = len(highb_rows)
 
-    threshold_count = sum(
-        1
-        for row in highb_rows
-        if row["highb"] > threshold
-    )
-
-    positive_closeb_count = sum(
-        1
-        for row in highb_rows
-        if (
-            row["highb"] > threshold
-            and row.get("closeb") is not None
-            and row["closeb"] > 0
-        )
-    )
-
     open_excluded_count = (
         len(matching)
         - len(eligible)
     )
 
     logger.info(
-        "BUY evaluation: total=%d HighB>%.2f%%=%d "
+        "BUY evaluation: total=%d "
         "CloseB>0=%d open_excluded=%d "
         "eligible=%d trading_eligible=%d",
         len(highb_rows),
-        threshold,
-        len([
-            row
-            for row in highb_rows
-            if row["highb"] > threshold
-        ]),
         len(matching),
         len(excluded_open),
         len(eligible),
@@ -1561,8 +1531,17 @@ def evaluate_sell(
 
         if not window.is_open:
             next_text = local_text(window.first_next_time)
-            advisory_key = f"{sell_reason}|{bought_before_text}|{next_text}"
+
+            # Suppress repeated closed-market SELL advisories.
+            # BoughtBefore and market measurements may change every cycle,
+            # but they must not trigger another Telegram message while the
+            # SELL reason and next actionable sell time remain unchanged.
+            advisory_key = f"{sell_reason}|{next_text}"
             if advisories.get(ticker) == advisory_key:
+                logger.info(
+                    "SELL %s closed-market advisory already sent; suppressing duplicate",
+                    ticker,
+                )
                 continue
 
             message = (

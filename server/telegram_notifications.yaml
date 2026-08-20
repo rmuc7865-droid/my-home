@@ -1,66 +1,74 @@
-dashboard_url: "https://dashboard.julys-consulting.com/"
-
+dashboard_url: https://dashboard.julys-consulting.com/
 poll_seconds: 60
-
 recipients:
-  - name: "Robert"
-    watchlist: "robert"
-    bot_token_env: TELEGRAM_BOT_TOKEN_USER1
-    chat_id: "8655503365"
-
-  - name: "Gabi"
-    watchlist: "gabi"
-    bot_token_env: TELEGRAM_BOT_TOKEN_USER2
-    chat_id: "8370155930"
-
+- name: Robert
+  watchlist: robert
+  bot_token_env: TELEGRAM_BOT_TOKEN_USER1
+  chat_id: '8655503365'
+- name: Gabi
+  watchlist: gabi
+  bot_token_env: TELEGRAM_BOT_TOKEN_USER2
+  chat_id: '8370155930'
 buy:
   enabled: true
-  minimum_closeb_count: 6
-  minimum_closeb_percent: 2.0
+  minimum_closeb_count: 2
+  minimum_closeb_percent: 0.4
   highb_threshold_percent: 3.0
   baseline_hours: 2
   baseline_tolerance_minutes: 30
-
 sell:
   enabled: true
   movement_percent: 1.1
-  c5_hours: 24
+  c5_hours: 24.0
   rule1_tolerance_minutes: 30
   rule2_max_data_age_minutes: 30
-
 trading_windows:
   US:
     enabled: true
-    open_weekdays: [mon, tue, wed, thu, fri]
+    open_weekdays:
+    - mon
+    - tue
+    - wed
+    - thu
+    - fri
     closed_dates: []
-    timezone: "America/New_York"
-    buy_start: "09:45"
-    buy_end: "15:50"
-    sell_start: "09:35"
-    sell_end: "15:55"
+    timezone: America/New_York
+    buy_start: 09:45
+    buy_end: '15:50'
+    sell_start: 09:35
+    sell_end: '15:55'
     max_buy_sell_time_seconds: 120
-
   DE:
     enabled: true
-    open_weekdays: [mon, tue, wed, thu, fri]
+    open_weekdays:
+    - mon
+    - tue
+    - wed
+    - thu
+    - fri
     closed_dates: []
-    timezone: "Europe/Berlin"
-    buy_start: "09:15"
-    buy_end: "17:20"
-    sell_start: "09:05"
-    sell_end: "17:25"
+    timezone: Europe/Berlin
+    buy_start: 09:15
+    buy_end: '17:20'
+    sell_start: 09:05
+    sell_end: '17:25'
     max_buy_sell_time_seconds: 120
-
   CRYPTO:
     enabled: true
-    open_weekdays: [mon, tue, wed, thu, fri, sat, sun]
+    open_weekdays:
+    - mon
+    - tue
+    - wed
+    - thu
+    - fri
+    - sat
+    - sun
     closed_dates: []
-    timezone: "UTC"
-    buy_start: "00:00"
-    buy_end: "23:59"
-    sell_start: "00:00"
-    sell_end: "23:59"
+    timezone: UTC
+    buy_start: 00:00
+    buy_end: '23:59'
+    sell_start: 00:00
+    sell_end: '23:59'
     max_buy_sell_time_seconds: null
-
 alerts:
   enabled: true

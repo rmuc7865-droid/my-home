@@ -28,6 +28,8 @@ services:
     env_file: .env
     depends_on:
       - api
+    volumes:
+      - ./server/telegram_notifications.yaml:/app/server/telegram_notifications.yaml
     restart: unless-stopped
     ports:
       - "127.0.0.1:8501:8501"

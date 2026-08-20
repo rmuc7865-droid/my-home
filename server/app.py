@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -29,11 +29,60 @@ def require_api_key(x_api_key: str = Header(default="")) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+MEASUREMENT_RETENTION_DAYS = 183
+
+def cleanup_old_measurements() -> None:
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(days=MEASUREMENT_RETENTION_DAYS)
+    )
+
+    db = SessionLocal()
+
+    try:
+        old_measurement_ids = select(
+            Measurement.id
+        ).where(
+            Measurement.timestamp < cutoff
+        )
+
+        deleted_alerts = db.execute(
+            delete(Alert).where(
+                Alert.measurement_id.in_(
+                    old_measurement_ids
+                )
+            )
+        )
+
+        deleted_measurements = db.execute(
+            delete(Measurement).where(
+                Measurement.timestamp < cutoff
+            )
+        )
+
+        db.commit()
+
+        print(
+            "Measurement retention cleanup: "
+            f"cutoff={cutoff.isoformat()}, "
+            f"measurements_deleted="
+            f"{deleted_measurements.rowcount}, "
+            f"alerts_deleted="
+            f"{deleted_alerts.rowcount}"
+        )
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    cleanup_old_measurements()
     yield
-
 
 app = FastAPI(title="Home Monitor API", version="1.0.0", lifespan=lifespan)
 
