@@ -113,7 +113,19 @@ class MassiveCryptoCollector(Collector):
 
         for query_date in query_dates:
             date_text = query_date.isoformat()
-            bars = await self._fetch_bars_for_day(client, ticker, date_text)
+            try:
+                bars = await self._fetch_bars_for_day(client, ticker, date_text)
+            except httpx.HTTPError as exc:
+                # Access/availability can differ by UTC day for delayed plans.
+                # Keep bars already fetched for other days instead of discarding
+                # the entire ticker when one date (often today) is unavailable.
+                logger.warning(
+                    "Massive crypto %s %s: request failed; skipping day: %s",
+                    ticker,
+                    date_text,
+                    exc,
+                )
+                continue
 
             logger.info(
                 "Massive crypto %s %s: returned %d bar(s)",
