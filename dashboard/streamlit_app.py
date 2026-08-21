@@ -1845,16 +1845,12 @@ elif page == "Last Data":
             st.info("No active assets available.")
 
         else:
-            # The existing BUY decision is named CanBuy in the trading logic.
-            # Last Data exposes only assets that currently require a BUY or
-            # SELL decision, without changing the underlying decision rules.
-            relevant = live[
-                live["CanBuy"].fillna(False).astype(bool)
-                | live["ShouldSell"].fillna(False).astype(bool)
-            ].copy()
+            # Last Data is the complete per-ticker trading-data view. Keep one
+            # row for every ticker regardless of its current BUY/SELL decision.
+            relevant = live.copy()
 
             if relevant.empty:
-                st.info("No tickers currently have ShouldBuy/CanBuy=True or ShouldSell=True.")
+                st.info("No ticker data is currently available.")
             else:
                 relevant["_CloseBSort"] = pd.to_numeric(
                     relevant["CloseB"], errors="coerce"
@@ -1968,8 +1964,8 @@ elif page == "Last Data":
                 )
 
         st.caption(
-            "Last Data shows only tickers for which the existing trading logic currently has "
-            "CanBuy=True (the BUY/ShouldBuy decision) or ShouldSell=True. Rows are ordered by "
+            "Last Data shows one row for every ticker, regardless of its current BUY/SELL "
+            "decision. Rows are ordered by "
             "CloseB from highest to lowest. LastCollect is the timestamp of the latest market "
             "bar, while LastPrice is its estimated EUR price. RecordsToday counts unique market "
             "bars from 03:00 Europe/Berlin, which is the operating-day boundary for this view."
