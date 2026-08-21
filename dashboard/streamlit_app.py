@@ -434,9 +434,12 @@ def fmt_local_datetime(value, fmt="%Y-%m-%d %H:%M:%S %Z"):
 def add_market_data_count(
     result: pd.DataFrame,
     measurements_df: pd.DataFrame,
+    *,
+    day_start_hour: int = 0,
+    output_column: str = "MarketData",
 ) -> pd.DataFrame:
     if result.empty or measurements_df.empty:
-        result["MarketData"] = 0
+        result[output_column] = 0
         return result
 
     work = measurements_df[
@@ -453,21 +456,27 @@ def add_market_data_count(
     local_timestamp = work["timestamp"].dt.tz_convert(
         LOCAL_TIMEZONE
     )
+    now_local = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+    day_start_local = now_local.normalize() + pd.Timedelta(hours=day_start_hour)
+    if now_local < day_start_local:
+        day_start_local -= pd.Timedelta(days=1)
 
-    today = pd.Timestamp.now(
-        tz=LOCAL_TIMEZONE
-    ).date()
-
-    work = work[
-        local_timestamp.dt.date == today
-    ].copy()
+    if day_start_hour == 0:
+        work = work[
+            local_timestamp.dt.date == now_local.date()
+        ].copy()
+    else:
+        work = work[
+            (local_timestamp >= day_start_local)
+            & (local_timestamp <= now_local)
+        ].copy()
 
     counts = (
         work.groupby("ticker")["timestamp"]
         .nunique()
     )
 
-    result["MarketData"] = (
+    result[output_column] = (
         result["Ticker"]
         .map(counts)
         .fillna(0)
@@ -1621,7 +1630,7 @@ def build_live_overview_cached(
 
 render_dashboard_title(df, alerts_df)
 
-page = st.sidebar.radio("Page", ["Advisor", "Live Overview", "Historical Trends", "Simulation", "Trade Analysis", "System Health", "Alerts", "Settings", "Logs"])
+page = st.sidebar.radio("Page", ["Advisor", "Last Data", "Historical Trends", "Simulation", "Trade Analysis", "System Health", "Alerts", "Settings", "Logs"])
 if st.sidebar.button(
     "Refresh now",
     use_container_width=True,
@@ -1765,11 +1774,11 @@ if page == "Advisor":
 
         st.caption(
             "Advisor columns: Ticker and TickerName identify the asset; LastCollect is the latest "
-            "market-data time used by Live Overview. CanBuy is the Live Overview buy decision. "
+            "market-data time used by Last Data. CanBuy is the Last Data buy decision. "
             f"Group is the number of active tickers with CloseB >= {BUY_MIN_CLOSEB_PERCENT:g}%, "
             "the count used for C2. CloseB is the approximately two-hour percentage price change. "
             "BoughtBefore is the prior-buy/init time used by the sell evaluation. ShouldSell is "
-            "the Live Overview sell decision. Drop is the percentage fall from the peak selected "
+            "the Last Data sell decision. Drop is the percentage fall from the peak selected "
             "by the shared C4 logic (decision MaxTime) to the current price. Static is the maximum "
             "absolute percentage deviation from the current price during the configured C5 lookback "
             "window; it is compared with the movement threshold used by C5. CanSellNow indicates whether the configured "
@@ -1778,7 +1787,7 @@ if page == "Advisor":
             "sell-window time or the first next sell time."
         )
 
-elif page == "Live Overview":
+elif page == "Last Data":
     market_df = df[
         df["asset_type"].isin(
             ["stock", "crypto"]
@@ -1797,275 +1806,195 @@ elif page == "Live Overview":
             )
         )
 
-        #
-        # Determine currently tracked assets using collection
-        # time, not market-bar time.
-        #
-        newest_received = (
-            market_df["received_at"].max()
-        )
-
-        active_cutoff = (
-            newest_received
-            - pd.Timedelta(minutes=30)
-        )
-
-        latest_received = (
-            market_df.groupby("ticker")[
-                "received_at"
-            ]
-            .max()
-        )
- 
+        # Determine currently tracked assets using collection time, not
+        # market-bar time. This keeps delayed feeds active as long as the
+        # collector is still receiving them.
+        newest_received = market_df["received_at"].max()
+        active_cutoff = newest_received - pd.Timedelta(minutes=30)
+        latest_received = market_df.groupby("ticker")["received_at"].max()
         active_tickers = latest_received[
             latest_received >= active_cutoff
         ].index
 
         active_df = market_df[
-            market_df["ticker"].isin(
-                active_tickers
-            )
+            market_df["ticker"].isin(active_tickers)
         ].copy()
 
         live = build_live_overview(active_df)
         live = add_market_data_count(
             live,
             market_df,
+            day_start_hour=3,
+            output_column="RecordsToday",
         )
 
-        newest_market_data = (
-            active_df["timestamp"].max()
-        )
-
+        newest_market_data = active_df["timestamp"].max()
         sources = active_df["system"].nunique()
         tracked_assets = len(active_tickers)
 
-        #
-        # Summary
-        #
         cols = st.columns(4)
+        newest_local = newest_market_data.tz_convert(LOCAL_TIMEZONE)
+        cols[0].metric("Newest data", newest_local.strftime("%H:%M %Z"))
+        cols[1].metric("Sources", sources)
+        cols[2].metric("Tracked assets", tracked_assets)
+        cols[3].metric("Open alerts", open_alerts)
 
-        #cols[0].metric(
-        #    "Newest data",
-        #    newest_market_data.strftime("%H:%M UTC"),
-        #)
-        newest_local = newest_market_data.tz_convert(
-            LOCAL_TIMEZONE
-        )
-
-        cols[0].metric(
-            "Newest data",
-            newest_local.strftime("%H:%M %Z"),
-        )
-
-        cols[1].metric(
-            "Sources",
-            sources,
-        )
-
-        cols[2].metric(
-            "Tracked assets",
-            tracked_assets,
-        )
-
-        cols[3].metric(
-            "Open alerts",
-            open_alerts,
-        )
- 
-        #
-        # Latest values
-        #
-        st.subheader("Latest values")
+        st.subheader("Last Data")
 
         if live.empty:
             st.info("No active assets available.")
 
         else:
-            display_live = live.copy()
-            
-            def format_sell_time(row):
-                value = row["SellTime"]
+            # The existing BUY decision is named CanBuy in the trading logic.
+            # Last Data exposes only assets that currently require a BUY or
+            # SELL decision, without changing the underlying decision rules.
+            relevant = live[
+                live["CanBuy"].fillna(False).astype(bool)
+                | live["ShouldSell"].fillna(False).astype(bool)
+            ].copy()
 
-                if pd.notna(value):
-                    return f"{int(value)} s"
+            if relevant.empty:
+                st.info("No tickers currently have ShouldBuy/CanBuy=True or ShouldSell=True.")
+            else:
+                relevant["_CloseBSort"] = pd.to_numeric(
+                    relevant["CloseB"], errors="coerce"
+                )
+                relevant = relevant.sort_values(
+                    by="_CloseBSort",
+                    ascending=False,
+                    na_position="last",
+                )
 
-                over = row["SellTimeOver"]
+                relevant = relevant.rename(
+                    columns={
+                        "Time": "LastCollect",
+                        "Price": "LastPrice",
+                        "SellTime": "LastSellTime",
+                        "Drop": "DropPrice",
+                        "Static": "ChangePrice",
+                    }
+                )
 
-                if pd.notna(over):
-                    return f"> {int(over)} s"
+                def format_last_sell_time(row):
+                    value = row.get("LastSellTime")
+                    if pd.notna(value):
+                        return f"{int(value)}s"
+                    over = row.get("SellTimeOver")
+                    if pd.notna(over):
+                        return f">{int(over)}s"
+                    return "—"
 
-                return "—"
-
-            display_live["SellTime"] = (
-                display_live.apply(
-                    format_sell_time,
+                relevant["LastSellTime"] = relevant.apply(
+                    format_last_sell_time,
                     axis=1,
                 )
-            )
 
-            display_live["BuyQty"] = (
-                pd.to_numeric(
-                    display_live["BuyQty"],
-                    errors="coerce",
-                )
-                .map(
-                    lambda value:
-                    str(int(value))
+                relevant["LastPrice"] = pd.to_numeric(
+                    relevant["LastPrice"], errors="coerce"
+                ).map(
+                    lambda value: f"€{value:+.3f}"
                     if pd.notna(value)
                     else "—"
                 )
-            )
 
-            display_live["BuyValueEUR"] = (
-                pd.to_numeric(
-                    display_live["BuyValueEUR"],
-                    errors="coerce",
-                )
-                .map(
-                    lambda value:
-                    f"€{value:,.0f}"
-                    if pd.notna(value)
-                    else "—"
-                )
-            )
-
-            display_live["Price"] = (
-                pd.to_numeric(
-                    display_live["Price"],
-                    errors="coerce",
-                )
-                .map(
-                    lambda value:
-                    f"€{value:,.2f}"
-                    if pd.notna(value)
-                    else "—"
-                )
-            )
-
-            display_live["BoughtBefore"] = display_live["BoughtBefore"].map(format_local_timestamp)
-
-            for column in [
-                "OpenB",
-                "HighB",
-                "LowB",
-                "CloseB",
-            ]:
-                display_live[column] = (
-                    pd.to_numeric(
-                        display_live[column],
-                        errors="coerce",
-                    )
-                    .map(
-                        lambda value:
+                relevant["OpenB"] = pd.to_numeric(
+                    relevant["OpenB"], errors="coerce"
+                ).map(
+                    lambda value: "0%"
+                    if pd.notna(value) and abs(float(value)) < 0.0000001
+                    else (
                         f"{value:+.2f}%"
                         if pd.notna(value)
                         else "—"
                     )
                 )
 
-            live = live.rename(
-                columns={
-                    "Time": "LastCollect",
-                    "SellTime": "LastSellTime",
-                }
-            )
+                for column in ["LowB", "HighB", "CloseB"]:
+                    relevant[column] = pd.to_numeric(
+                        relevant[column], errors="coerce"
+                    ).map(
+                        lambda value: f"{value:+.2f}%"
+                        if pd.notna(value)
+                        else "—"
+                    )
 
-            display = live.copy()
-            display = display.rename(
-                columns={
-                    "Time": "LastCollect",
-                    "SellTime": "LastSellTime",
-                }
-            )
+                for column in ["DropPrice", "ChangePrice"]:
+                    relevant[column] = pd.to_numeric(
+                        relevant[column], errors="coerce"
+                    ).map(
+                        lambda value: f"{value:.2f}%"
+                        if pd.notna(value)
+                        else "—"
+                    )
 
-            live_columns = [
-                "Ticker",
-                "TickerName",
-                "Type",
-                "LastCollect",
-                "MarketData",
-                "Price",
-                "OpenB",
-                "LowB",
-                "HighB",
-                "CloseB",
-                "CanBuy",
-                "C1",
-                "C2",
-                "LastSellTime",
-                "BuyQty",
-                "BuyValueEUR",
-                "ShouldSell",
-                "C4",
-                "C5",
-                "CanSellNow",
-                "BoughtBefore",
-                "SellTiming",
-            ]
-
-            display = display[
-                [
-                    column
-                    for column in live_columns
-                    if column in display.columns
+                live_columns = [
+                    "Ticker",
+                    "TickerName",
+                    "Type",
+                    "LastCollect",
+                    "LastPrice",
+                    "RecordsToday",
+                    "OpenB",
+                    "LowB",
+                    "HighB",
+                    "CloseB",
+                    "LastSellTime",
+                    "DropPrice",
+                    "ChangePrice",
+                    "C1",
+                    "C2",
+                    "C4",
+                    "C5",
                 ]
-            ]
 
-            st.dataframe(
-                display,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "CanBuy": st.column_config.CheckboxColumn(
-                        "CanBuy"
-                    ),
-                    "C1": st.column_config.CheckboxColumn(
-                        "C1"
-                    ),
-                    "C2": st.column_config.CheckboxColumn(
-                        "C2"
-                    ),
-                    "ShouldSell": st.column_config.CheckboxColumn(
-                        "ShouldSell"
-                    ),
-                    "C4": st.column_config.CheckboxColumn(
-                        "C4"
-                    ),
-                    "C5": st.column_config.CheckboxColumn(
-                        "C5"
-                    ),
-                    "CanSellNow": st.column_config.CheckboxColumn(
-                        "CanSellNow"
-                    ),
-                },
-            )
+                display = relevant[
+                    [column for column in live_columns if column in relevant.columns]
+                ]
+
+                st.dataframe(
+                    display,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "RecordsToday": st.column_config.NumberColumn(
+                            "RecordsToday",
+                            format="%d",
+                        ),
+                        "C1": st.column_config.CheckboxColumn("C1"),
+                        "C2": st.column_config.CheckboxColumn("C2"),
+                        "C4": st.column_config.CheckboxColumn("C4"),
+                        "C5": st.column_config.CheckboxColumn("C5"),
+                    },
+                )
 
         st.caption(
-            "SellTime is an estimated liquidity time for a €10,000 "
-            "position using recent 1-second market turnover and a "
-            "10% participation assumption. > 1800 s means insufficient "
-            "estimated liquidity in the previous 30 minutes. "
-            "BuyQty is the minimum whole-share quantity whose estimated "
-            "value is at least €10,000 using the ECB EUR/USD reference rate."
+            "Last Data shows only tickers for which the existing trading logic currently has "
+            "CanBuy=True (the BUY/ShouldBuy decision) or ShouldSell=True. Rows are ordered by "
+            "CloseB from highest to lowest. LastCollect is the timestamp of the latest market "
+            "bar, while LastPrice is its estimated EUR price. RecordsToday counts unique market "
+            "bars from 03:00 Europe/Berlin, which is the operating-day boundary for this view."
         )
         st.caption(
-            "OpenB, LowB, HighB and CloseB describe the "
-            "approximately 2-hour price block ending at Time. "
-            "All four values are percentage changes relative "
-            "to the baseline price approximately 2 hours earlier. "
-            "OpenB is the start of the block, LowB is the minimum "
-            "price during the block, HighB is the maximum price, "
-            "and CloseB is the latest Price collected at Time."
+            "OpenB, LowB, HighB and CloseB describe the approximately two-hour price block "
+            "ending at LastCollect. Values are percentage changes from the baseline price about "
+            "two hours earlier: OpenB is the block start, LowB the minimum, HighB the maximum, "
+            "and CloseB the latest price relative to that baseline."
         )
         st.caption(
-            "ZERO decision support: CanBuy = C1 and C2. C1 checks the configured BUY window; "
-            f"C2 requires at least {BUY_MIN_CLOSEB_COUNT} live tickers with CloseB >= {BUY_MIN_CLOSEB_PERCENT:g}%. "
-            f"C4 is satisfied after a drop of more than {float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% from the sampled peak since InitTime. "
-            f"C5 is satisfied after a full {float(SELL_CONFIG.get('c5_hours', 24.0)):g} hours when every sampled price stays within +/-{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% of the current price. "
-            "ShouldSell = C4 or C5. "
-            "CanSellNow only indicates whether the configured SELL window is open now. "
-            "If it is closed, SellTiming shows FirstNextSellTime; otherwise it shows RemainingTime."
+            "LastSellTime is the estimated time needed to sell a EUR 10,000 position using "
+            "recent one-second market turnover and the configured participation assumption. "
+            "DropPrice is the percentage fall from the peak selected by C4. ChangePrice is the "
+            "maximum absolute percentage deviation from the current price over the configured "
+            "C5 lookback window."
+        )
+        st.caption(
+            "C1 checks whether the configured BUY trading window is open at the market-data time. "
+            f"C2 is true when at least {BUY_MIN_CLOSEB_COUNT} active tickers have CloseB >= "
+            f"{BUY_MIN_CLOSEB_PERCENT:g}%. C4 is true after a drop of more than "
+            f"{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% from the sampled peak. "
+            f"C5 is true after a full {float(SELL_CONFIG.get('c5_hours', 24.0)):g} hours when "
+            f"every sampled price stays within +/-{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% "
+            "of the current price. ShouldSell = C4 or C5."
         )
 
 elif page == "Alerts":
