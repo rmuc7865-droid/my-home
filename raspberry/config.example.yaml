@@ -48,6 +48,8 @@ collectors:
     multiplier: 15
     timespan: minute
     timeout_seconds: 30
+    backfill_days: 2
+    limit: 50000
 
   # Energomonitor cloud API collector. First create an API token in the
   # Energomonitor application and run the discovery command documented in README.md.
