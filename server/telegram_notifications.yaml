@@ -11,17 +11,21 @@ recipients:
   chat_id: '8370155930'
 buy:
   enabled: true
-  minimum_closeb_count: 2
-  minimum_closeb_percent: 0.4
+  minimum_closeb_count: 5
+  minimum_closeb_percent: 1.5
   highb_threshold_percent: 3.0
   baseline_hours: 2
+  max_open_tickers: 10
   baseline_tolerance_minutes: 30
 sell:
   enabled: true
-  movement_percent: 1.1
+  movement_percent: 2.0
   c5_hours: 24.0
   rule1_tolerance_minutes: 30
   rule2_max_data_age_minutes: 30
+  c6_min_gain_percent: 2.0
+  c7_max_gain_percent: 5.0
+  details: false
 trading_windows:
   US:
     enabled: true
@@ -33,6 +37,7 @@ trading_windows:
     - fri
     closed_dates: []
     timezone: America/New_York
+    regular_close: '16:00'
     buy_start: 09:45
     buy_end: '15:50'
     sell_start: 09:35
@@ -48,6 +53,7 @@ trading_windows:
     - fri
     closed_dates: []
     timezone: Europe/Berlin
+    regular_close: '17:30'
     buy_start: 09:15
     buy_end: '17:20'
     sell_start: 09:05

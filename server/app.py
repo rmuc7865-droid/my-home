@@ -165,25 +165,64 @@ async def upload(batch: UploadBatch, db: Session = Depends(get_db)) -> UploadRes
 def measurements(
     system: str | None = None,
     limit: int = Query(default=500, ge=1, le=50000),
+    compact: bool = Query(default=False),
     db: Session = Depends(get_db),
 ) -> list[dict]:
     statement = select(Measurement).order_by(desc(Measurement.timestamp)).limit(limit)
     if system:
         statement = statement.where(Measurement.system == system)
+
     rows = db.scalars(statement).all()
-    return [
-        {
-            "id": row.id,
-            "record_id": row.record_id,
-            "device": row.device,
-            "system": row.system,
-            "timestamp": row.timestamp,
-            "measurements": json.loads(row.measurements_json),
-            "metadata": json.loads(row.metadata_json),
-            "received_at": row.received_at,
-        }
-        for row in rows
-    ]
+
+    if not compact:
+        return [
+            {
+                "id": row.id,
+                "record_id": row.record_id,
+                "device": row.device,
+                "system": row.system,
+                "timestamp": row.timestamp,
+                "measurements": json.loads(row.measurements_json),
+                "metadata": json.loads(row.metadata_json),
+                "received_at": row.received_at,
+            }
+            for row in rows
+        ]
+
+    result = []
+
+    for row in rows:
+        measurements_payload = json.loads(row.measurements_json)
+        metadata = json.loads(row.metadata_json)
+
+        ticker = metadata.get("ticker")
+        if not ticker:
+            ticker = row.system
+
+        asset_type = metadata.get("asset_type")
+        if not asset_type:
+            if row.system == "crypto":
+                asset_type = "crypto"
+            elif row.system == "polygon":
+                asset_type = "stock"
+            else:
+                asset_type = "other"
+
+        result.append(
+            {
+                "id": row.id,
+                "device": row.device,
+                "system": row.system,
+                "ticker": ticker,
+                "asset_type": asset_type,
+                "timestamp": row.timestamp,
+                "received_at": row.received_at,
+                "eur_usd": metadata.get("eur_usd"),
+                **measurements_payload,
+            }
+        )
+
+    return result
 
 
 @app.get("/api/v1/alerts", dependencies=[Depends(require_api_key)])
@@ -351,6 +390,65 @@ def simulation_open_tickers(db: Session = Depends(get_db)) -> dict[str, list[str
     )
     return {"tickers": tickers}
 
+@app.post(
+    "/api/v1/simulation/reset-open",
+    dependencies=[Depends(require_api_key)],
+)
+def reset_open_simulation_trades(
+    db: Session = Depends(get_db),
+) -> dict:
+    """Administratively close all currently OPEN simulator positions.
+
+    This is used to synchronize the simulator after the user has manually
+    cleared positions in the external broker.
+
+    It is intentionally NOT a normal simulated SELL:
+    - no SELL price is recorded;
+    - no simulated P/L is calculated;
+    - no Telegram SELL is marked as sent;
+    - SellReason is MANUAL_RESET.
+    """
+    now = datetime.now(timezone.utc)
+
+    trades = list(
+        db.scalars(
+            select(SimulationTrade)
+            .where(
+                SimulationTrade.sell_time.is_(None),
+                SimulationTrade.buy_telegram_sent.is_(True),
+            )
+            .order_by(
+                SimulationTrade.buy_time.asc(),
+                SimulationTrade.id.asc(),
+            )
+        ).all()
+    )
+
+    tickers = []
+
+    for trade in trades:
+        trade.sell_time = now
+        trade.sell_price = None
+        trade.sell_price_eur = None
+        trade.sell_reason = "MANUAL_RESET"
+        trade.relative_difference = None
+        trade.absolute_difference = None
+        trade.sell_telegram_sent = False
+        trade.updated_at = now
+
+        tickers.append(trade.ticker)
+
+    db.commit()
+
+    return {
+        "reset": True,
+        "closed_count": len(trades),
+        "tickers": tickers,
+        "reason": "MANUAL_RESET",
+        "timestamp": now,
+    }
+
+
 @app.get("/api/v1/simulation", dependencies=[Depends(require_api_key)])
 def simulation(
     days: int = Query(default=365, ge=0, le=3660),
@@ -381,7 +479,6 @@ def simulation(
     if not include_open:
         statement = statement.where(
             SimulationTrade.sell_time.is_not(None),
-            SimulationTrade.sell_telegram_sent.is_(True),
         )
     rows = db.scalars(statement).all()
     return [
@@ -403,7 +500,6 @@ def simulation(
             "Status": (
                 "CLOSED"
                 if row.sell_time is not None
-                and row.sell_telegram_sent
                 else "OPEN"
             ),
         }

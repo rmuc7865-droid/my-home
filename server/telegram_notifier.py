@@ -744,12 +744,14 @@ def evaluate_buy(
         )
         return
 
+    # C2 is a two-stage condition: the global breadth requirement must pass,
+    # and the individual ticker must itself meet the configured CloseB threshold.
     matching = [
         row
         for row in highb_rows
         if (
             row.get("closeb") is not None
-            and row["closeb"] > 0
+            and row["closeb"] >= minimum_closeb_percent
         )
     ]
 
@@ -790,6 +792,22 @@ def evaluate_buy(
             str(ticker).upper()
             for ticker in (open_payload or [])
         }
+
+    # BUY portfolio cap: never let a BUY batch take the simulator above the
+    # configured maximum number of simultaneously OPEN tickers.
+    max_open_tickers = max(1, int(rule.get("max_open_tickers", 10)))
+    open_ticker_count = len(open_tickers)
+    available_open_slots = max(0, max_open_tickers - open_ticker_count)
+
+    if available_open_slots <= 0:
+        logger.info(
+            "BUY portfolio cap reached: open=%d max=%d; no new BUYs",
+            open_ticker_count,
+            max_open_tickers,
+        )
+        state["buy_condition_active"] = False
+        return
+
 
     excluded_open = [
         row
@@ -911,7 +929,7 @@ def evaluate_buy(
 
     logger.info(
         "BUY evaluation: total=%d "
-        "CloseB>0=%d open_excluded=%d "
+        "C2_tickers=%d open_excluded=%d "
         "eligible=%d trading_eligible=%d",
         len(highb_rows),
         len(matching),
@@ -921,7 +939,9 @@ def evaluate_buy(
     )
 
     # Global BUY list: maximum 6 tickers.
-    selected = trading_eligible[:6]
+    # Keep the existing maximum-six BUY batch, but never exceed portfolio capacity.
+    buy_batch_limit = min(6, available_open_slots)
+    selected = trading_eligible[:buy_batch_limit]
     #selected = eligible[:6]
 
     if selected:
@@ -1446,41 +1466,9 @@ def evaluate_sell(
             init_time=buy_time,
         )
 
-        logger.info(
-            "SELL decision %s: ShouldSell=%s C4=%s C5=%s MaxTime=%s LastOneProcTime=%s",
-            ticker,
-            decision.should_sell,
-            decision.c4_satisfied,
-            decision.c5_satisfied,
-            decision.max_time,
-            decision.last_one_proc_time,
-        )
-
-        if not decision.should_sell:
-            # Keep any closed-market advisory marker for this open holding.
-            # A SELL condition can flicker between polling cycles as fresh
-            # measurements arrive. Clearing the marker here would allow the
-            # same closed-session advisory to be sent again if the condition
-            # becomes true before trading opens.
-            continue
-
-        # BoughtBefore is an applicability cutoff for a holding. A freshly
-        # simulated BUY at exactly MaxTime/LastOneProcTime must not immediately
-        # become a SELL. The simulator follows the advisory only when its BUY
-        # happened strictly before the computed cutoff.
-        if not sell_applies_to_holding(decision, buy_time):
-            logger.info(
-                "SELL %s not applicable to simulated holding: BuyTime=%s BoughtBefore=%s",
-                ticker,
-                buy_time,
-                decision.bought_before,
-            )
-            # As above, do not clear a previously-sent closed-market marker
-            # merely because the current SELL decision is not applicable.
-            # The marker is removed when the holding is actually closed (or
-            # disappears from the open-trade list).
-            continue
-
+        # Resolve market actionability before the SELL gate because C6 is an
+        # end-of-day rule: it is only allowed to trigger while trading is open
+        # and the configured SELL window is close to ending.
         market_region = market_region_for_row(
             ticker,
             latest_row,
@@ -1495,16 +1483,148 @@ def evaluate_sell(
             )
             continue
 
-        # CanSellNow is about the user's actionable clock time, while
-        # ShouldSell is derived from the newest available market measurement.
         action_time = pd.Timestamp.now(tz="UTC")
         window = trading_window_info(action_time, market_config, "sell")
 
+        # C6: end-of-day weak-position exit.
+        #
+        # Trigger only when C4 and C5 are both false, trading is currently open,
+        # regular market close is within c6_close_minutes, and the latest price
+        # gain versus the CURRENT OPEN holding's InitPrice/BuyPrice is below
+        # c6_min_gain_percent.
+        #
+        # C6 intentionally does NOT use BoughtBefore. BoughtBefore protects C4/C5
+        # from acting on price history that predates a fresh holding; C6 is a
+        # separate end-of-day rule for an already-open simulated position.
+        c6_enabled = bool(rule.get("c6_enabled", True))
+        c6_close_minutes = float(rule.get("c6_close_minutes", 30.0))
+        c6_min_gain_percent = float(rule.get("c6_min_gain_percent", 2.0))
+
+        # C7: end-of-day strong-profit exit.
+        #
+        # C7 deliberately uses the same reference price and regular-close
+        # countdown as C6. It triggers when C4/C5 are false and the current
+        # holding gain is ABOVE the configured maximum gain. The purpose is
+        # to realise a strong same-day profit rather than carry the position
+        # through the overnight session.
+        c7_max_gain_percent = float(rule.get("c7_max_gain_percent", 5.0))
+
+        buy_price = pd.to_numeric(trade.get("BuyPrice"), errors="coerce")
+        if pd.isna(buy_price):
+            buy_price = pd.to_numeric(trade.get("InitPrice"), errors="coerce")
+
+        c6_reference_price = None
+        c6_reference_time = None
+        c6_reference_source = None
+
+        if pd.notna(buy_price) and float(buy_price) > 0:
+            c6_reference_price = float(buy_price)
+            c6_reference_time = buy_time
+            c6_reference_source = "InitPriceLatest"
+
+        c6_gain_percent = None
+        if c6_reference_price is not None and c6_reference_price > 0:
+            c6_gain_percent = (
+                float(current_price) / c6_reference_price - 1.0
+            ) * 100.0
+
+        # C6 counts down to the end of the regular Opening phase, not to
+        # sell_end. sell_end remains the independent execution-safety cutoff.
+        c6_remaining_minutes = None
+        regular_close_value = market_config.get("regular_close")
+        if window.is_open and regular_close_value:
+            try:
+                market_timezone = str(market_config.get("timezone") or "UTC")
+                action_local = action_time.tz_convert(market_timezone)
+                regular_close_time = parse_hhmm(str(regular_close_value))
+                regular_close_local = pd.Timestamp(
+                    datetime.combine(action_local.date(), regular_close_time),
+                    tz=ZoneInfo(market_timezone),
+                )
+                c6_remaining_minutes = (
+                    regular_close_local - action_local
+                ).total_seconds() / 60.0
+            except Exception:
+                logger.exception(
+                    "SELL %s C6: invalid regular_close=%r for market %s",
+                    ticker,
+                    regular_close_value,
+                    market_region,
+                )
+
+        c6_satisfied = bool(
+            c6_enabled
+            and not decision.c4_satisfied
+            and not decision.c5_satisfied
+            and window.is_open
+            and c6_remaining_minutes is not None
+            and 0.0 <= c6_remaining_minutes <= c6_close_minutes
+            and c6_gain_percent is not None
+            and c6_gain_percent < c6_min_gain_percent
+        )
+
+        c7_satisfied = bool(
+            not decision.c4_satisfied
+            and not decision.c5_satisfied
+            and window.is_open
+            and c6_remaining_minutes is not None
+            and 0.0 <= c6_remaining_minutes <= c6_close_minutes
+            and c6_gain_percent is not None
+            and c6_gain_percent > c7_max_gain_percent
+        )
+
+        # C4/C5 keep their existing holding-applicability protection. C6/C7
+        # are evaluated independently and may sell the open holding without it.
+        c45_satisfied = bool(decision.should_sell)
+        c45_applies = bool(
+            c45_satisfied and sell_applies_to_holding(decision, buy_time)
+        )
+        should_sell = bool(c45_applies or c6_satisfied or c7_satisfied)
+
+        logger.info(
+            "SELL decision %s: ShouldSell=%s C4=%s C5=%s C6=%s C7=%s "
+            "C6Gain=%s C6Reference=%s@%s RemainingMin=%s "
+            "C7MaxGain=%+.2f%% MaxTime=%s LastOneProcTime=%s",
+            ticker,
+            should_sell,
+            decision.c4_satisfied,
+            decision.c5_satisfied,
+            c6_satisfied,
+            c7_satisfied,
+            f"{c6_gain_percent:+.2f}%" if c6_gain_percent is not None else "—",
+            c6_reference_source or "—",
+            c6_reference_time,
+            f"{c6_remaining_minutes:.1f}" if c6_remaining_minutes is not None else "—",
+            c7_max_gain_percent,
+            decision.max_time,
+            decision.last_one_proc_time,
+        )
+
+        if not should_sell:
+            if c45_satisfied and not c45_applies:
+                logger.info(
+                    "SELL %s C4/C5 not applicable to simulated holding: "
+                    "BuyTime=%s BoughtBefore=%s",
+                    ticker,
+                    buy_time,
+                    decision.bought_before,
+                )
+            # Keep any closed-market advisory marker for this open holding.
+            # A SELL condition can flicker between polling cycles as fresh
+            # measurements arrive. Clearing the marker here would allow the
+            # same closed-session advisory to be sent again if the condition
+            # becomes true before trading opens.
+            continue
+
         reasons = []
-        if decision.c4_satisfied:
+        if c45_applies and decision.c4_satisfied:
             reasons.append("C4")
-        if decision.c5_satisfied:
+        if c45_applies and decision.c5_satisfied:
             reasons.append("C5")
+        if c6_satisfied:
+            reasons.append("C6")
+        if c7_satisfied:
+            reasons.append("C7")
         sell_reason = "+".join(reasons)
 
         def local_text(value) -> str:
@@ -1523,7 +1643,6 @@ def evaluate_sell(
         )
 
         relative_difference = None
-        buy_price = pd.to_numeric(trade.get("BuyPrice"), errors="coerce")
         if pd.notna(buy_price) and float(buy_price) > 0:
             relative_difference = (
                 float(current_price) / float(buy_price) - 1.0
