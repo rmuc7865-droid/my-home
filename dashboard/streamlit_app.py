@@ -3328,12 +3328,18 @@ elif page == "Last Data":
         )
 
         newest_market_data = active_df["timestamp"].max()
-        active_assets = len(currently_collected_tickers)
+
+        # These two metrics describe exactly the rows shown in the Last Data
+        # table below. ``Assets`` is the total number of ticker rows, including
+        # historical rows with no records in the current 03:00-03:00 day.
+        # ``Assets with records`` is the subset whose displayed DayRecs value
+        # (the Records column before the display rename) is greater than zero.
+        assets = int(len(live))
         assets_with_records = (
             int(
-                (
-                    pd.to_numeric(live["Records"], errors="coerce").fillna(0) > 0
-                ).sum()
+                pd.to_numeric(
+                    live["Records"], errors="coerce"
+                ).fillna(0).gt(0).sum()
             )
             if "Records" in live.columns
             else 0
@@ -3343,7 +3349,7 @@ elif page == "Last Data":
         newest_local = newest_market_data.tz_convert(LOCAL_TIMEZONE)
         cols[0].metric("Newest data", newest_local.strftime("%H:%M %Z"))
         cols[1].metric("Assets with records", assets_with_records)
-        cols[2].metric("Assets", active_assets)
+        cols[2].metric("Assets", assets)
         cols[3].metric("Alerts", open_alerts)
 
         st.subheader("Last Data")
