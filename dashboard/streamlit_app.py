@@ -3329,12 +3329,22 @@ elif page == "Last Data":
 
         newest_market_data = active_df["timestamp"].max()
         active_assets = len(currently_collected_tickers)
+        assets_with_records = (
+            int(
+                (
+                    pd.to_numeric(live["Records"], errors="coerce").fillna(0) > 0
+                ).sum()
+            )
+            if "Records" in live.columns
+            else 0
+        )
 
-        cols = st.columns(3)
+        cols = st.columns(4)
         newest_local = newest_market_data.tz_convert(LOCAL_TIMEZONE)
         cols[0].metric("Newest data", newest_local.strftime("%H:%M %Z"))
-        cols[1].metric("Active assets", active_assets)
-        cols[2].metric("Open alerts", open_alerts)
+        cols[1].metric("Assets with records", assets_with_records)
+        cols[2].metric("Assets", active_assets)
+        cols[3].metric("Alerts", open_alerts)
 
         st.subheader("Last Data")
 
@@ -3659,8 +3669,6 @@ elif page == "Last Data":
                 live_columns = [
                     "Ticker",
                     "TickerName",
-                    "Phase",
-                    "LastSelling",
                     "DayRecs",
                     "LastCollect",
                     "LastPrice",
@@ -3670,6 +3678,8 @@ elif page == "Last Data":
                     "Close2h",
                     "DropDur2%",
                     "ChangeDur2%",
+                    "Phase",
+                    "LastSelling",
                     "WaitToTrade",
                     "WaitToOpening",
                 ]
