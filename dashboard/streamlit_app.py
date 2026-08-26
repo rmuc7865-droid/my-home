@@ -5858,7 +5858,6 @@ elif page == "Historical Data":
                     # applied at that time.
                     #
                     historical_trade_intervals = []
-                    reentry_buy_points = set()
                     historical_buy_points = {}
                     historical_sell_points = {}
 
@@ -5911,8 +5910,6 @@ elif page == "Historical Data":
                                     "BuyTime"
                                 )
 
-                                previous_sell = pd.NaT
-
                                 for _, trade in ticker_trades.iterrows():
                                     buy_time = trade.get("BuyTime")
                                     sell_time = trade.get("SellTime")
@@ -5951,32 +5948,6 @@ elif page == "Historical Data":
                                                 trade.get("SellReason") or ""
                                             ).strip().upper(),
                                         }
-
-                                    if pd.notna(previous_sell):
-                                        previous_sell_point = (
-                                            pd.Timestamp(previous_sell)
-                                            .round("15min")
-                                        )
-                                        actual_buy_point = (
-                                            pd.Timestamp(buy_time)
-                                            .round("15min")
-                                        )
-
-                                        if (
-                                            actual_buy_point
-                                            == previous_sell_point
-                                            + pd.Timedelta(minutes=15)
-                                        ):
-                                            reentry_buy_points.add(
-                                                (
-                                                    ticker,
-                                                    actual_buy_point
-                                                    - pd.Timedelta(minutes=15),
-                                                )
-                                            )
-
-                                    if pd.notna(sell_time):
-                                        previous_sell = sell_time
 
                     except Exception as exc:
                         st.warning(
@@ -6317,8 +6288,8 @@ elif page == "Historical Data":
                         )
 
                         #
-                        # Re-entry BUY points are drawn separately as
-                        # triangles. Other OPEN points use larger circles.
+                        # Every simulator BUY/init point is drawn as a triangle.
+                        # All other OPEN timepoints use larger circles.
                         #
                         open_points[
                             "_RoundedTime"
@@ -6482,25 +6453,16 @@ elif page == "Historical Data":
                             _historical_open_reason, axis=1
                         )
 
-                        open_points[
-                            "_IsReentry"
-                        ] = open_points.apply(
-                            lambda row: (
-                                str(
-                                    row["ticker"]
-                                ).upper(),
-                                row["_RoundedTime"],
-                            )
-                            in reentry_buy_points,
-                            axis=1,
+                        open_points["_IsBuyPoint"] = (
+                            open_points["_Action"].eq("Buy")
                         )
 
                         regular_open_points = open_points[
-                            ~open_points["_IsReentry"]
+                            ~open_points["_IsBuyPoint"]
                         ].copy()
 
-                        reentry_points = open_points[
-                            open_points["_IsReentry"]
+                        buy_points = open_points[
+                            open_points["_IsBuyPoint"]
                         ].copy()
 
                         if not regular_open_points.empty:
@@ -6533,12 +6495,12 @@ elif page == "Historical Data":
                                 ),
                             )
 
-                        if not reentry_points.empty:
+                        if not buy_points.empty:
                             figure.add_scatter(
-                                x=reentry_points[
+                                x=buy_points[
                                     "Local Time"
                                 ],
-                                y=reentry_points[
+                                y=buy_points[
                                     y_column
                                 ],
                                 mode="markers",
@@ -6550,8 +6512,8 @@ elif page == "Historical Data":
                                         "width": 2,
                                     },
                                 },
-                                name="Re-BUY after SELL",
-                                customdata=reentry_points[
+                                name="Simulator BUY / Init",
+                                customdata=buy_points[
                                     ["ticker", "_Action", "_Reason"]
                                 ],
                                 hovertemplate=(
