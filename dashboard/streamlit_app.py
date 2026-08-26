@@ -2260,7 +2260,7 @@ if page == "Zero-Trading":
                 parsed = pd.to_datetime(value, utc=True, errors="coerce")
                 if pd.isna(parsed):
                     return "—"
-                return parsed.tz_convert(LOCAL_TIMEZONE).strftime("%H:%M %Z")
+                return parsed.tz_convert(LOCAL_TIMEZONE).strftime("%H:%M")
 
             def _zero_interval_metrics(ticker, last_time, start_time):
                 last_time = pd.to_datetime(last_time, utc=True, errors="coerce")
@@ -3139,7 +3139,7 @@ if page == "Zero-Trading":
                 newest_display = (
                     newest_display
                     .tz_convert(LOCAL_TIMEZONE)
-                    .strftime("%H:%M %Z")
+                    .strftime("%H:%M")
                     if pd.notna(newest_display)
                     else "—"
                 )
