@@ -5352,11 +5352,32 @@ elif page == "Historical Data":
         )
     ].copy()
 
-    historical_summary_cols = st.columns(4)
-    historical_summary_cols[0].metric("Newest Data", format_newest_data(trends_df))
-    historical_summary_cols[1].metric("Assets", count_market_assets(trends_df))
-    historical_summary_cols[2].metric("Measurements", len(trends_df))
-    historical_summary_cols[3].metric("Alerts", count_open_alerts(alerts_df))
+    historical_summary_placeholder = st.empty()
+
+    def render_historical_summary(
+        from_to: str = "—",
+        points: int = 0,
+    ) -> None:
+        with historical_summary_placeholder.container():
+            historical_summary_cols = st.columns(4)
+            historical_summary_cols[0].metric(
+                "Newest Data",
+                format_newest_data(trends_df),
+            )
+            historical_summary_cols[1].metric(
+                "Assets",
+                count_market_assets(trends_df),
+            )
+            historical_summary_cols[2].metric(
+                "From - To",
+                from_to,
+            )
+            historical_summary_cols[3].metric(
+                "Points",
+                int(points),
+            )
+
+    render_historical_summary()
 
     if trends_df.empty:
         st.info("No historical data available.")
@@ -5398,10 +5419,6 @@ elif page == "Historical Data":
             st.info("No assets available.")
 
         else:
-            # Reserve the Historical Data counter row here so it is displayed
-            # directly below the Home Monitor header and above the Assets controls.
-            historical_info_placeholder = st.empty()
-
             control_cols = st.columns(4)
 
             #
@@ -6664,27 +6681,14 @@ elif page == "Historical Data":
                         else "—"
                     )
 
-                    with historical_info_placeholder.container():
-                        info_cols = st.columns(3)
-
-                        info_cols[0].metric(
-                            "From",
-                            first_time.strftime(
-                                "%d.%m %H:%M"
-                            ),
-                        )
-
-                        info_cols[1].metric(
-                            "To",
-                            last_time.strftime(
-                                "%d.%m %H:%M"
-                            ),
-                        )
-
-                        info_cols[2].metric(
-                            "Points",
-                            len(chart_df),
-                        )
+                    render_historical_summary(
+                        from_to=(
+                            first_time.strftime("%d.%m %H:%M")
+                            + " - "
+                            + last_time.strftime("%d.%m %H:%M")
+                        ),
+                        points=len(chart_df),
+                    )
 
                     st.subheader(
                         "Steps to analyse the ticker trading periods"
