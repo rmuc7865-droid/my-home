@@ -1785,8 +1785,6 @@ st.sidebar.caption(
 )
 
 if page == "Zero-Trading":
-    st.header("Zero-Trading")
-
     market_df = df[df["asset_type"].isin(["stock", "crypto"])].copy()
 
     if market_df.empty:
@@ -2262,7 +2260,7 @@ if page == "Zero-Trading":
                 parsed = pd.to_datetime(value, utc=True, errors="coerce")
                 if pd.isna(parsed):
                     return "—"
-                return parsed.tz_convert(LOCAL_TIMEZONE).strftime("%H:%M")
+                return parsed.tz_convert(LOCAL_TIMEZONE).strftime("%H:%M %Z")
 
             def _zero_interval_metrics(ticker, last_time, start_time):
                 last_time = pd.to_datetime(last_time, utc=True, errors="coerce")
@@ -2409,9 +2407,13 @@ if page == "Zero-Trading":
                 advisor["_LastSellingRaw"] = pd.to_numeric(
                     advisor.get("SellTime"), errors="coerce"
                 )
+                # Keep the original timezone-aware market timestamp for all
+                # Zero-Trading calculations.  ``Time`` is only a display string
+                # (already converted to Europe/Berlin as HH:MM); parsing it as
+                # UTC would shift LastTime and all wait/condition calculations.
                 advisor["_LastCollectRaw"] = (
-                    pd.to_datetime(advisor["Time"], utc=True, errors="coerce")
-                    if "Time" in advisor.columns
+                    pd.to_datetime(advisor["_timestamp"], utc=True, errors="coerce")
+                    if "_timestamp" in advisor.columns
                     else pd.NaT
                 )
 
@@ -3045,13 +3047,9 @@ if page == "Zero-Trading":
                         "WaitToOpening",
                         "Qty",
                         "LastSelling",
-                        "LastTops",
                         "LastClose2h",
-                        "Drop24h",
                         "DropInitTimeLatest",
-                        "Change24h",
                         "ChangeInitTimeLatest",
-                        "WeakInitTimeLatest",
                         "ProfitInitTimeLatest",
                     ]
                     if zero_details:
@@ -3146,17 +3144,22 @@ if page == "Zero-Trading":
                     else "—"
                 )
 
-                counter_cols = st.columns(3)
+                st.header("Zero-Trading")
+                counter_cols = st.columns(4)
                 counter_cols[0].metric(
                     "Newest data",
                     newest_display,
                 )
                 counter_cols[1].metric(
-                    "Buy assets",
-                    buy_asset_count,
+                    "Max Assets",
+                    BUY_MAX_OPEN_TICKERS,
                 )
                 counter_cols[2].metric(
-                    "Sell assets",
+                    "Buy Assets",
+                    buy_asset_count,
+                )
+                counter_cols[3].metric(
+                    "Sell Assets",
                     sell_asset_count,
                 )
 
