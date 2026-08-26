@@ -5925,9 +5925,14 @@ elif page == "Historical Data":
                                         )
                                     )
 
-                                    buy_point = (
-                                        pd.Timestamp(buy_time).round("15min")
-                                        - pd.Timedelta(minutes=15)
+                                    # Map the simulator BuyTime to the market-data
+                                    # node at or immediately before the BUY.  Using
+                                    # round(...)-15min incorrectly shifted exact
+                                    # quarter-hour buys (for example 16:00 -> 15:45)
+                                    # and also misclassified times after the half-way
+                                    # point of a 15-minute bucket.
+                                    buy_point = pd.Timestamp(buy_time).floor(
+                                        "15min"
                                     )
                                     historical_buy_points[(ticker, buy_point)] = {
                                         "buy_time": buy_time,
@@ -5935,10 +5940,9 @@ elif page == "Historical Data":
                                     }
 
                                     if pd.notna(sell_time):
-                                        sell_open_point = (
-                                            pd.Timestamp(sell_time).round("15min")
-                                            - pd.Timedelta(minutes=15)
-                                        )
+                                        sell_open_point = pd.Timestamp(
+                                            sell_time
+                                        ).floor("15min")
                                         historical_sell_points[
                                             (ticker, sell_open_point)
                                         ] = {
@@ -6230,10 +6234,7 @@ elif page == "Historical Data":
                             .eq(ticker)
                             & (
                                 chart_df["timestamp"]
-                                >= (
-                                    buy_time
-                                    - pd.Timedelta(minutes=15)
-                                )
+                                >= pd.Timestamp(buy_time).floor("15min")
                             )
                         )
 
@@ -6295,7 +6296,7 @@ elif page == "Historical Data":
                             "_RoundedTime"
                         ] = (
                             open_points["timestamp"]
-                            .dt.round("15min")
+                            .dt.floor("15min")
                         )
 
                         def _historical_close2h_reason(ticker, point_time):
@@ -6616,8 +6617,9 @@ elif page == "Historical Data":
                         "Historical Data node meaning: the normal line markers are market-data "
                         "observations. Larger green circular nodes mark every displayed 15-minute "
                         "timepoint during which that ticker had simulator status OPEN. A green "
-                        "triangle marks a new simulator BUY when the same ticker was sold at the "
-                        "immediately preceding 15-minute timepoint and bought again at the next one. "
+                        "triangle marks every simulator BUY/init node, including the first buy and "
+                        "all later re-buys. BUY times are mapped to the chart node at or immediately "
+                        "before the simulator BuyTime. "
                         "SellTime itself is treated as CLOSED, so OPEN highlighting ends before "
                         "the SellTime point."
                     )
