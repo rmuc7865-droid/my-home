@@ -5925,33 +5925,46 @@ elif page == "Historical Data":
                                         )
                                     )
 
-                                    # Map the simulator BuyTime to the market-data
-                                    # node at or immediately before the BUY.  Using
-                                    # round(...)-15min incorrectly shifted exact
-                                    # quarter-hour buys (for example 16:00 -> 15:45)
-                                    # and also misclassified times after the half-way
-                                    # point of a 15-minute bucket.
-                                    buy_point = pd.Timestamp(buy_time).floor(
-                                        "15min"
-                                    )
-                                    historical_buy_points[(ticker, buy_point)] = {
-                                        "buy_time": buy_time,
-                                        "sell_time": sell_time,
-                                    }
+                                    # Attach each simulator transition to exactly
+                                    # one plotted market-data node.  Using a 15-minute
+                                    # bucket as the lookup key caused every chart point
+                                    # inside that bucket to inherit Action=Buy (for
+                                    # example 15:45, 16:00 and 16:15 in sparse/irregular
+                                    # data).  Instead select the latest actual plotted
+                                    # timestamp at or before the simulator event.
+                                    ticker_chart_times = chart_df.loc[
+                                        chart_df["ticker"]
+                                        .astype(str)
+                                        .str.upper()
+                                        .eq(ticker),
+                                        "timestamp",
+                                    ]
 
-                                    if pd.notna(sell_time):
-                                        sell_open_point = pd.Timestamp(
-                                            sell_time
-                                        ).floor("15min")
-                                        historical_sell_points[
-                                            (ticker, sell_open_point)
-                                        ] = {
+                                    buy_candidates = ticker_chart_times[
+                                        ticker_chart_times <= buy_time
+                                    ]
+                                    if not buy_candidates.empty:
+                                        buy_point = buy_candidates.max()
+                                        historical_buy_points[(ticker, buy_point)] = {
                                             "buy_time": buy_time,
                                             "sell_time": sell_time,
-                                            "sell_reason": str(
-                                                trade.get("SellReason") or ""
-                                            ).strip().upper(),
                                         }
+
+                                    if pd.notna(sell_time):
+                                        sell_candidates = ticker_chart_times[
+                                            ticker_chart_times <= sell_time
+                                        ]
+                                        if not sell_candidates.empty:
+                                            sell_open_point = sell_candidates.max()
+                                            historical_sell_points[
+                                                (ticker, sell_open_point)
+                                            ] = {
+                                                "buy_time": buy_time,
+                                                "sell_time": sell_time,
+                                                "sell_reason": str(
+                                                    trade.get("SellReason") or ""
+                                                ).strip().upper(),
+                                            }
 
                     except Exception as exc:
                         st.warning(
@@ -6292,12 +6305,9 @@ elif page == "Historical Data":
                         # Every simulator BUY/init point is drawn as a triangle.
                         # All other OPEN timepoints use larger circles.
                         #
-                        open_points[
-                            "_RoundedTime"
-                        ] = (
-                            open_points["timestamp"]
-                            .dt.floor("15min")
-                        )
+                        # Keep the exact plotted timestamp for transition lookup.
+                        # A simulator BUY/SELL must label only one chart node.
+                        open_points["_ActionTime"] = open_points["timestamp"]
 
                         def _historical_close2h_reason(ticker, point_time):
                             source = historical[
@@ -6411,7 +6421,7 @@ elif page == "Historical Data":
                         def _historical_open_action(row):
                             key = (
                                 str(row["ticker"]).upper(),
-                                row["_RoundedTime"],
+                                row["_ActionTime"],
                             )
 
                             # Both BUY and SELL are attached to the preceding
@@ -6427,7 +6437,7 @@ elif page == "Historical Data":
                             action = _historical_open_action(row)
                             key = (
                                 str(row["ticker"]).upper(),
-                                row["_RoundedTime"],
+                                row["_ActionTime"],
                             )
 
                             if action == "Buy":
