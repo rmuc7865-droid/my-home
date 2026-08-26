@@ -3924,12 +3924,31 @@ elif page == "Alerts":
                 st.error(str(exc))
 
 elif page == "Settings":
+    editable_config = load_trading_config()
+    editable_windows = editable_config.setdefault("trading_windows", {})
+    editable_buy = editable_config.setdefault("buy", {})
+    editable_sell = editable_config.setdefault("sell", {})
+
+    last_change = (
+        editable_config.get("dashboard", {}).get("last_rule_change", {})
+        if isinstance(editable_config.get("dashboard", {}), dict)
+        else {}
+    )
+    last_changes_display = "—"
+    if isinstance(last_change, dict):
+        last_change_time = pd.to_datetime(last_change.get("time"), utc=True, errors="coerce")
+        last_change_description = str(last_change.get("description") or "").strip()
+        if pd.notna(last_change_time) and last_change_description:
+            last_changes_display = (
+                f"{last_change_time.tz_convert(LOCAL_TIMEZONE).strftime('%d.%m %H:%M')} · "
+                f"{last_change_description}"
+            )
+
     st.header("Settings")
-    settings_summary_cols = st.columns(4)
+    settings_summary_cols = st.columns([1, 1, 3])
     settings_summary_cols[0].metric("Newest Data", format_newest_data(df))
-    settings_summary_cols[1].metric("Max Assets", BUY_MAX_OPEN_TICKERS)
-    settings_summary_cols[2].metric("Assets", count_market_assets(df))
-    settings_summary_cols[3].metric("Alerts", count_open_alerts(alerts_df))
+    settings_summary_cols[1].metric("Assets", count_market_assets(df))
+    settings_summary_cols[2].metric("Last changes", last_changes_display)
 
     config_path = trading_config_path()
     st.caption(f"Active configuration file: {config_path}")
@@ -3938,11 +3957,6 @@ elif page == "Settings":
         st.success("Settings saved. The dashboard has reloaded and is now using the modified values.")
     if st.session_state.pop("watchlist_saved", False):
         st.success("Watchlist saved. It will be available to a collector that reads the configured watchlist path at its next collection cycle.")
-
-    editable_config = load_trading_config()
-    editable_windows = editable_config.setdefault("trading_windows", {})
-    editable_buy = editable_config.setdefault("buy", {})
-    editable_sell = editable_config.setdefault("sell", {})
 
     st.subheader("Rule-based parameters")
     st.caption(
@@ -4175,6 +4189,99 @@ elif page == "Settings":
             for error in errors:
                 st.error(error)
         else:
+            changes = []
+
+            def _record_setting_change(label, old_value, new_value, formatter=str):
+                if old_value != new_value:
+                    changes.append(
+                        f"{label} {formatter(old_value)}→{formatter(new_value)}"
+                    )
+
+            _record_setting_change(
+                "C2 count",
+                int(editable_buy.get("minimum_closeb_count", editable_buy.get("minimum_closeb_ge2_count", 6))),
+                int(new_closeb_count),
+            )
+            _record_setting_change(
+                "C2 threshold",
+                float(editable_buy.get("minimum_closeb_percent", 2.0)),
+                float(new_closeb_percent),
+                lambda value: f"{float(value):.2f}%",
+            )
+            _record_setting_change(
+                "Max OPEN",
+                int(editable_buy.get("max_open_tickers", 10)),
+                int(new_max_open_tickers),
+            )
+            _record_setting_change(
+                "C4/C5 threshold",
+                float(editable_sell.get("movement_percent", 1.1)),
+                float(new_movement_percent),
+                lambda value: f"{float(value):.2f}%",
+            )
+            _record_setting_change(
+                "C5 window",
+                float(editable_sell.get("c5_hours", 24.0)),
+                float(new_c5_hours),
+                lambda value: f"{float(value):g}h",
+            )
+            _record_setting_change(
+                "C6 gain",
+                float(editable_sell.get("c6_min_gain_percent", 2.0)),
+                float(new_c6_min_gain_percent),
+                lambda value: f"{float(value):.2f}%",
+            )
+            _record_setting_change(
+                "C7 gain",
+                float(editable_sell.get("c7_max_gain_percent", 5.0)),
+                float(new_c7_max_gain_percent),
+                lambda value: f"{float(value):.2f}%",
+            )
+            _record_setting_change(
+                "Details",
+                bool(editable_sell.get("details", True)),
+                bool(new_details),
+                lambda value: "on" if value else "off",
+            )
+
+            for region, values in market_values.items():
+                old_cfg = editable_windows.get(region, {})
+                market_fields = (
+                    ("enabled", "enabled"),
+                    ("timezone", "timezone"),
+                    ("buy_start", "BUY start"),
+                    ("buy_end", "BUY end"),
+                    ("sell_start", "SELL start"),
+                    ("sell_end", "SELL end"),
+                    ("open_weekdays", "weekdays"),
+                    ("closed_dates", "closed dates"),
+                )
+                for field, label in market_fields:
+                    old_value = old_cfg.get(field)
+                    new_value = values.get(field)
+                    if field in ("open_weekdays", "closed_dates"):
+                        old_value = list(old_value or [])
+                        new_value = list(new_value or [])
+                    _record_setting_change(
+                        f"{region} {label}",
+                        old_value,
+                        new_value,
+                        lambda value: ",".join(value) if isinstance(value, list) else str(value),
+                    )
+
+            if changes:
+                short_changes = "; ".join(changes[:3])
+                if len(changes) > 3:
+                    short_changes += f"; +{len(changes) - 3} more"
+            else:
+                short_changes = "No values changed"
+
+            dashboard_meta = editable_config.setdefault("dashboard", {})
+            dashboard_meta["last_rule_change"] = {
+                "time": pd.Timestamp.now(tz="UTC").isoformat(),
+                "description": short_changes,
+            }
+
             editable_buy["minimum_closeb_count"] = int(new_closeb_count)
             editable_buy.pop("minimum_closeb_ge2_count", None)
             editable_buy["minimum_closeb_percent"] = float(new_closeb_percent)
@@ -6604,7 +6711,13 @@ elif page == "Historical Data":
                     figure.update_layout(
                         xaxis_title="Local time",
                         yaxis_title=y_label,
-                        hovermode="x unified",
+                        # Use point-specific hover. With ``x unified`` Plotly also
+                        # shows the nearest point from sparse overlay traces. That
+                        # caused a BUY triangle at 16:00 to appear in the tooltip
+                        # while hovering the ordinary 15:45 market-data node.
+                        # ``closest`` keeps Action/Reason attached to the exact
+                        # marker being hovered.
+                        hovermode="closest",
                     )
 
                     st.plotly_chart(
