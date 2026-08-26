@@ -1,0 +1,197 @@
+--- a/server/telegram_notifier.py
++++ b/server/telegram_notifier.py
+@@ -1446,41 +1446,9 @@
+             init_time=buy_time,
+         )
+ 
+-        logger.info(
+-            "SELL decision %s: ShouldSell=%s C4=%s C5=%s MaxTime=%s LastOneProcTime=%s",
+-            ticker,
+-            decision.should_sell,
+-            decision.c4_satisfied,
+-            decision.c5_satisfied,
+-            decision.max_time,
+-            decision.last_one_proc_time,
+-        )
+-
+-        if not decision.should_sell:
+-            # Keep any closed-market advisory marker for this open holding.
+-            # A SELL condition can flicker between polling cycles as fresh
+-            # measurements arrive. Clearing the marker here would allow the
+-            # same closed-session advisory to be sent again if the condition
+-            # becomes true before trading opens.
+-            continue
+-
+-        # BoughtBefore is an applicability cutoff for a holding. A freshly
+-        # simulated BUY at exactly MaxTime/LastOneProcTime must not immediately
+-        # become a SELL. The simulator follows the advisory only when its BUY
+-        # happened strictly before the computed cutoff.
+-        if not sell_applies_to_holding(decision, buy_time):
+-            logger.info(
+-                "SELL %s not applicable to simulated holding: BuyTime=%s BoughtBefore=%s",
+-                ticker,
+-                buy_time,
+-                decision.bought_before,
+-            )
+-            # As above, do not clear a previously-sent closed-market marker
+-            # merely because the current SELL decision is not applicable.
+-            # The marker is removed when the holding is actually closed (or
+-            # disappears from the open-trade list).
+-            continue
+-
++        # Resolve market actionability before the SELL gate because C6 is an
++        # end-of-day rule: it is only allowed to trigger while trading is open
++        # and the configured SELL window is close to ending.
+         market_region = market_region_for_row(
+             ticker,
+             latest_row,
+@@ -1495,16 +1463,137 @@
+             )
+             continue
+ 
+-        # CanSellNow is about the user's actionable clock time, while
+-        # ShouldSell is derived from the newest available market measurement.
+         action_time = pd.Timestamp.now(tz="UTC")
+         window = trading_window_info(action_time, market_config, "sell")
+ 
++        # C6: end-of-day weak-position exit.
++        #
++        # Trigger only when C4 and C5 are both false, trading is currently open,
++        # the SELL window closes soon, and the latest price is still below the
++        # configured minimum gain relative to:
++        #   * InitPrice/BuyPrice for holdings no older than c6_reference_hours;
++        #   * the market price around LastTime-c6_reference_hours for older ones.
++        #
++        # C6 intentionally does NOT use BoughtBefore. BoughtBefore protects C4/C5
++        # from acting on price history that predates a fresh holding; C6 is a
++        # separate end-of-day rule for an already-open simulated position.
++        c6_enabled = bool(rule.get("c6_enabled", True))
++        c6_close_minutes = float(rule.get("c6_close_minutes", 30.0))
++        c6_min_gain_percent = float(rule.get("c6_min_gain_percent", 2.0))
++        c6_reference_hours = float(rule.get("c6_reference_hours", 24.0))
++        c6_reference_tolerance_minutes = float(
++            rule.get("c6_reference_tolerance_minutes", 30.0)
++        )
++
++        buy_price = pd.to_numeric(trade.get("BuyPrice"), errors="coerce")
++        c6_reference_price = None
++        c6_reference_time = None
++        c6_reference_source = None
++
++        reference_cutoff = latest_time - pd.Timedelta(hours=c6_reference_hours)
++        if buy_time >= reference_cutoff:
++            if pd.notna(buy_price) and float(buy_price) > 0:
++                c6_reference_price = float(buy_price)
++                c6_reference_time = buy_time
++                c6_reference_source = "InitPrice"
++        else:
++            reference_rows = ticker_df.copy()
++            reference_rows["close_numeric"] = pd.to_numeric(
++                reference_rows["close"], errors="coerce"
++            )
++            reference_rows = reference_rows[
++                reference_rows["close_numeric"].notna()
++                & (reference_rows["close_numeric"] > 0)
++            ].copy()
++            if not reference_rows.empty:
++                reference_rows["reference_distance"] = (
++                    reference_rows["timestamp"] - reference_cutoff
++                ).abs()
++                reference_row = reference_rows.sort_values(
++                    ["reference_distance", "timestamp"],
++                    ascending=[True, True],
++                ).iloc[0]
++                reference_distance_minutes = (
++                    reference_row["reference_distance"].total_seconds() / 60.0
++                )
++                if reference_distance_minutes <= c6_reference_tolerance_minutes:
++                    c6_reference_price = float(reference_row["close_numeric"])
++                    c6_reference_time = pd.to_datetime(
++                        reference_row["timestamp"], utc=True
++                    )
++                    c6_reference_source = "LastTime-24h"
++
++        c6_gain_percent = None
++        if c6_reference_price is not None and c6_reference_price > 0:
++            c6_gain_percent = (
++                float(current_price) / c6_reference_price - 1.0
++            ) * 100.0
++
++        c6_remaining_minutes = None
++        if window.is_open and window.remaining_time is not None:
++            c6_remaining_minutes = (
++                pd.Timedelta(window.remaining_time).total_seconds() / 60.0
++            )
++
++        c6_satisfied = bool(
++            c6_enabled
++            and not decision.c4_satisfied
++            and not decision.c5_satisfied
++            and window.is_open
++            and c6_remaining_minutes is not None
++            and 0.0 <= c6_remaining_minutes <= c6_close_minutes
++            and c6_gain_percent is not None
++            and c6_gain_percent < c6_min_gain_percent
++        )
++
++        # C4/C5 keep their existing holding-applicability protection. C6 is
++        # evaluated independently and may sell the open holding without it.
++        c45_satisfied = bool(decision.should_sell)
++        c45_applies = bool(
++            c45_satisfied and sell_applies_to_holding(decision, buy_time)
++        )
++        should_sell = bool(c45_applies or c6_satisfied)
++
++        logger.info(
++            "SELL decision %s: ShouldSell=%s C4=%s C5=%s C6=%s "
++            "C6Gain=%s C6Reference=%s@%s RemainingMin=%s "
++            "MaxTime=%s LastOneProcTime=%s",
++            ticker,
++            should_sell,
++            decision.c4_satisfied,
++            decision.c5_satisfied,
++            c6_satisfied,
++            f"{c6_gain_percent:+.2f}%" if c6_gain_percent is not None else "—",
++            c6_reference_source or "—",
++            c6_reference_time,
++            f"{c6_remaining_minutes:.1f}" if c6_remaining_minutes is not None else "—",
++            decision.max_time,
++            decision.last_one_proc_time,
++        )
++
++        if not should_sell:
++            if c45_satisfied and not c45_applies:
++                logger.info(
++                    "SELL %s C4/C5 not applicable to simulated holding: "
++                    "BuyTime=%s BoughtBefore=%s",
++                    ticker,
++                    buy_time,
++                    decision.bought_before,
++                )
++            # Keep any closed-market advisory marker for this open holding.
++            # A SELL condition can flicker between polling cycles as fresh
++            # measurements arrive. Clearing the marker here would allow the
++            # same closed-session advisory to be sent again if the condition
++            # becomes true before trading opens.
++            continue
++
+         reasons = []
+-        if decision.c4_satisfied:
++        if c45_applies and decision.c4_satisfied:
+             reasons.append("C4")
+-        if decision.c5_satisfied:
++        if c45_applies and decision.c5_satisfied:
+             reasons.append("C5")
++        if c6_satisfied:
++            reasons.append("C6")
+         sell_reason = "+".join(reasons)
+ 
+         def local_text(value) -> str:
+@@ -1523,7 +1612,6 @@
+         )
+ 
+         relative_difference = None
+-        buy_price = pd.to_numeric(trade.get("BuyPrice"), errors="coerce")
+         if pd.notna(buy_price) and float(buy_price) > 0:
+             relative_difference = (
+                 float(current_price) / float(buy_price) - 1.0

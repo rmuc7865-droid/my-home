@@ -24,7 +24,6 @@ sell:
   rule1_tolerance_minutes: 30
   rule2_max_data_age_minutes: 30
   c6_min_gain_percent: 2.0
-  c7_max_gain_percent: 5.0
   details: true
 trading_windows:
   US:

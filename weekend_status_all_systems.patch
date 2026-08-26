@@ -1,0 +1,11 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -752,5 +752,6 @@
+-    active_cutoff = now - pd.Timedelta(hours=24)
+-    latest = latest[latest["last_received_time"] >= active_cutoff].copy()
++    # Keep every known system in the global status calculation. A system
++    # with old data must become STALE/OFFLINE rather than disappear, otherwise
++    # Healthy/Market can incorrectly become green on weekends or outages.
+     if latest.empty:
+         return result
+ 

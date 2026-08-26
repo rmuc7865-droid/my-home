@@ -1,0 +1,17 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,3 +1,12 @@
+-                advisor["DropInitTimeLatest"] = advisor["_DropInitTimeLatestRaw"].map(_zero_percent)
++                movement_threshold = float(SELL_CONFIG.get("movement_percent", 1.1))
++                advisor["DropInitTimeLatest"] = advisor["_DropInitTimeLatestRaw"].map(
++                    lambda value: _zero_percent(value)
++                    if pd.notna(value) and abs(float(value)) > movement_threshold
++                    else "—"
++                )
+                 advisor["Change24h"] = advisor["_Change24hRaw"].map(_zero_percent)
+-                advisor["ChangeInitTimeLatest"] = advisor["_ChangeInitTimeLatestRaw"].map(_zero_percent)
++                advisor["ChangeInitTimeLatest"] = advisor["_ChangeInitTimeLatestRaw"].map(
++                    lambda value: _zero_percent(value)
++                    if pd.notna(value) and abs(float(value)) > movement_threshold
++                    else "—"
++                )

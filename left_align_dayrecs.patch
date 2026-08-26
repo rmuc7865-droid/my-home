@@ -1,0 +1,25 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -11,4 +11,11 @@
+                     }
+                 )
+ 
++                # DayRecs is a display value. Keep it as text so Streamlit
++                # follows the table's left alignment instead of right-aligning
++                # it as a numeric column.
++                relevant["DayRecs"] = relevant["DayRecs"].map(
++                    lambda value: str(int(value)) if pd.notna(value) else "—"
++                )
++
+                 live_columns = [
+@@ -2,10 +2,4 @@
+                     display,
+                     use_container_width=True,
+                     hide_index=True,
+-                    column_config={
+-                        "DayRecs": st.column_config.NumberColumn(
+-                            "DayRecs",
+-                            format="%d",
+-                        ),
+-                    },
+                 )

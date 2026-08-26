@@ -1,0 +1,17 @@
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@
+   dashboard:
+     build: .
+     command: streamlit run dashboard/streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+     env_file: .env
+     depends_on:
+       - api
+     volumes:
+       - ./server/telegram_notifications.yaml:/app/server/telegram_notifications.yaml
++      - ./config/tickers.json:/app/config/tickers.json:ro
++      - ./config/crypto_tickers.json:/app/config/crypto_tickers.json:ro
++      - ./config/international_tickers.json:/app/config/international_tickers.json:ro
+     restart: unless-stopped
+     ports:
+       - "127.0.0.1:8501:8501"

@@ -1,0 +1,43 @@
+--- a/dashboard/streamlit_app.py
++++ b/dashboard/streamlit_app.py
+@@ -1798,34 +1798,20 @@
+         )
+ 
+         #
+-        # Determine currently tracked assets using collection
+-        # time, not market-bar time.
++        # Last Data is the complete trading overview. Keep every ticker
++        # that has market data in the loaded history, even when its most
++        # recent record is older than 30 minutes (for example before the
++        # corresponding market opens).
+         #
+-        newest_received = (
+-            market_df["received_at"].max()
+-        )
+-
+-        active_cutoff = (
+-            newest_received
+-            - pd.Timedelta(minutes=30)
+-        )
+-
+         latest_received = (
+             market_df.groupby("ticker")[
+                 "received_at"
+             ]
+             .max()
+         )
+- 
+-        active_tickers = latest_received[
+-            latest_received >= active_cutoff
+-        ].index
+ 
+-        active_df = market_df[
+-            market_df["ticker"].isin(
+-                active_tickers
+-            )
+-        ].copy()
++        active_tickers = latest_received.index
++        active_df = market_df.copy()
+ 
+         live = build_live_overview(active_df)
+         live = add_market_data_count(

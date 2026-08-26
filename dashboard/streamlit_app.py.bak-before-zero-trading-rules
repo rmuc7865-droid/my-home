@@ -78,22 +78,12 @@ def load_measurement_df_cached():
         "/api/v1/measurements",
         {
             "limit": 50000,
-            "compact": True,
         },
     )
 
     measurement_rows = []
 
     for record in measurements:
-        # Compact API responses already contain the dashboard fields flattened
-        # into each row. Keep support for the original nested representation so
-        # the loader remains backward-compatible during deployments/rollbacks.
-        if "measurements" not in record:
-            # Keep raw timestamp strings while building the row list.
-            # Convert complete columns once below for much better performance.
-            measurement_rows.append(dict(record))
-            continue
-
         metadata = (
             record.get("metadata")
             or {}
@@ -124,8 +114,14 @@ def load_measurement_df_cached():
             "device": record["device"],
             "ticker": ticker,
             "asset_type": asset_type,
-            "timestamp": record["timestamp"],
-            "received_at": record.get("received_at"),
+            "timestamp": pd.to_datetime(
+                record["timestamp"],
+                utc=True,
+            ),
+            "received_at": pd.to_datetime(
+                record.get("received_at"),
+                utc=True,
+            ),
             "eur_usd": metadata.get(
                 "eur_usd"
             ),
@@ -138,61 +134,14 @@ def load_measurement_df_cached():
             }
         )
 
-    result = pd.DataFrame(
+    return pd.DataFrame(
         measurement_rows
     )
-
-    if not result.empty:
-        if "timestamp" in result.columns:
-            result["timestamp"] = pd.to_datetime(
-                result["timestamp"],
-                utc=True,
-                errors="coerce",
-                format="mixed",
-            )
-
-        if "received_at" in result.columns:
-            result["received_at"] = pd.to_datetime(
-                result["received_at"],
-                utc=True,
-                errors="coerce",
-                format="mixed",
-            )
-
-    return result
 
 def api_post(path: str):
     response = httpx.post(f"{API_URL}{path}", headers=HEADERS, timeout=20)
     response.raise_for_status()
     return response.json()
-
-
-page = st.sidebar.radio(
-    "Page",
-    [
-        "Zero-Trading",
-        "Last Data",
-        "Historical Data",
-        "Sim-Trading",
-        "Trading Efficiency",
-        "System Health",
-        "Alerts",
-        "Settings",
-        "Logs",
-    ],
-)
-
-refresh_requested = st.sidebar.button(
-    "Refresh now",
-    use_container_width=True,
-)
-
-if refresh_requested:
-    # Clear before loading dashboard data. This avoids the previous behavior
-    # where a button click first loaded the old cache, cleared it, and then
-    # triggered a second complete rerun/load.
-    st.cache_data.clear()
-
 
 try:
     df = load_measurement_df_cached()
@@ -834,18 +783,11 @@ def dashboard_status_summary(measurements_df: pd.DataFrame, alerts_table: pd.Dat
         )
     )
 
-    # Crypto and Massive are intentionally excluded from the dashboard
-    # Healthy/Market indicators.
-    #
-    # Massive may still be shown as STALE/OFFLINE on the System Health page,
-    # but its provider/system status must not control the two global badges.
-    excluded_status_systems = {"crypto", "massive"}
+    # Crypto is intentionally excluded from the dashboard Healthy/Market
+    # indicators. Those badges represent the systems relevant to ZERO
+    # stock trading decisions.
     status_latest = latest[
-        ~latest["system"]
-        .astype(str)
-        .str.strip()
-        .str.lower()
-        .isin(excluded_status_systems)
+        latest["system"].astype(str).str.strip().str.lower() != "crypto"
     ].copy()
 
     result["collector_bad"] = status_latest.loc[
@@ -900,7 +842,7 @@ def render_dashboard_title(measurements_df: pd.DataFrame, alerts_table: pd.DataF
     healthy_tip = "Healthy" if not healthy_parts else "; ".join(healthy_parts)
 
     if status.get("market_state") == "OK":
-        market_tip = "All relevant systems have MarketStatus OK"
+        market_tip = "All relevant non-crypto systems have MarketStatus OK"
     elif status.get("market_state") == "STALE":
         market_tip = (
             "MarketStatus STALE: "
@@ -1415,13 +1357,12 @@ def build_trade_analysis_cached(
     _measurements_df: pd.DataFrame,
     _trades_df: pd.DataFrame,
     reference_time,
-    period,
 ) -> pd.DataFrame:
     return build_trade_analysis(
         measurements_df=_measurements_df,
         trades_df=_trades_df,
         reference_time=reference_time,
-        period=period,
+        period=pd.Timedelta(days=7),
     )
 
 def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
@@ -1727,17 +1668,8 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
         closeb_ge2_count = int(
             (pd.to_numeric(result["CloseB"], errors="coerce") >= BUY_MIN_CLOSEB_PERCENT).sum()
         )
-        c2_breadth_satisfied = closeb_ge2_count >= BUY_MIN_CLOSEB_COUNT
+        c2_satisfied = closeb_ge2_count >= BUY_MIN_CLOSEB_COUNT
         for index, current in result.iterrows():
-            current_closeb = pd.to_numeric(
-                current.get("CloseB"),
-                errors="coerce",
-            )
-            c2_satisfied = bool(
-                c2_breadth_satisfied
-                and pd.notna(current_closeb)
-                and float(current_closeb) >= BUY_MIN_CLOSEB_PERCENT
-            )
             market_region = current.get("MarketRegion")
             market_config = TRADING_WINDOWS.get(market_region) if market_region else None
             c1_satisfied = False
@@ -1770,13 +1702,20 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
 def build_live_overview_cached(
     _data: pd.DataFrame,
     data_version,
-    cache_scope: str = "default",
 ) -> pd.DataFrame:
     return build_live_overview(
         _data
     )
 
 render_dashboard_title(df, alerts_df)
+
+page = st.sidebar.radio("Page", ["Zero-Trading", "Last Data", "Historical Data", "Sim-Trading", "Trading Efficiency", "System Health", "Alerts", "Settings", "Logs"])
+if st.sidebar.button(
+    "Refresh now",
+    use_container_width=True,
+):
+    st.cache_data.clear()
+    st.rerun()
 
 local_now = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
 st.sidebar.caption(
@@ -1798,115 +1737,22 @@ if page == "Zero-Trading":
         newest_received = market_df["received_at"].max()
         latest_received = market_df.groupby("ticker")["received_at"].max()
 
-        # Keep all stored tickers available for SELL evaluation. C4/C5/C6 must
-        # not disappear just because a source is stale (for example over a
-        # weekend). C2/BUY, however, uses only the same non-stale ticker
-        # universe as Sim-Trading so old CloseB values cannot satisfy breadth.
+        # Zero-Trading must keep all tickers with stored market data available
+        # for BUY/SELL evaluation. A stock ticker must not disappear merely
+        # because its market/source has been quiet for more than 30 minutes
+        # (for example overnight or during a weekend).
         active_tickers = latest_received.index
         active_df = market_df[
             market_df["ticker"].isin(active_tickers)
         ].copy()
-
-        advisor_data_version = (
-            active_df["timestamp"].max(),
-            active_df["id"].max(),
-        )
-        advisor_live = build_live_overview_cached(
-            active_df,
-            advisor_data_version,
-            "zero-trading-advisor",
-        )
+        advisor_live = build_live_overview(active_df)
 
         if advisor_live.empty:
             st.info("No active assets available.")
         else:
             newest_market_data = active_df["timestamp"].max()
-
-            latest_market_rows = (
-                active_df.sort_values(["timestamp", "id"])
-                .drop_duplicates(subset=["ticker"], keep="last")
-                .set_index("ticker")
-            )
-            c2_stale_tickers = set()
-            for ticker in active_tickers:
-                if ticker not in latest_market_rows.index:
-                    c2_stale_tickers.add(ticker)
-                    continue
-
-                latest_row = latest_market_rows.loc[ticker]
-                latest_bar_time = pd.to_datetime(
-                    latest_row.get("timestamp"),
-                    utc=True,
-                    errors="coerce",
-                )
-                if pd.isna(latest_bar_time):
-                    c2_stale_tickers.add(ticker)
-                    continue
-
-                asset_type = str(
-                    latest_row.get("asset_type") or ""
-                ).strip().lower()
-                maximum_bar_age = (
-                    pd.Timedelta(minutes=60)
-                    if asset_type == "crypto"
-                    else pd.Timedelta(hours=72)
-                )
-                if newest_market_data - latest_bar_time > maximum_bar_age:
-                    c2_stale_tickers.add(ticker)
-
-            c2_active_tickers = set(active_tickers) - c2_stale_tickers
-            c2_active_df = active_df[
-                active_df["ticker"].isin(c2_active_tickers)
-            ].copy()
-            c2_live = (
-                build_live_overview_cached(
-                    c2_active_df,
-                    (
-                        c2_active_df["timestamp"].max(),
-                        c2_active_df["id"].max(),
-                    ),
-                    "zero-trading-c2",
-                )
-                if not c2_active_df.empty
-                else pd.DataFrame()
-            )
-
-            if not c2_live.empty and "Ticker" in c2_live.columns:
-                c2_closeb_numeric = pd.to_numeric(
-                    c2_live.get("CloseB"),
-                    errors="coerce",
-                )
-                c2_group_count = int(
-                    (c2_closeb_numeric >= BUY_MIN_CLOSEB_PERCENT).sum()
-                )
-                c2_map = (
-                    c2_live
-                    .dropna(subset=["Ticker"])
-                    .assign(
-                        _TickerKey=lambda frame: (
-                            frame["Ticker"]
-                            .astype(str)
-                            .str.strip()
-                            .str.upper()
-                        )
-                    )
-                    .drop_duplicates(subset=["_TickerKey"], keep="first")
-                    .set_index("_TickerKey")["C2"]
-                    .fillna(False)
-                    .astype(bool)
-                    .to_dict()
-                )
-            else:
-                c2_group_count = 0
-                c2_map = {}
-
-            advisor_live["C2"] = (
-                advisor_live["Ticker"]
-                .astype(str)
-                .str.strip()
-                .str.upper()
-                .map(lambda ticker: bool(c2_map.get(ticker, False)))
-            )
+            closeb_numeric = pd.to_numeric(advisor_live.get("CloseB"), errors="coerce")
+            c2_group_count = int((closeb_numeric >= BUY_MIN_CLOSEB_PERCENT).sum())
 
             try:
                 zero_sim_payload = load_simulation_payload_cached()
@@ -1948,6 +1794,16 @@ if page == "Zero-Trading":
                 zero_open_buy_times = {}
                 zero_open_trades = {}
 
+            zero_max_open = BUY_MAX_OPEN_TICKERS
+            zero_available_open_slots = max(0, zero_max_open - zero_open_count)
+
+            if zero_available_open_slots <= 0:
+                st.warning(
+                    "BUY portfolio limit reached: "
+                    f"{zero_open_count}/{zero_max_open} OPEN tickers. "
+                    "New BUYs are blocked until a position is closed or the limit is increased in Settings."
+                )
+
             movement_threshold = float(
                 SELL_CONFIG.get("movement_percent", 1.1)
             )
@@ -1956,9 +1812,6 @@ if page == "Zero-Trading":
             )
             c6_min_gain_percent = float(
                 SELL_CONFIG.get("c6_min_gain_percent", 2.0)
-            )
-            c7_max_gain_percent = float(
-                SELL_CONFIG.get("c7_max_gain_percent", 5.0)
             )
             c6_close_minutes = float(
                 SELL_CONFIG.get("c6_close_minutes", 30.0)
@@ -1971,9 +1824,7 @@ if page == "Zero-Trading":
             )
 
             advisor_live["C6"] = False
-            advisor_live["C7"] = False
             advisor_live["C6Check"] = "—"
-            advisor_live["C7Check"] = "—"
 
             for idx, row in advisor_live.iterrows():
                 ticker_value = str(
@@ -2096,19 +1947,8 @@ if page == "Zero-Trading":
                     and c6_gain_percent < c6_min_gain_percent
                 )
 
-                c7_satisfied = bool(
-                    not decision.c4_satisfied
-                    and not decision.c5_satisfied
-                    and window is not None
-                    and window.is_open
-                    and c6_remaining_minutes is not None
-                    and 0.0 <= c6_remaining_minutes <= c6_close_minutes
-                    and c6_gain_percent is not None
-                    and c6_gain_percent > c7_max_gain_percent
-                )
-
                 advisor_live.at[idx, "ShouldSell"] = bool(
-                    decision.should_sell or c6_satisfied or c7_satisfied
+                    decision.should_sell or c6_satisfied
                 )
                 advisor_live.at[idx, "C4"] = bool(
                     decision.c4_satisfied
@@ -2117,7 +1957,6 @@ if page == "Zero-Trading":
                     decision.c5_satisfied
                 )
                 advisor_live.at[idx, "C6"] = c6_satisfied
-                advisor_live.at[idx, "C7"] = c7_satisfied
                 advisor_live.at[idx, "BoughtBefore"] = (
                     decision.bought_before
                 )
@@ -2136,22 +1975,6 @@ if page == "Zero-Trading":
                         f"remaining={c6_remaining_minutes:.1f}m"
                         if c6_remaining_minutes is not None
                         else f"; threshold < {c6_min_gain_percent:.2f}%; remaining=—"
-                    )
-
-                advisor_live.at[idx, "C7Check"] = (
-                    f"{'TRUE' if c7_satisfied else 'FALSE'}: "
-                    f"gain {c6_gain_percent:+.2f}%"
-                    if c6_gain_percent is not None
-                    else f"{'TRUE' if c7_satisfied else 'FALSE'}: gain unavailable"
-                )
-                if c6_gain_percent is not None:
-                    advisor_live.at[idx, "C7Check"] += (
-                        f"; threshold > {c7_max_gain_percent:.2f}%; "
-                        f"reference={c6_reference_source or '—'} "
-                        f"{format_local_timestamp(c6_reference_time)}; "
-                        f"remaining={c6_remaining_minutes:.1f}m"
-                        if c6_remaining_minutes is not None
-                        else f"; threshold > {c7_max_gain_percent:.2f}%; remaining=—"
                     )
 
                 if (
@@ -2190,224 +2013,178 @@ if page == "Zero-Trading":
                     f"{last_outside}"
                 )
 
-            # Build one current row per ticker. Current condition values are
-            # evaluated at that ticker's own latest collected market timestamp.
-            # Details add the latest actual simulator state transition (Buy/Sell)
-            # in the active 03:00 -> 03:00 local accounting day.
-            def _zero_timedelta_text(value):
-                if value is None:
-                    return "—"
+            if "ShouldBuy" in advisor_live.columns:
+                buy_decision = advisor_live["ShouldBuy"].fillna(False).astype(bool)
+            elif "CanBuy" in advisor_live.columns:
+                buy_decision = advisor_live["CanBuy"].fillna(False).astype(bool)
+            else:
+                buy_decision = pd.Series(False, index=advisor_live.index)
 
-                total_minutes = None
-                if isinstance(value, str):
-                    raw = value.strip()
-                    if not raw or raw in {"-", "—", "None", "nan", "NaT"}:
+            if zero_available_open_slots <= 0:
+                buy_decision = pd.Series(False, index=advisor_live.index)
+            else:
+                buy_candidates = advisor_live.loc[buy_decision].copy()
+                if not buy_candidates.empty:
+                    buy_candidates["_CloseBSort"] = pd.to_numeric(buy_candidates.get("CloseB"), errors="coerce")
+                    allowed_buy_indexes = set(
+                        buy_candidates.sort_values(
+                            ["_CloseBSort", "Ticker"],
+                            ascending=[False, True],
+                            na_position="last",
+                        ).head(min(6, zero_available_open_slots)).index.tolist()
+                    )
+                    buy_decision = pd.Series(
+                        [bool(buy_decision.loc[idx]) and idx in allowed_buy_indexes for idx in advisor_live.index],
+                        index=advisor_live.index,
+                    )
+
+            # Zero-Trading actions must respect the simulator position state:
+            # - an already OPEN ticker cannot be a new BUY candidate;
+            # - a SELL recommendation is valid only for an OPEN simulator ticker.
+            ticker_is_open = (
+                advisor_live["Ticker"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .isin(zero_open_tickers)
+            )
+
+            buy_decision = buy_decision & ~ticker_is_open
+
+            if "ShouldSell" in advisor_live.columns:
+                sell_decision = (
+                    advisor_live["ShouldSell"]
+                    .fillna(False)
+                    .astype(bool)
+                    & ticker_is_open
+                )
+            else:
+                sell_decision = pd.Series(False, index=advisor_live.index)
+
+            advisor = advisor_live[buy_decision | sell_decision].copy()
+
+            if advisor.empty:
+                st.success("No current Buy or Sell recommendations.")
+            else:
+                advisor["_BuyDecision"] = buy_decision.loc[advisor.index]
+                advisor["_SellDecision"] = sell_decision.loc[advisor.index]
+                advisor["Action"] = advisor.apply(
+                    lambda row: "Sell" if bool(row["_SellDecision"]) else "Buy",
+                    axis=1,
+                )
+
+                def _zero_timedelta_text(value):
+                    if value is None:
                         return "—"
-                    parts = raw.split(":")
-                    if (
-                        len(parts) == 2
-                        and parts[0].isdigit()
-                        and parts[1].isdigit()
-                    ):
-                        total_hours = int(parts[0])
-                        minute_part = int(parts[1])
-                        if 0 <= minute_part < 60:
-                            total_minutes = total_hours * 60 + minute_part
-                    if total_minutes is None:
+
+                    total_minutes = None
+
+                    if isinstance(value, str):
+                        raw = value.strip()
+                        if not raw or raw in {"-", "—", "None", "nan", "NaT"}:
+                            return "—"
+
+                        # Last Data may supply wait values as total-hours HH:MM,
+                        # including values above 24 hours such as 61:45.
+                        parts = raw.split(":")
+                        if (
+                            len(parts) == 2
+                            and parts[0].isdigit()
+                            and parts[1].isdigit()
+                        ):
+                            total_hours = int(parts[0])
+                            minute_part = int(parts[1])
+                            if 0 <= minute_part < 60:
+                                total_minutes = total_hours * 60 + minute_part
+
+                        if total_minutes is None:
+                            try:
+                                delta = pd.to_timedelta(raw)
+                            except Exception:
+                                return raw
+                            if pd.isna(delta):
+                                return "—"
+                            total_minutes = max(
+                                0,
+                                int(round(delta.total_seconds() / 60.0)),
+                            )
+                    else:
                         try:
-                            delta = pd.to_timedelta(raw)
+                            delta = pd.to_timedelta(value)
                         except Exception:
-                            return raw
+                            return "—"
                         if pd.isna(delta):
                             return "—"
                         total_minutes = max(
                             0,
                             int(round(delta.total_seconds() / 60.0)),
                         )
-                else:
+
+                    days, remainder = divmod(total_minutes, 24 * 60)
+                    hours, minutes = divmod(remainder, 60)
+
+                    return (
+                        f"{days}d {hours:02d}:{minutes:02d}"
+                        if days > 0
+                        else f"{hours:02d}:{minutes:02d}"
+                    )
+
+                def _zero_wait_is_zero(value):
+                    if value is None:
+                        return False
                     try:
                         delta = pd.to_timedelta(value)
+                        if pd.isna(delta):
+                            return False
+                        return abs(delta.total_seconds()) < 30
                     except Exception:
-                        return "—"
-                    if pd.isna(delta):
-                        return "—"
-                    total_minutes = max(
-                        0,
-                        int(round(delta.total_seconds() / 60.0)),
+                        return str(value).strip().lower() in {
+                            "0", "0s", "00:00", "0:00", "0d 00:00", "0 days 00:00:00"
+                        }
+
+                def _zero_local_timestamp(value):
+                    parsed = pd.to_datetime(
+                        value,
+                        errors="coerce",
                     )
+                    if pd.isna(parsed):
+                        return "—"
+                    return parsed.strftime("%H:%M")
 
-                days, remainder = divmod(total_minutes, 24 * 60)
-                hours, minutes = divmod(remainder, 60)
-                return (
-                    f"{days}d {hours:02d}:{minutes:02d}"
-                    if days > 0
-                    else f"{hours:02d}:{minutes:02d}"
-                )
+                def _zero_interval_metrics(ticker, last_time, start_time):
+                    last_time = pd.to_datetime(last_time, utc=True, errors="coerce")
+                    start_time = pd.to_datetime(start_time, utc=True, errors="coerce")
+                    if pd.isna(last_time) or pd.isna(start_time):
+                        return (None, None)
+                    source = market_df[market_df["ticker"].astype(str) == str(ticker)].copy()
+                    if source.empty:
+                        return (None, None)
+                    source = source[(source["timestamp"] >= start_time) & (source["timestamp"] <= last_time)].copy()
+                    if source.empty:
+                        return (None, None)
+                    source["_CloseNumeric"] = pd.to_numeric(source["close"], errors="coerce")
+                    source = source[source["_CloseNumeric"].notna() & (source["_CloseNumeric"] > 0)].copy()
+                    if source.empty:
+                        return (None, None)
+                    sort_cols = ["timestamp", "id"] if "id" in source.columns else ["timestamp"]
+                    source = source.sort_values(sort_cols).drop_duplicates(subset=["timestamp"], keep="last")
+                    last_price = float(source.iloc[-1]["_CloseNumeric"])
+                    peak_price = float(source["_CloseNumeric"].max())
+                    if last_price <= 0 or peak_price <= 0:
+                        return (None, None)
+                    drop_percent = max(0.0, ((peak_price - last_price) / peak_price) * 100.0)
+                    change_percent = float((((source["_CloseNumeric"] / last_price) - 1.0).abs().max()) * 100.0)
+                    return (drop_percent, change_percent)
 
-            def _zero_wait_is_zero(value):
-                if value is None:
-                    return False
-                try:
-                    delta = pd.to_timedelta(value)
-                    if pd.isna(delta):
-                        return False
-                    return abs(delta.total_seconds()) < 30
-                except Exception:
-                    return str(value).strip().lower() in {
-                        "0", "0s", "00:00", "0:00", "0d 00:00",
-                        "0 days 00:00:00",
-                    }
-
-            def _zero_local_timestamp(value):
-                parsed = pd.to_datetime(value, utc=True, errors="coerce")
-                if pd.isna(parsed):
-                    return "—"
-                return parsed.tz_convert(LOCAL_TIMEZONE).strftime("%H:%M")
-
-            def _zero_interval_metrics(ticker, last_time, start_time):
-                last_time = pd.to_datetime(last_time, utc=True, errors="coerce")
-                start_time = pd.to_datetime(start_time, utc=True, errors="coerce")
-                if pd.isna(last_time) or pd.isna(start_time):
-                    return (None, None)
-                source = market_df[
-                    market_df["ticker"].astype(str).str.upper() == str(ticker).upper()
-                ].copy()
-                if source.empty:
-                    return (None, None)
-                source = source[
-                    (source["timestamp"] >= start_time)
-                    & (source["timestamp"] <= last_time)
-                ].copy()
-                if source.empty:
-                    return (None, None)
-                source["_CloseNumeric"] = pd.to_numeric(
-                    source["close"], errors="coerce"
+                advisor["_LastClose2hRaw"] = pd.to_numeric(advisor.get("CloseB"), errors="coerce")
+                advisor["_LastSellingRaw"] = pd.to_numeric(advisor.get("SellTime"), errors="coerce")
+                advisor["_InitTimeLatestRaw"] = advisor["Ticker"].astype(str).str.strip().str.upper().map(
+                    zero_open_buy_times
                 )
-                source = source[
-                    source["_CloseNumeric"].notna()
-                    & (source["_CloseNumeric"] > 0)
-                ].copy()
-                if source.empty:
-                    return (None, None)
-                sort_cols = (
-                    ["timestamp", "id"]
-                    if "id" in source.columns
-                    else ["timestamp"]
-                )
-                source = (
-                    source.sort_values(sort_cols)
-                    .drop_duplicates(subset=["timestamp"], keep="last")
-                )
-                last_price = float(source.iloc[-1]["_CloseNumeric"])
-                peak_price = float(source["_CloseNumeric"].max())
-                if last_price <= 0 or peak_price <= 0:
-                    return (None, None)
-                drop_percent = max(
-                    0.0,
-                    ((peak_price - last_price) / peak_price) * 100.0,
-                )
-                change_percent = float(
-                    (((source["_CloseNumeric"] / last_price) - 1.0).abs().max())
-                    * 100.0
-                )
-                return (drop_percent, change_percent)
-
-            def _zero_trade_value(trade, *keys):
-                for key in keys:
-                    if key in trade and trade.get(key) not in (None, ""):
-                        return trade.get(key)
-                return None
-
-            # Normalize simulator trades once so state-at-time and the latest
-            # action in the accounting day can be derived deterministically.
-            zero_sim_df = pd.DataFrame(zero_sim_rows)
-            if zero_sim_df.empty:
-                zero_sim_df = pd.DataFrame(
-                    columns=[
-                        "Ticker", "BuyTime", "SellTime", "SellReason",
-                        "BuyPriceEUR", "BuyPrice", "InitPrice",
-                    ]
-                )
-            if "Ticker" not in zero_sim_df.columns:
-                if "ticker" in zero_sim_df.columns:
-                    zero_sim_df["Ticker"] = zero_sim_df["ticker"]
-                else:
-                    zero_sim_df["Ticker"] = ""
-            zero_sim_df["Ticker"] = (
-                zero_sim_df["Ticker"].astype(str).str.strip().str.upper()
-            )
-            for canonical, fallback in [
-                ("BuyTime", "buy_time"),
-                ("SellTime", "sell_time"),
-            ]:
-                if canonical not in zero_sim_df.columns:
-                    zero_sim_df[canonical] = (
-                        zero_sim_df[fallback]
-                        if fallback in zero_sim_df.columns
-                        else pd.NaT
-                    )
-                zero_sim_df[canonical] = pd.to_datetime(
-                    zero_sim_df[canonical], utc=True, errors="coerce"
-                )
-
-            def _zero_latest_trade_at(ticker, when):
-                when = pd.to_datetime(when, utc=True, errors="coerce")
-                if pd.isna(when) or zero_sim_df.empty:
-                    return None
-                trades = zero_sim_df[
-                    (zero_sim_df["Ticker"] == str(ticker).upper())
-                    & zero_sim_df["BuyTime"].notna()
-                    & (zero_sim_df["BuyTime"] <= when)
-                ].copy()
-                if trades.empty:
-                    return None
-                return trades.sort_values("BuyTime").iloc[-1]
-
-            def _zero_is_open_at(ticker, when):
-                trade = _zero_latest_trade_at(ticker, when)
-                if trade is None:
-                    return False
-                sell_time = pd.to_datetime(
-                    trade.get("SellTime"), utc=True, errors="coerce"
-                )
-                when = pd.to_datetime(when, utc=True, errors="coerce")
-                return pd.isna(sell_time) or sell_time > when
-
-            def _zero_market_row_at(ticker, when):
-                when = pd.to_datetime(when, utc=True, errors="coerce")
-                if pd.isna(when):
-                    return None
-                source = active_df[
-                    (active_df["ticker"].astype(str).str.upper() == str(ticker).upper())
-                    & (active_df["timestamp"] <= when)
-                ].copy()
-                if source.empty:
-                    return None
-                sort_cols = (
-                    ["timestamp", "id"]
-                    if "id" in source.columns
-                    else ["timestamp"]
-                )
-                return source.sort_values(sort_cols).iloc[-1]
-
-            def _zero_open_count_at(when):
-                if zero_sim_df.empty:
-                    return 0
-                count = 0
-                for ticker in zero_sim_df["Ticker"].dropna().unique():
-                    if ticker and _zero_is_open_at(ticker, when):
-                        count += 1
-                return count
-
-            advisor = advisor_live.copy()
-            if advisor.empty:
-                st.info("No active assets available.")
-            else:
-                advisor["_LastClose2hRaw"] = pd.to_numeric(
-                    advisor.get("CloseB"), errors="coerce"
-                )
-                advisor["_LastSellingRaw"] = pd.to_numeric(
-                    advisor.get("SellTime"), errors="coerce"
+                advisor["_InitTimeLatestRaw"] = pd.to_datetime(
+                    advisor["_InitTimeLatestRaw"],
+                    utc=True,
+                    errors="coerce",
                 )
                 advisor["_LastCollectRaw"] = (
                     pd.to_datetime(advisor["Time"], utc=True, errors="coerce")
@@ -2415,301 +2192,33 @@ if page == "Zero-Trading":
                     else pd.NaT
                 )
 
-                # Recalculate C4/C5/C6/C7 and waits at each ticker's LastTime.
-                # InitTimeLatest is the latest simulator BuyTime that is still
-                # OPEN at that exact timestamp.
-                current_c4 = {}
-                current_c5 = {}
-                current_c6 = {}
-                current_c7 = {}
-                current_wait_trade = {}
-                current_wait_opening = {}
-                current_init = {}
-                current_open = {}
-                current_sell_window_open = {}
-                current_buy_window_open = {}
-                current_profit_init = {}
-                current_buy_ts = {}
-                current_buy_c2 = {}
-                current_c2_snapshot_cache = {}
-
-                def _zero_current_c2_at(action_time, ticker):
-                    action_time = pd.to_datetime(action_time, utc=True, errors="coerce")
-                    if pd.isna(action_time):
-                        return (0, False)
-                    cache_key = pd.Timestamp(action_time).isoformat()
-                    if cache_key not in current_c2_snapshot_cache:
-                        snapshot_source = active_df[
-                            active_df["timestamp"] <= action_time
-                        ].copy()
-                        if snapshot_source.empty:
-                            current_c2_snapshot_cache[cache_key] = (0, {})
-                        else:
-                            snapshot_live = build_live_overview(snapshot_source)
-                            if snapshot_live.empty or "Ticker" not in snapshot_live.columns:
-                                current_c2_snapshot_cache[cache_key] = (0, {})
-                            else:
-                                closeb = pd.to_numeric(
-                                    snapshot_live.get("CloseB"), errors="coerce"
-                                )
-                                count = int(
-                                    (closeb >= BUY_MIN_CLOSEB_PERCENT).sum()
-                                )
-                                snapshot_map = (
-                                    snapshot_live
-                                    .assign(
-                                        _TickerKey=lambda frame: (
-                                            frame["Ticker"].astype(str).str.strip().str.upper()
-                                        ),
-                                        _CloseBNumeric=closeb,
-                                    )
-                                    .drop_duplicates(subset=["_TickerKey"], keep="first")
-                                    .set_index("_TickerKey")["_CloseBNumeric"]
-                                    .to_dict()
-                                )
-                                current_c2_snapshot_cache[cache_key] = (count, snapshot_map)
-                    count, closeb_map = current_c2_snapshot_cache[cache_key]
-                    ticker_closeb = pd.to_numeric(
-                        closeb_map.get(str(ticker).upper()), errors="coerce"
-                    )
-                    c2_value = bool(
-                        count >= BUY_MIN_CLOSEB_COUNT
-                        and pd.notna(ticker_closeb)
-                        and float(ticker_closeb) >= BUY_MIN_CLOSEB_PERCENT
-                    )
-                    return (count, c2_value)
-
+                wait_to_trade_raw = {}
+                wait_to_opening_raw = {}
                 for idx, row in advisor.iterrows():
                     ticker = str(row.get("Ticker") or "").strip().upper()
-                    last_time = pd.to_datetime(
-                        row.get("_LastCollectRaw"), utc=True, errors="coerce"
-                    )
-                    market_row = _zero_market_row_at(ticker, last_time)
-                    asset_type = market_row.get("asset_type") if market_row is not None else None
+                    ticker_measurements = active_df[active_df["ticker"].astype(str) == ticker]
+                    asset_type = None
+                    if not ticker_measurements.empty:
+                        asset_type = ticker_measurements.sort_values("timestamp").iloc[-1].get("asset_type")
                     region = market_region_for_ticker(ticker, asset_type)
-                    market_config = TRADING_WINDOWS.get(region) if region else None
+                    phase_info = market_phase_info(newest_market_data, region)
+                    wait_to_trade_raw[idx] = phase_info[1] if len(phase_info) > 1 else None
+                    wait_to_opening_raw[idx] = phase_info[2] if len(phase_info) > 2 else None
 
-                    if market_config and pd.notna(last_time):
-                        phase_info = market_phase_info(last_time, region)
-                        current_wait_trade[idx] = (
-                            phase_info[1] if len(phase_info) > 1 else None
-                        )
-                        current_wait_opening[idx] = (
-                            phase_info[2] if len(phase_info) > 2 else None
-                        )
-                        current_sell_window_open[idx] = bool(
-                            trading_window_info(last_time, market_config, "sell").is_open
-                        )
-                        current_buy_window_open[idx] = bool(
-                            trading_window_info(last_time, market_config, "buy").is_open
-                        )
-                    else:
-                        current_wait_trade[idx] = None
-                        current_wait_opening[idx] = None
-                        current_sell_window_open[idx] = False
-                        current_buy_window_open[idx] = False
+                advisor["_WaitToTradeRaw"] = pd.Series(wait_to_trade_raw)
+                advisor["_WaitToOpeningRaw"] = pd.Series(wait_to_opening_raw)
 
-                    trade = _zero_latest_trade_at(ticker, last_time)
-                    is_open = _zero_is_open_at(ticker, last_time)
-                    current_open[idx] = is_open
-                    init_time = (
-                        pd.to_datetime(trade.get("BuyTime"), utc=True, errors="coerce")
-                        if trade is not None and is_open
-                        else pd.NaT
-                    )
-                    current_init[idx] = init_time
-
-                    c4 = False
-                    c5 = False
-                    c6 = False
-                    c7 = False
-                    profit_init = None
-                    if is_open and pd.notna(init_time) and market_row is not None:
-                        ticker_history = active_df[
-                            (active_df["ticker"].astype(str).str.upper() == ticker)
-                            & (active_df["timestamp"] <= last_time)
-                        ].copy()
-                        if not ticker_history.empty:
-                            sort_cols = (
-                                ["timestamp", "id"]
-                                if "id" in ticker_history.columns
-                                else ["timestamp"]
-                            )
-                            ticker_history = (
-                                ticker_history.sort_values(sort_cols)
-                                .drop_duplicates(subset=["timestamp"], keep="last")
-                            )
-                            current_price = pd.to_numeric(
-                                ticker_history.iloc[-1].get("close"), errors="coerce"
-                            )
-                            if pd.notna(current_price) and float(current_price) > 0:
-                                decision = evaluate_sell_history(
-                                    ticker_df=ticker_history,
-                                    latest_time=last_time,
-                                    current_price=float(current_price),
-                                    movement_percent=movement_threshold,
-                                    c5_hours=c5_hours,
-                                    init_time=init_time,
-                                )
-                                c4 = bool(decision.c4_satisfied)
-                                c5 = bool(decision.c5_satisfied)
-
-                                reference_price = pd.NA
-                                if trade is not None:
-                                    for key in ["BuyPriceEUR", "BuyPrice", "InitPrice"]:
-                                        if key in trade.index:
-                                            candidate = pd.to_numeric(
-                                                trade.get(key), errors="coerce"
-                                            )
-                                            if pd.notna(candidate) and float(candidate) > 0:
-                                                reference_price = float(candidate)
-                                                break
-                                if pd.notna(reference_price):
-                                    profit_init = (
-                                        float(current_price) / float(reference_price) - 1.0
-                                    ) * 100.0
-
-                                remaining_minutes = None
-                                if market_config and current_sell_window_open[idx]:
-                                    regular_close_value = market_config.get("regular_close")
-                                    if regular_close_value:
-                                        try:
-                                            market_timezone = str(
-                                                market_config.get("timezone") or "UTC"
-                                            )
-                                            action_local = last_time.tz_convert(market_timezone)
-                                            regular_close_local = pd.Timestamp(
-                                                f"{action_local.date()} {regular_close_value}",
-                                                tz=market_timezone,
-                                            )
-                                            remaining_minutes = (
-                                                regular_close_local - action_local
-                                            ).total_seconds() / 60.0
-                                        except Exception:
-                                            remaining_minutes = None
-
-                                c6 = bool(
-                                    c6_enabled
-                                    and not c4
-                                    and not c5
-                                    and current_sell_window_open[idx]
-                                    and remaining_minutes is not None
-                                    and 0.0 <= remaining_minutes <= c6_close_minutes
-                                    and profit_init is not None
-                                    and profit_init < c6_min_gain_percent
-                                )
-                                c7 = bool(
-                                    not c4
-                                    and not c5
-                                    and current_sell_window_open[idx]
-                                    and remaining_minutes is not None
-                                    and 0.0 <= remaining_minutes <= c6_close_minutes
-                                    and profit_init is not None
-                                    and profit_init > c7_max_gain_percent
-                                )
-
-                    current_c4[idx] = c4
-                    current_c5[idx] = c5
-                    current_c6[idx] = c6
-                    current_c7[idx] = c7
-                    current_profit_init[idx] = profit_init
-                    buy_ts_value, buy_c2_value = _zero_current_c2_at(
-                        last_time, ticker
-                    )
-                    current_buy_ts[idx] = buy_ts_value
-                    current_buy_c2[idx] = buy_c2_value
-
-                advisor["C4"] = pd.Series(current_c4).reindex(advisor.index).fillna(False).astype(bool)
-                advisor["C5"] = pd.Series(current_c5).reindex(advisor.index).fillna(False).astype(bool)
-                advisor["C6"] = pd.Series(current_c6).reindex(advisor.index).fillna(False).astype(bool)
-                advisor["C7"] = pd.Series(current_c7).reindex(advisor.index).fillna(False).astype(bool)
-                advisor["_WaitToTradeRaw"] = pd.Series(current_wait_trade).reindex(advisor.index)
-                advisor["_WaitToOpeningRaw"] = pd.Series(current_wait_opening).reindex(advisor.index)
-                advisor["_InitTimeLatestRaw"] = pd.to_datetime(
-                    pd.Series(current_init).reindex(advisor.index),
-                    utc=True,
-                    errors="coerce",
-                )
-                advisor["_IsOpenAtLastTime"] = pd.Series(current_open).reindex(advisor.index).fillna(False).astype(bool)
-                advisor["_SellWindowOpen"] = pd.Series(current_sell_window_open).reindex(advisor.index).fillna(False).astype(bool)
-                advisor["_BuyWindowOpen"] = pd.Series(current_buy_window_open).reindex(advisor.index).fillna(False).astype(bool)
-                advisor["_ProfitInitTimeLatestRaw"] = pd.to_numeric(
-                    pd.Series(current_profit_init).reindex(advisor.index), errors="coerce"
-                )
-
-                # C2 at each ticker's own LastTime. BuyTs is the number of
-                # tickers with Close2h >= the configured threshold at that time.
-                advisor["BuyTs"] = pd.to_numeric(
-                    pd.Series(current_buy_ts).reindex(advisor.index), errors="coerce"
-                ).fillna(0).astype(int)
-                advisor["BuyC2"] = (
-                    pd.Series(current_buy_c2)
-                    .reindex(advisor.index)
-                    .fillna(False)
-                    .astype(bool)
-                )
-                advisor["SellC4"] = advisor["C4"]
-                advisor["SellC5"] = advisor["C5"]
-                advisor["SellC6"] = advisor["C6"]
-                advisor["SellC7"] = advisor["C7"]
-                advisor["Trading"] = advisor["_WaitToOpeningRaw"].map(_zero_wait_is_zero)
-
-                sell_signal = (
-                    advisor["SellC4"]
-                    | advisor["SellC5"]
-                    | advisor["SellC6"]
-                    | advisor["SellC7"]
-                )
-                advisor["ToSell"] = (
-                    advisor["_IsOpenAtLastTime"]
-                    & advisor["_SellWindowOpen"]
-                    & sell_signal
-                )
-
-                # A ticker can be bought only when it is not already OPEN, C2 is
-                # true, the buy window is open, and it survives the same up-to-6
-                # Close2h ranking used by the simulator/advisor. Portfolio slots
-                # are applied at the newest available state.
-                buy_pool = (
-                    ~advisor["_IsOpenAtLastTime"]
-                    & advisor["BuyC2"]
-                    & advisor["_BuyWindowOpen"]
-                    & ~advisor["ToSell"]
-                )
-                advisor["ToBuy"] = False
-                buy_candidates = advisor.loc[buy_pool].copy()
-                if not buy_candidates.empty:
-                    buy_candidates["_BuyRankClose"] = pd.to_numeric(
-                        buy_candidates["_LastClose2hRaw"], errors="coerce"
-                    )
-                    available_slots = max(
-                        0,
-                        int(BUY_MAX_OPEN_TICKERS) - _zero_open_count_at(newest_market_data),
-                    )
-                    buy_limit = min(6, available_slots)
-                    if buy_limit > 0:
-                        allowed = buy_candidates.sort_values(
-                            ["_BuyRankClose", "Ticker"],
-                            ascending=[False, True],
-                            na_position="last",
-                        ).head(buy_limit).index
-                        advisor.loc[allowed, "ToBuy"] = True
-
-                # Current display metrics.
                 drop24 = {}
                 drop_init = {}
                 change24 = {}
                 change_init = {}
+                weak_init = {}
                 for idx, row in advisor.iterrows():
                     ticker = str(row.get("Ticker") or "").strip().upper()
-                    last_time = row.get("_LastCollectRaw")
-                    init_time = row.get("_InitTimeLatestRaw")
+                    last_time = row["_LastCollectRaw"]
+                    init_time = row["_InitTimeLatestRaw"]
                     if pd.notna(last_time):
-                        d24, c24 = _zero_interval_metrics(
-                            ticker,
-                            last_time,
-                            last_time - pd.Timedelta(hours=24),
-                        )
+                        d24, c24 = _zero_interval_metrics(ticker, last_time, last_time - pd.Timedelta(hours=24))
                     else:
                         d24, c24 = (None, None)
                     if pd.notna(last_time) and pd.notna(init_time) and init_time <= last_time:
@@ -2721,417 +2230,233 @@ if page == "Zero-Trading":
                     change24[idx] = c24
                     change_init[idx] = ci
 
-                advisor["_Drop24hRaw"] = pd.Series(drop24).reindex(advisor.index)
-                advisor["_DropInitTimeLatestRaw"] = pd.Series(drop_init).reindex(advisor.index)
-                advisor["_Change24hRaw"] = pd.Series(change24).reindex(advisor.index)
-                advisor["_ChangeInitTimeLatestRaw"] = pd.Series(change_init).reindex(advisor.index)
+                    weak_value = None
+                    if pd.notna(last_time) and pd.notna(init_time) and init_time <= last_time:
+                        source = market_df[
+                            market_df["ticker"].astype(str) == ticker
+                        ].copy()
+                        if not source.empty:
+                            source["_CloseNumeric"] = pd.to_numeric(
+                                source["close"],
+                                errors="coerce",
+                            )
+                            source = source[
+                                source["_CloseNumeric"].notna()
+                                & (source["_CloseNumeric"] > 0)
+                            ].copy()
+                            if not source.empty:
+                                source["_InitDistance"] = (
+                                    source["timestamp"] - init_time
+                                ).abs()
+                                init_row = source.sort_values(
+                                    ["_InitDistance", "timestamp"],
+                                    ascending=[True, True],
+                                ).iloc[0]
+                                if (
+                                    init_row["_InitDistance"].total_seconds()
+                                    <= 1800
+                                ):
+                                    init_price = float(
+                                        init_row["_CloseNumeric"]
+                                    )
+                                    last_rows = source[
+                                        source["timestamp"] <= last_time
+                                    ]
+                                    if not last_rows.empty and init_price > 0:
+                                        last_price = float(
+                                            last_rows.sort_values(
+                                                ["timestamp", "id"]
+                                            ).iloc[-1]["_CloseNumeric"]
+                                        )
+                                        weak_value = (
+                                            last_price / init_price - 1.0
+                                        ) * 100.0
+                    weak_init[idx] = weak_value
+
+                advisor["_Drop24hRaw"] = pd.Series(drop24)
+                advisor["_DropInitTimeLatestRaw"] = pd.Series(drop_init)
+                advisor["_Change24hRaw"] = pd.Series(change24)
+                advisor["_ChangeInitTimeLatestRaw"] = pd.Series(change_init)
+                advisor["_WeakInitTimeLatestRaw"] = pd.Series(weak_init)
 
                 advisor["WaitToTrade"] = advisor["_WaitToTradeRaw"].map(_zero_timedelta_text)
                 advisor["WaitToOpening"] = advisor["_WaitToOpeningRaw"].map(_zero_timedelta_text)
+
                 if "BuyQty" in advisor.columns:
                     advisor["Qty"] = pd.to_numeric(advisor["BuyQty"], errors="coerce")
                 elif "Qty" not in advisor.columns:
                     advisor["Qty"] = pd.NA
-                advisor["Qty"] = advisor["Qty"].map(
-                    lambda value: str(int(round(float(value)))) if pd.notna(value) else "-"
-                )
-                advisor["LastTime"] = advisor["_LastCollectRaw"].map(_zero_local_timestamp)
+                advisor.loc[advisor["Action"] == "Sell", "Qty"] = pd.NA
+
+                advisor["InitTimeLatest"] = advisor["_InitTimeLatestRaw"].map(_zero_local_timestamp)
+                advisor["LastCollect"] = advisor["_LastCollectRaw"].map(_zero_local_timestamp)
                 advisor["LastSelling"] = advisor["_LastSellingRaw"].map(
                     lambda value: f"{int(round(float(value)))}s" if pd.notna(value) else "—"
                 )
-                advisor["LastTops"] = int(c2_group_count)
+                advisor["LastTops"] = c2_group_count
+                advisor.loc[advisor["Action"] == "Sell", "LastTops"] = "-"
                 advisor["LastClose2h"] = advisor["_LastClose2hRaw"].map(
                     lambda value: f"{float(value):+.2f}%" if pd.notna(value) else "—"
+                )
+
+                def _zero_reason(row):
+                    action = str(row.get("Action") or "").strip()
+
+                    if action == "Buy":
+                        return "Strong Close2h"
+
+                    if action == "Sell":
+                        c4 = bool(row.get("C4", False))
+                        c5 = bool(row.get("C5", False))
+                        c6 = bool(row.get("C6", False))
+
+                        if c6:
+                            return "End-of-day exit"
+                        if c4 and c5:
+                            return "Drop + static"
+                        if c4:
+                            return "Price drop"
+                        if c5:
+                            return "Price static"
+                        return "Sell signal"
+
+                    return "—"
+
+                advisor["Reason"] = advisor.apply(
+                    _zero_reason,
+                    axis=1,
                 )
 
                 def _zero_percent(value):
                     return f"{float(value):.2f}%" if pd.notna(value) else "—"
 
                 advisor["Drop24h"] = advisor["_Drop24hRaw"].map(_zero_percent)
+                movement_threshold = float(SELL_CONFIG.get("movement_percent", 1.1))
                 advisor["DropInitTimeLatest"] = advisor["_DropInitTimeLatestRaw"].map(_zero_percent)
                 advisor["Change24h"] = advisor["_Change24hRaw"].map(_zero_percent)
                 advisor["ChangeInitTimeLatest"] = advisor["_ChangeInitTimeLatestRaw"].map(_zero_percent)
-                advisor["WeakInitTimeLatest"] = advisor["_ProfitInitTimeLatestRaw"].map(
-                    lambda value: f"{float(value):+.2f}%" if pd.notna(value) else "—"
+                advisor["WeakInitTimeLatest"] = advisor["_WeakInitTimeLatestRaw"].map(
+                    lambda value: f"{float(value):+.2f}%"
+                    if pd.notna(value)
+                    else "—"
                 )
-                advisor["ProfitInitTimeLatest"] = advisor["_ProfitInitTimeLatestRaw"].map(
-                    lambda value: f"{float(value):+.2f}%" if pd.notna(value) else "—"
+                advisor["C2"] = bool(c2_group_count >= BUY_MIN_CLOSEB_COUNT)
+                for bool_column in ["C4", "C5", "C6"]:
+                    if bool_column not in advisor.columns:
+                        advisor[bool_column] = False
+                    advisor[bool_column] = advisor[bool_column].fillna(False).astype(bool)
+                advisor["Qty"] = advisor["Qty"].map(
+                    lambda value: str(int(round(float(value)))) if pd.notna(value) else "-"
                 )
 
-                # Current 03:00 -> 03:00 accounting day.
-                now_local = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
-                accounting_day = now_local.normalize()
-                if now_local.hour < 3:
-                    accounting_day = accounting_day - pd.Timedelta(days=1)
-                accounting_start_local = accounting_day + pd.Timedelta(hours=3)
-                accounting_end_local = accounting_start_local + pd.Timedelta(days=1)
-                accounting_start_utc = accounting_start_local.tz_convert("UTC")
-                accounting_end_utc = accounting_end_local.tz_convert("UTC")
-
-                # Build the latest actual simulator transition per ticker in the
-                # accounting day. A Sell transition is ignored for MANUAL_RESET.
-                sim_events = []
-                for _, trade in zero_sim_df.iterrows():
-                    ticker = str(trade.get("Ticker") or "").strip().upper()
-                    if not ticker:
-                        continue
-                    buy_time = pd.to_datetime(
-                        trade.get("BuyTime"), utc=True, errors="coerce"
-                    )
-                    sell_time = pd.to_datetime(
-                        trade.get("SellTime"), utc=True, errors="coerce"
-                    )
-                    if (
-                        pd.notna(buy_time)
-                        and accounting_start_utc <= buy_time < accounting_end_utc
-                    ):
-                        sim_events.append({
-                            "Ticker": ticker,
-                            "ActionTime": buy_time,
-                            "Action": "Buy",
-                            "Trade": trade,
-                        })
-                    sell_reason = str(trade.get("SellReason") or "").strip().upper()
-                    if (
-                        pd.notna(sell_time)
-                        and accounting_start_utc <= sell_time < accounting_end_utc
-                        and sell_reason != "MANUAL_RESET"
-                    ):
-                        sim_events.append({
-                            "Ticker": ticker,
-                            "ActionTime": sell_time,
-                            "Action": "Sell",
-                            "Trade": trade,
-                        })
-
-                latest_event_by_ticker = {}
-                for event in sim_events:
-                    previous = latest_event_by_ticker.get(event["Ticker"])
-                    if previous is None or event["ActionTime"] > previous["ActionTime"]:
-                        latest_event_by_ticker[event["Ticker"]] = event
-
-                snapshot_cache = {}
-
-                def _zero_snapshot_live(action_time):
-                    key = pd.Timestamp(action_time).isoformat()
-                    if key in snapshot_cache:
-                        return snapshot_cache[key]
-                    snapshot_source = active_df[
-                        active_df["timestamp"] <= action_time
-                    ].copy()
-                    if snapshot_source.empty:
-                        result = (pd.DataFrame(), 0)
-                    else:
-                        live = build_live_overview(snapshot_source)
-                        if live.empty or "Ticker" not in live.columns:
-                            result = (live, 0)
-                        else:
-                            closeb = pd.to_numeric(live.get("CloseB"), errors="coerce")
-                            # SimBuyTs intentionally uses > threshold, per table definition.
-                            count = int((closeb > BUY_MIN_CLOSEB_PERCENT).sum())
-                            result = (live, count)
-                    snapshot_cache[key] = result
-                    return result
-
-                def _zero_sell_conditions_at(ticker, action_time, init_time, trade):
-                    result = {"C4": False, "C5": False, "C6": False, "C7": False}
-                    action_time = pd.to_datetime(action_time, utc=True, errors="coerce")
-                    init_time = pd.to_datetime(init_time, utc=True, errors="coerce")
-                    if pd.isna(action_time) or pd.isna(init_time):
-                        return result
-                    history = active_df[
-                        (active_df["ticker"].astype(str).str.upper() == ticker)
-                        & (active_df["timestamp"] <= action_time)
-                    ].copy()
-                    if history.empty:
-                        return result
-                    sort_cols = ["timestamp", "id"] if "id" in history.columns else ["timestamp"]
-                    history = history.sort_values(sort_cols).drop_duplicates(
-                        subset=["timestamp"], keep="last"
-                    )
-                    current_price = pd.to_numeric(
-                        history.iloc[-1].get("close"), errors="coerce"
-                    )
-                    if pd.isna(current_price) or float(current_price) <= 0:
-                        return result
-                    decision = evaluate_sell_history(
-                        ticker_df=history,
-                        latest_time=action_time,
-                        current_price=float(current_price),
-                        movement_percent=movement_threshold,
-                        c5_hours=c5_hours,
-                        init_time=init_time,
-                    )
-                    result["C4"] = bool(decision.c4_satisfied)
-                    result["C5"] = bool(decision.c5_satisfied)
-
-                    reference_price = pd.NA
-                    for key in ["BuyPriceEUR", "BuyPrice", "InitPrice"]:
-                        if key in trade.index:
-                            candidate = pd.to_numeric(trade.get(key), errors="coerce")
-                            if pd.notna(candidate) and float(candidate) > 0:
-                                reference_price = float(candidate)
-                                break
-                    gain = None
-                    if pd.notna(reference_price):
-                        gain = (float(current_price) / float(reference_price) - 1.0) * 100.0
-
-                    latest_market = history.iloc[-1]
-                    region = market_region_for_ticker(
-                        ticker, latest_market.get("asset_type")
-                    )
-                    market_config = TRADING_WINDOWS.get(region) if region else None
-                    remaining_minutes = None
-                    sell_open = False
-                    if market_config:
-                        sell_open = bool(
-                            trading_window_info(action_time, market_config, "sell").is_open
-                        )
-                        regular_close_value = market_config.get("regular_close")
-                        if sell_open and regular_close_value:
-                            try:
-                                market_timezone = str(market_config.get("timezone") or "UTC")
-                                action_local = action_time.tz_convert(market_timezone)
-                                regular_close_local = pd.Timestamp(
-                                    f"{action_local.date()} {regular_close_value}",
-                                    tz=market_timezone,
-                                )
-                                remaining_minutes = (
-                                    regular_close_local - action_local
-                                ).total_seconds() / 60.0
-                            except Exception:
-                                remaining_minutes = None
-                    result["C6"] = bool(
-                        c6_enabled
-                        and not result["C4"]
-                        and not result["C5"]
-                        and sell_open
-                        and remaining_minutes is not None
-                        and 0.0 <= remaining_minutes <= c6_close_minutes
-                        and gain is not None
-                        and gain < c6_min_gain_percent
-                    )
-                    result["C7"] = bool(
-                        not result["C4"]
-                        and not result["C5"]
-                        and sell_open
-                        and remaining_minutes is not None
-                        and 0.0 <= remaining_minutes <= c6_close_minutes
-                        and gain is not None
-                        and gain > c7_max_gain_percent
-                    )
-                    return result
-
-                # Default Details values.
-                for column, default in {
-                    "SimLastActionTime": "—",
-                    "SimLastAction": "—",
-                    "SimLastInit": "—",
-                    "SimReason": "—",
-                    "SimBuyTs": pd.NA,
-                    "SimBuyC2": False,
-                    "SimSellC4": False,
-                    "SimSellC5": False,
-                    "SimSellC6": False,
-                    "SimSellC7": False,
-                    "SimWaitToOpening": False,
-                }.items():
-                    advisor[column] = default
-
-                for idx, row in advisor.iterrows():
-                    ticker = str(row.get("Ticker") or "").strip().upper()
-                    event = latest_event_by_ticker.get(ticker)
-                    if event is None:
-                        continue
-                    action_time = event["ActionTime"]
-                    action = event["Action"]
-                    trade = event["Trade"]
-                    snapshot_live, snapshot_count = _zero_snapshot_live(action_time)
-                    snapshot_row = None
-                    if not snapshot_live.empty and "Ticker" in snapshot_live.columns:
-                        matches = snapshot_live[
-                            snapshot_live["Ticker"].astype(str).str.strip().str.upper() == ticker
-                        ]
-                        if not matches.empty:
-                            snapshot_row = matches.iloc[0]
-
-                    sim_c2 = False
-                    if snapshot_row is not None:
-                        closeb = pd.to_numeric(snapshot_row.get("CloseB"), errors="coerce")
-                        sim_c2 = bool(
-                            snapshot_count >= BUY_MIN_CLOSEB_COUNT
-                            and pd.notna(closeb)
-                            and float(closeb) >= BUY_MIN_CLOSEB_PERCENT
-                        )
-
-                    init_time = pd.to_datetime(
-                        trade.get("BuyTime"), utc=True, errors="coerce"
-                    )
-                    sell_conditions = _zero_sell_conditions_at(
-                        ticker, action_time, init_time, trade
-                    )
-
-                    market_row = _zero_market_row_at(ticker, action_time)
-                    wait_opening = None
-                    last_collect_at_action = pd.NaT
-                    if market_row is not None:
-                        last_collect_at_action = pd.to_datetime(
-                            market_row.get("timestamp"), utc=True, errors="coerce"
-                        )
-                        region = market_region_for_ticker(
-                            ticker, market_row.get("asset_type")
-                        )
-                        if region:
-                            phase_info = market_phase_info(action_time, region)
-                            wait_opening = phase_info[2] if len(phase_info) > 2 else None
-
-                    reason = "Buy signal" if action == "Buy" else str(
-                        trade.get("SellReason") or "Sell signal"
-                    ).strip()
-                    sim_init = (
-                        init_time if action == "Sell" else last_collect_at_action
-                    )
-
-                    advisor.at[idx, "SimLastActionTime"] = _zero_local_timestamp(action_time)
-                    advisor.at[idx, "SimLastAction"] = action
-                    advisor.at[idx, "SimLastInit"] = _zero_local_timestamp(sim_init)
-                    advisor.at[idx, "SimReason"] = reason or "—"
-                    advisor.at[idx, "SimBuyTs"] = int(snapshot_count)
-                    advisor.at[idx, "SimBuyC2"] = bool(sim_c2)
-                    advisor.at[idx, "SimSellC4"] = bool(sell_conditions["C4"])
-                    advisor.at[idx, "SimSellC5"] = bool(sell_conditions["C5"])
-                    advisor.at[idx, "SimSellC6"] = bool(sell_conditions["C6"])
-                    advisor.at[idx, "SimSellC7"] = bool(sell_conditions["C7"])
-                    advisor.at[idx, "SimWaitToOpening"] = _zero_wait_is_zero(wait_opening)
-
-                # Keep current opportunities and/or tickers with an actual simulator
-                # transition in the current accounting day. This preserves current
-                # actionable rows while ensuring the table carries the day's latest
-                # simulator action at most once per ticker.
-                has_sim_action = advisor["Ticker"].astype(str).str.upper().isin(
-                    latest_event_by_ticker.keys()
+                advisor["_ActionSort"] = advisor["Action"].map({"Buy": 0, "Sell": 1}).fillna(99)
+                advisor = advisor.sort_values(
+                    by=["_ActionSort", "_LastClose2hRaw", "Ticker"],
+                    ascending=[True, False, True],
+                    na_position="last",
                 )
-                advisor = advisor[
-                    advisor["ToSell"] | advisor["ToBuy"] | has_sim_action
-                ].copy()
 
-                if advisor.empty:
-                    st.success(
-                        "No current Buy/Sell opportunities and no simulator actions "
-                        "in the active 03:00–03:00 accounting day."
-                    )
-                else:
-                    # Required ordering: ToSell, ToBuy, LastClose2h.
-                    advisor = advisor.sort_values(
-                        by=["ToSell", "ToBuy", "_LastClose2hRaw", "Ticker"],
-                        ascending=[False, False, False, True],
-                        na_position="last",
-                    )
+                requested_columns = [
+                    "Action",
+                    "Reason",
+                    "C2",
+                    "C4",
+                    "C5",
+                    "C6",
+                ]
+                if zero_details:
+                    requested_columns.extend([
+                        "C4Check",
+                        "C5Check",
+                        "C6Check",
+                    ])
+                requested_columns.extend([
+                    "Ticker",
+                    "TickerName",
+                    "LastCollect",
+                    "WaitToTrade",
+                    "WaitToOpening",
+                    "Qty",
+                    "InitTimeLatest",
+                    "LastSelling",
+                    "LastTops",
+                    "LastClose2h",
+                    "Drop24h",
+                    "DropInitTimeLatest",
+                    "Change24h",
+                    "ChangeInitTimeLatest",
+                    "WeakInitTimeLatest",
+                ])
+                for column in requested_columns:
+                    if column not in advisor.columns:
+                        advisor[column] = "—"
+                display = advisor[requested_columns].copy()
+                display = display.rename(
+                    columns={
+                        "C4Check": "C4 Check",
+                        "C5Check": "C5 Check",
+                        "C6Check": "C6 Check",
+                    }
+                )
 
-                    requested_columns = [
-                        "LastTime",
-                        "ToSell",
-                        "ToBuy",
-                        "Ticker",
-                        "TickerName",
-                        "BuyTs",
-                        "BuyC2",
-                        "SellC4",
-                        "SellC5",
-                        "SellC6",
-                        "SellC7",
-                        "Trading",
-                        "WaitToTrade",
-                        "WaitToOpening",
-                        "Qty",
-                        "LastSelling",
-                        "LastTops",
-                        "LastClose2h",
-                        "Drop24h",
-                        "DropInitTimeLatest",
-                        "Change24h",
-                        "ChangeInitTimeLatest",
-                        "WeakInitTimeLatest",
-                        "ProfitInitTimeLatest",
-                    ]
-                    if zero_details:
-                        requested_columns.extend([
-                            "SimLastActionTime",
-                            "SimLastAction",
-                            "SimLastInit",
-                            "SimReason",
-                            "SimBuyTs",
-                            "SimBuyC2",
-                            "SimSellC4",
-                            "SimSellC5",
-                            "SimSellC6",
-                            "SimSellC7",
-                            "SimWaitToOpening",
-                        ])
+                raw_lookup = advisor[[
+                    "Action", "_WaitToTradeRaw", "_WaitToOpeningRaw", "_LastSellingRaw",
+                    "_LastClose2hRaw", "_Drop24hRaw", "_DropInitTimeLatestRaw",
+                    "_Change24hRaw", "_ChangeInitTimeLatestRaw",
+                    "_WeakInitTimeLatestRaw", "C6",
+                ]].loc[display.index].copy()
 
-                    for column in requested_columns:
-                        if column not in advisor.columns:
-                            advisor[column] = "—"
-                    display = advisor[requested_columns].copy()
+                def _zero_row_style(row):
+                    raw = raw_lookup.loc[row.name]
+                    action = str(raw.get("Action") or "")
+                    styles = ["" for _ in row.index]
 
-                    raw_lookup = advisor[[
-                        "_WaitToTradeRaw",
-                        "_WaitToOpeningRaw",
-                        "_LastSellingRaw",
-                        "_LastClose2hRaw",
-                        "_Drop24hRaw",
-                        "_DropInitTimeLatestRaw",
-                        "_Change24hRaw",
-                        "_ChangeInitTimeLatestRaw",
-                        "_ProfitInitTimeLatestRaw",
-                        "SellC6",
-                        "SellC7",
-                    ]].loc[display.index].copy()
+                    def bold(column):
+                        if column in row.index:
+                            styles[row.index.get_loc(column)] = "font-weight: 700;"
 
-                    def _zero_row_style(row):
-                        raw = raw_lookup.loc[row.name]
-                        styles = ["" for _ in row.index]
+                    if _zero_wait_is_zero(raw.get("_WaitToTradeRaw")):
+                        bold("WaitToTrade")
+                    if _zero_wait_is_zero(raw.get("_WaitToOpeningRaw")):
+                        bold("WaitToOpening")
 
-                        def bold(column):
-                            if column in row.index:
-                                styles[row.index.get_loc(column)] = "font-weight: 700;"
+                    last_selling = pd.to_numeric(raw.get("_LastSellingRaw"), errors="coerce")
+                    if pd.notna(last_selling) and float(last_selling) < 120.0:
+                        bold("LastSelling")
 
-                        if _zero_wait_is_zero(raw.get("_WaitToTradeRaw")):
-                            bold("WaitToTrade")
-                        if _zero_wait_is_zero(raw.get("_WaitToOpeningRaw")):
-                            bold("WaitToOpening")
-                        last_selling = pd.to_numeric(
-                            raw.get("_LastSellingRaw"), errors="coerce"
-                        )
-                        if pd.notna(last_selling) and float(last_selling) < 120.0:
-                            bold("LastSelling")
-                        last_close = pd.to_numeric(
-                            raw.get("_LastClose2hRaw"), errors="coerce"
-                        )
+                    if action == "Buy":
+                        last_close = pd.to_numeric(raw.get("_LastClose2hRaw"), errors="coerce")
                         if pd.notna(last_close) and float(last_close) > 2.0:
                             bold("LastClose2h")
-                        for display_column, raw_column in [
-                            ("Drop24h", "_Drop24hRaw"),
-                            ("DropInitTimeLatest", "_DropInitTimeLatestRaw"),
-                        ]:
-                            numeric = pd.to_numeric(raw.get(raw_column), errors="coerce")
-                            if pd.notna(numeric) and float(numeric) > movement_threshold:
-                                bold(display_column)
-                        for display_column, raw_column in [
-                            ("Change24h", "_Change24hRaw"),
-                            ("ChangeInitTimeLatest", "_ChangeInitTimeLatestRaw"),
-                        ]:
-                            numeric = pd.to_numeric(raw.get(raw_column), errors="coerce")
-                            if pd.notna(numeric) and float(numeric) < movement_threshold:
-                                bold(display_column)
-                        if bool(raw.get("SellC6", False)) or bool(raw.get("SellC7", False)):
-                            bold("ProfitInitTimeLatest")
-                        return styles
 
-                    styled_display = display.style.apply(_zero_row_style, axis=1)
+                    for display_column, raw_column in [
+                        ("Drop24h", "_Drop24hRaw"),
+                        ("DropInitTimeLatest", "_DropInitTimeLatestRaw"),
+                    ]:
+                        numeric = pd.to_numeric(raw.get(raw_column), errors="coerce")
+                        if pd.notna(numeric) and float(numeric) > movement_threshold:
+                            bold(display_column)
 
-                    buy_asset_count = int(display["ToBuy"].fillna(False).sum())
-                    sell_asset_count = int(display["ToSell"].fillna(False).sum())
+                    for display_column, raw_column in [
+                        ("Change24h", "_Change24hRaw"),
+                        ("ChangeInitTimeLatest", "_ChangeInitTimeLatestRaw"),
+                    ]:
+                        numeric = pd.to_numeric(raw.get(raw_column), errors="coerce")
+                        if pd.notna(numeric) and float(numeric) < movement_threshold:
+                            bold(display_column)
+
+                    if bool(raw.get("C6", False)):
+                        bold("WeakInitTimeLatest")
+                    return styles
+
+                styled_display = display.style.apply(_zero_row_style, axis=1)
+
+                buy_asset_count = int(
+                    (display["Action"] == "Buy").sum()
+                )
+                sell_asset_count = int(
+                    (display["Action"] == "Sell").sum()
+                )
 
                 newest_display = pd.to_datetime(
                     newest_market_data,
@@ -3167,56 +2492,51 @@ if page == "Zero-Trading":
                 )
 
         st.caption(
-            "Zero-Trading shows at most one row per ticker. LastTime is the ticker's latest "
-            "market-data time. ToSell and ToBuy show whether the simulator can execute that "
-            "action at LastTime. Rows are sorted by ToSell, then ToBuy, then LastClose2h, all "
-            "with actionable/high values first. Trading is true exactly when WaitToOpening is 00:00."
+            "Zero-Trading shows only actionable Buy/Sell recommendations. Rows are sorted first by "
+            "Action (Buy before Sell), then by LastClose2h from highest to lowest. WaitToTrade and "
+            "WaitToOpening use the same Newest-data market-phase calculation as Last Data and are "
+            "displayed as HH:mm, or Xd HH:mm when one or more full days remain."
         )
 
         st.caption(
-            "Parameters: BuyTs is the number of tickers whose Close2h is greater than or equal to "
-            f"the configured C2 threshold ({BUY_MIN_CLOSEB_PERCENT:g}%) at LastTime; BuyC2 is the "
-            f"C2 result and requires at least {BUY_MIN_CLOSEB_COUNT} qualifying tickers. SellC4 is "
-            f"the drop-from-peak condition using the {float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% "
-            f"movement threshold. SellC5 is the static-price condition over "
-            f"{float(SELL_CONFIG.get('c5_hours', 24.0)):g} hours. SellC6 is the near-close weak-position "
-            f"exit within {float(SELL_CONFIG.get('c6_close_minutes', 30.0)):g} minutes of regular close "
-            f"when gain is below {float(SELL_CONFIG.get('c6_min_gain_percent', 2.0)):.2f}%. SellC7 uses "
-            f"the same close window and is true when gain is above "
-            f"{float(SELL_CONFIG.get('c7_max_gain_percent', 5.0)):.2f}%."
-        )
-
-        st.caption(
-            "LastSelling is the estimated liquidity time to sell; LastClose2h is the approximately "
-            "two-hour CloseB. Drop24h and Change24h use LastTime-24h through LastTime. "
-            "DropInitTimeLatest and ChangeInitTimeLatest use the latest OPEN simulator InitTime through "
-            "LastTime. ProfitInitTimeLatest is the percentage gain from that OPEN position's init/buy "
-            "price to LastPrice. WaitToTrade and WaitToOpening are evaluated at each ticker's LastTime."
+            "Parameters: C2 is the global BUY breadth condition; C4 is the drop-from-peak condition; "
+            "C5 is the static-price condition; C6 is the near-market-close weak-position exit. "
+            "LastSelling is the estimated liquidity time to sell; LastTops is the current C2 ticker "
+            "count and is '-' for Sell rows; LastClose2h is the approximately two-hour CloseB. "
+            "Drop24h and Change24h use LastCollect-24h through LastCollect. DropInitTimeLatest and "
+            "ChangeInitTimeLatest use the latest OPEN InitTime through LastCollect. "
+            f"Drop values are bold above the C4/C5 movement threshold "
+            f"({float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}%). "
+            f"Change values are bold below that threshold. WeakInitTimeLatest is the percentage "
+            f"gain from the latest OPEN position's InitPrice to LastPrice. C6 is true only when "
+            f"C4 and C5 are false, the market is open, regular market close is within the next "
+            f"{float(SELL_CONFIG.get('c6_close_minutes', 30.0)):g} minutes, and WeakInitTimeLatest "
+            f"is below the C6 minimum gain ({float(SELL_CONFIG.get('c6_min_gain_percent', 2.0)):.2f}%). "
+            f"WeakInitTimeLatest is bold when C6 is true."
         )
 
         if bool(SELL_CONFIG.get("details", True)):
             st.caption(
-                "Details is enabled: SimLastActionTime and SimLastAction show the latest actual simulator "
-                "CLOSED->OPEN Buy or OPEN->CLOSED Sell transition in the active 03:00-03:00 accounting day. "
-                "SimLastInit and SimReason describe that action. SimBuyTs, SimBuyC2, SimSellC4-C7 and "
-                "SimWaitToOpening are reconstructed at SimLastActionTime. SimBuyTs intentionally counts "
-                "Close2h values strictly greater than the C2 threshold, as defined for the simulator details."
+                "Details is enabled: C4 Check, C5 Check and C6 Check show the inputs used by each "
+                "SELL condition. Disable Details in Settings to hide these three diagnostic columns."
             )
 
         st.subheader("Steps to buy a ticker")
         st.markdown(
-            "1. Check **ToBuy == True**.\n"
-            "2. Review **BuyTs**, **BuyC2** and **LastClose2h**.\n"
-            "3. Confirm **Trading == True** and **LastSelling** is acceptable.\n"
-            "4. Buy **Qty** in the ZERO app if you want to follow the simulator signal."
+            "1. Is **Action == Buy** and **LastClose2h** high?\n"
+            "2. Is now the trading time (**WaitToTrade = 0**)?\n"
+            "3. Is **LastSelling** short?\n"
+            "4. If all are yes, buy **Qty** in the ZERO app and set a **2% Stop-Loss**."
         )
 
         st.subheader("Steps to sell a ticker")
         st.markdown(
-            "1. Check **ToSell == True**.\n"
-            "2. Review **SellC4**, **SellC5**, **SellC6** and **SellC7**.\n"
-            "3. Confirm **Trading == True** and **LastSelling** is acceptable.\n"
-            "4. Sell the ticker in the ZERO app if you want to follow the simulator signal."
+            "1. Is **Action == Sell** and is the ticker open in the ZERO app?\n"
+            "2. Was the ticker bought before **InitTimeLatest**?\n"
+            "3. Is the ticker price drop larger than 2%, or is the ticker price change larger than 2%?\n"
+            "4. Is now the trading time (**WaitToTrade = 0**)?\n"
+            "5. Is **LastSelling** short?\n"
+            "6. If all are yes, sell the ticker in the ZERO app."
         )
 
 elif page == "Last Data":
@@ -3309,14 +2629,7 @@ elif page == "Last Data":
         active_tickers = latest_received.index
         active_df = market_df.copy()
 
-        live = build_live_overview_cached(
-            active_df,
-            (
-                active_df["timestamp"].max(),
-                active_df["id"].max(),
-            ),
-            "last-data",
-        )
+        live = build_live_overview(active_df)
         live = add_market_data_count(
             live,
             market_df,
@@ -3963,7 +3276,7 @@ elif page == "Settings":
                 ),
             )
 
-        c6_col1, c7_col1, details_col = st.columns(3)
+        c6_col1, c6_col2 = st.columns(2)
         with c6_col1:
             new_c6_min_gain_percent = st.number_input(
                 "C6: minimum gain (%)",
@@ -3977,34 +3290,19 @@ elif page == "Settings":
                     "and the gain versus the C6 reference price is below this percentage."
                 ),
             )
-        with c7_col1:
-            new_c7_max_gain_percent = st.number_input(
-                "C7: maximum gain (%)",
-                min_value=-100.0,
-                max_value=1000.0,
-                value=float(editable_sell.get("c7_max_gain_percent", 5.0)),
-                step=0.1,
-                format="%.2f",
-                help=(
-                    "C7 may trigger near the regular market close when C4 and C5 are false "
-                    "and the gain versus the same C6 reference price is above this percentage. "
-                    "The goal is to lock in a strong same-day gain and reduce overnight risk."
-                ),
-            )
-        with details_col:
+        with c6_col2:
             new_details = st.checkbox(
                 "Details",
                 value=bool(editable_sell.get("details", True)),
                 help=(
-                    "Show SimLastActionTime, SimLastAction, SimLastInit, SimReason and the SimBuy/SimSell snapshot columns on Zero-Trading."
+                    "Show C4 Check, C5 Check and C6 Check columns on Zero-Trading."
                 ),
             )
 
         st.caption(
             "Parameter names: movement_percent = the percentage threshold shared by C4 and C5; "
-            "c5_hours = the C5 static-price window length; c6_min_gain_percent = the lower "
-            "end-of-day gain threshold; c7_max_gain_percent = the upper end-of-day gain threshold; "
-            "Details controls the Zero-Trading simulator-action detail columns."
+            "c5_hours = the C5 static-price window length; c6_min_gain_percent = the minimum "
+            "gain required by C6 near market close; Details controls the Zero-Trading check columns."
         )
 
         st.markdown("**Market calendars and trading windows (C1 / CanSellNow)**")
@@ -4090,12 +3388,6 @@ elif page == "Settings":
             errors.append("C5 static-price window must be between 0.25 and 720 hours.")
         if not (-100.0 <= new_c6_min_gain_percent <= 1000.0):
             errors.append("C6 minimum gain must be between -100% and 1000%.")
-        if not (-100.0 <= new_c7_max_gain_percent <= 1000.0):
-            errors.append("C7 maximum gain must be between -100% and 1000%.")
-        if new_c7_max_gain_percent <= new_c6_min_gain_percent:
-            errors.append(
-                "C7 maximum gain must be greater than the C6 minimum gain."
-            )
 
         for region, values in market_values.items():
             if not _valid_timezone(values["timezone"]):
@@ -4125,7 +3417,6 @@ elif page == "Settings":
             editable_sell["movement_percent"] = float(new_movement_percent)
             editable_sell["c5_hours"] = float(new_c5_hours)
             editable_sell["c6_min_gain_percent"] = float(new_c6_min_gain_percent)
-            editable_sell["c7_max_gain_percent"] = float(new_c7_max_gain_percent)
             editable_sell["details"] = bool(new_details)
             for region, values in market_values.items():
                 cfg = editable_windows.setdefault(region, {})
@@ -4149,98 +3440,6 @@ elif page == "Settings":
     backup_path = st.session_state.pop("settings_backup", None)
     if backup_path:
         st.caption(f"Previous configuration backup: {backup_path}")
-
-    st.divider()
-    st.subheader("Simulator synchronization")
-
-    st.caption(
-        "Use this after you have manually cleared positions in ZERO. "
-        "It administratively closes all currently OPEN simulator positions "
-        "with SellReason=MANUAL_RESET. No normal simulator SELL, Telegram SELL, "
-        "SellPrice or simulated profit/loss is created."
-    )
-
-    try:
-        manual_reset_open_payload = api_get(
-            "/api/v1/simulation/open-tickers"
-        )
-        manual_reset_open_tickers = (
-            manual_reset_open_payload.get("tickers", [])
-            if isinstance(manual_reset_open_payload, dict)
-            else []
-        )
-    except Exception as exc:
-        manual_reset_open_tickers = []
-        st.warning(
-            f"Cannot determine currently OPEN simulator positions: {exc}"
-        )
-
-    st.write(
-        f"Currently OPEN simulator positions: "
-        f"**{len(manual_reset_open_tickers)}**"
-    )
-
-    if manual_reset_open_tickers:
-        st.caption(
-            "Tickers: "
-            + ", ".join(
-                sorted(
-                    str(ticker)
-                    for ticker in manual_reset_open_tickers
-                )
-            )
-        )
-
-    manual_reset_confirm = st.checkbox(
-        "I confirm that these positions should be removed from "
-        "the simulator's OPEN portfolio.",
-        key="manual_simulator_reset_confirm",
-    )
-
-    if st.button(
-        "Reset all OPEN simulator positions",
-        disabled=(
-            not manual_reset_confirm
-            or not manual_reset_open_tickers
-        ),
-        type="secondary",
-        key="manual_simulator_reset_button",
-    ):
-        try:
-            reset_result = api_post(
-                "/api/v1/simulation/reset-open"
-            )
-
-            load_simulation_payload_cached.clear()
-            load_simulation_cached.clear()
-
-            st.session_state[
-                "manual_simulator_reset_result"
-            ] = reset_result
-
-            st.rerun()
-
-        except Exception as exc:
-            st.error(
-                f"Could not reset OPEN simulator positions: {exc}"
-            )
-
-    manual_reset_result = st.session_state.pop(
-        "manual_simulator_reset_result",
-        None,
-    )
-
-    if isinstance(manual_reset_result, dict):
-        reset_count = int(
-            manual_reset_result.get("closed_count", 0)
-            or 0
-        )
-
-        st.success(
-            f"Manual simulator synchronization completed: "
-            f"{reset_count} OPEN position(s) moved to CLOSED "
-            f"with SellReason=MANUAL_RESET."
-        )
 
     st.divider()
     st.subheader("System parameters")
@@ -4340,21 +3539,6 @@ elif page == "Settings":
 
 elif page == "Logs":
     st.header("Logs")
-
-    def _logs_left_table(frame: pd.DataFrame):
-        """Left-align values and headers in Logs tables."""
-        return (
-            frame.style
-            .set_properties(**{"text-align": "left"})
-            .set_table_styles(
-                [
-                    {
-                        "selector": "th",
-                        "props": [("text-align", "left")],
-                    }
-                ]
-            )
-        )
 
     market_df = df[
         df["asset_type"].isin(["stock", "crypto"])
@@ -4482,409 +3666,109 @@ elif page == "Logs":
 
     day_names = ["Mon", "Tue", "Wed", "Thu", "Fr"]
 
-    # Use the same EUR InitPrice that is presented by Sim-Trading whenever
-    # available. The ZERO Advisor calculates Qty as the smallest whole number
-    # of shares covering EUR 10,000, so reconstruct the same Qty for historical
-    # simulator trades. DiffSellPrice is stored in percentage points, therefore
-    # monetary P/L is:
-    #
-    #     (DiffSellPrice / 100) * Qty * InitPrice
-    #
-    # MANUAL_RESET is an administrative simulator synchronization and is
-    # deliberately not treated as a simulator SELL.
-    if not sim_results.empty:
-        if "BuyPriceEUR" in sim_results.columns:
-            sim_results["_LogsInitPrice"] = pd.to_numeric(
-                sim_results["BuyPriceEUR"],
-                errors="coerce",
-            )
-        elif "BuyPrice" in sim_results.columns:
-            sim_results["_LogsInitPrice"] = pd.to_numeric(
-                sim_results["BuyPrice"],
-                errors="coerce",
-            )
-        else:
-            sim_results["_LogsInitPrice"] = float("nan")
-
-        sim_results["_LogsQty"] = sim_results["_LogsInitPrice"].map(
-            lambda price: (
-                math.ceil(10000.0 / float(price))
-                if pd.notna(price) and float(price) > 0
-                else float("nan")
-            )
-        )
-
-        sim_results["_LogsInputEUR"] = (
-            sim_results["_LogsQty"]
-            * sim_results["_LogsInitPrice"]
-        )
-
-        sim_results["_LogsDiffSellPrice"] = pd.to_numeric(
-            sim_results.get(
-                "DiffSellPrice",
-                pd.Series(index=sim_results.index, dtype="float64"),
-            ),
-            errors="coerce",
-        )
-
-        sim_results["_LogsProfitEUR"] = (
-            sim_results["_LogsDiffSellPrice"]
-            / 100.0
-            * sim_results["_LogsQty"]
-            * sim_results["_LogsInitPrice"]
-        )
-
-        sim_results["_LogsSellReason"] = (
-            sim_results.get(
-                "SellReason",
-                pd.Series(index=sim_results.index, dtype="object"),
-            )
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .str.upper()
-        )
-
-    def _logs_sell_summary(day_start_local):
-        """Return simulator SELL count and EUR profit for 03:00 -> 03:00."""
-
-        accounting_start_local = (
-            day_start_local.normalize()
-            + pd.Timedelta(hours=3)
-        )
-        accounting_end_local = (
-            accounting_start_local
-            + pd.Timedelta(days=1)
-        )
-
-        accounting_start_utc = accounting_start_local.tz_convert("UTC")
-        accounting_end_utc = accounting_end_local.tz_convert("UTC")
-
-        if sim_results.empty:
-            return 0, 0.0
-
-        sell_mask = (
-            sim_results["SellTime"].notna()
-            & (sim_results["SellTime"] >= accounting_start_utc)
-            & (sim_results["SellTime"] < accounting_end_utc)
-            & sim_results["_LogsSellReason"].ne("MANUAL_RESET")
-        )
-
-        sell_assets = int(sell_mask.sum())
-
-        profit_eur = float(
-            sim_results.loc[
-                sell_mask,
-                "_LogsProfitEUR",
-            ]
-            .fillna(0.0)
-            .sum()
-        )
-
-        return sell_assets, profit_eur
-
     if pd.isna(last_collected_time):
         day_rows = [
             {
                 "Day": day_name,
-                "Date": "—",
                 "Buy Assets": 0,
                 "Sell Assets": 0,
-                "Profit": "€0.00",
+                "Profit": 0.0,
             }
             for day_name in day_names
         ]
-
         st.info(
             "No collected market-data timestamp is available; "
             "the daily Sim-Trading summary is shown with zeros."
         )
-
     else:
-        last_local = pd.Timestamp(
-            last_collected_time
-        ).tz_convert(
+        last_local = pd.Timestamp(last_collected_time).tz_convert(
             LOCAL_TIMEZONE
         )
 
-        # Build the five most recent Monday-Friday simulator accounting days,
-        # newest first, anchored to the current local operating day rather than
-        # the date of the latest market-data row. This keeps today's row visible
-        # even when there have not been any SELLs (or even any fresh market rows)
-        # yet today. Before 03:00, the preceding calendar day is still the active
-        # 03:00 -> 03:00 accounting day.
-        now_local = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
-        current_accounting_day = now_local.normalize()
-        if now_local.hour < 3:
-            current_accounting_day = (
-                current_accounting_day - pd.Timedelta(days=1)
-            )
-
-        recent_days = []
-        candidate_day = current_accounting_day
-
-        while len(recent_days) < 5:
-            if candidate_day.weekday() < 5:
-                recent_days.append(candidate_day)
-            candidate_day = candidate_day - pd.Timedelta(days=1)
+        current_week_monday = (
+            last_local.normalize()
+            - pd.Timedelta(days=last_local.weekday())
+        )
+        previous_week_monday = (
+            current_week_monday
+            - pd.Timedelta(days=7)
+        )
 
         day_rows = []
 
-        for day_start_local in recent_days:
-            day_name = day_start_local.strftime("%a")
-
-            # All daily simulator statistics use the same accounting day:
-            # 03:00 local time -> 03:00 local time on the following day.
-            accounting_start_local = (
-                day_start_local.normalize()
-                + pd.Timedelta(hours=3)
+        for day_offset, day_name in enumerate(day_names):
+            day_start_local = (
+                previous_week_monday
+                + pd.Timedelta(days=day_offset)
             )
-            accounting_end_local = (
-                accounting_start_local
+            day_end_local = (
+                day_start_local
                 + pd.Timedelta(days=1)
             )
 
-            # The newest day may still be incomplete. Transaction counts and
-            # realised percentages are therefore capped at the latest available
-            # market-data timestamp. Open Assets EOB is only final once the
-            # 03:00 end-of-day boundary has been reached.
-            effective_end_local = min(
-                accounting_end_local,
-                last_local,
-            )
+            day_start_utc = day_start_local.tz_convert("UTC")
+            day_end_utc = day_end_local.tz_convert("UTC")
 
-            bought_assets = 0
-            sold_assets = 0
-            max_open_assets = 0
-            open_assets_eob = 0
-            input_eur = 0.0
-            profit_on_input = 0.0
-            profit_eur = 0.0
-            loss_eur = 0.0
-
-            accounting_start_utc = accounting_start_local.tz_convert("UTC")
-            accounting_end_utc = accounting_end_local.tz_convert("UTC")
-            effective_end_utc = effective_end_local.tz_convert("UTC")
-
-            if (
-                not sim_results.empty
-                and effective_end_local > accounting_start_local
-            ):
+            if sim_results.empty:
+                buy_assets = 0
+                sell_assets = 0
+                profit = 0.0
+            else:
                 buy_mask = (
                     sim_results["BuyTime"].notna()
-                    & (sim_results["BuyTime"] >= accounting_start_utc)
-                    & (sim_results["BuyTime"] < effective_end_utc)
+                    & (sim_results["BuyTime"] >= day_start_utc)
+                    & (sim_results["BuyTime"] < day_end_utc)
                 )
-                bought_assets = int(buy_mask.sum())
-
                 sell_mask = (
                     sim_results["SellTime"].notna()
-                    & (sim_results["SellTime"] >= accounting_start_utc)
-                    & (sim_results["SellTime"] < effective_end_utc)
-                    & sim_results["_LogsSellReason"].ne("MANUAL_RESET")
+                    & (sim_results["SellTime"] >= day_start_utc)
+                    & (sim_results["SellTime"] < day_end_utc)
                 )
-                sold_assets = int(sell_mask.sum())
 
-                sold_diff = pd.to_numeric(
+                # Count simulator transactions/tickers bought or sold that day.
+                buy_assets = int(buy_mask.sum())
+                sell_assets = int(sell_mask.sum())
+
+                profit = float(
                     sim_results.loc[
                         sell_mask,
-                        "_LogsDiffSellPrice",
-                    ],
-                    errors="coerce",
-                ).dropna()
-
-                sold_profit_eur = pd.to_numeric(
-                    sim_results.loc[
-                        sell_mask,
-                        "_LogsProfitEUR",
-                    ],
-                    errors="coerce",
+                        "DiffSellPrice",
+                    ]
+                    .fillna(0.0)
+                    .sum()
                 )
-
-                profit_eur = float(
-                    sold_profit_eur[
-                        sim_results.loc[sell_mask, "_LogsDiffSellPrice"] > 0
-                    ].fillna(0.0).sum()
-                )
-                loss_eur = float(
-                    sold_profit_eur[
-                        sim_results.loc[sell_mask, "_LogsDiffSellPrice"] < 0
-                    ].fillna(0.0).sum()
-                )
-
-            # Calculate the maximum number of simultaneously OPEN positions
-            # during the accounting day. Start with the positions already open
-            # at 03:00, then process each BUY as +1 and each normal SELL as -1.
-            #
-            # BUY events are processed before SELL events when timestamps are
-            # identical, so the maximum reflects all positions existing at that
-            # instant.
-            if not sim_results.empty and effective_end_utc > accounting_start_utc:
-                open_at_start_mask = (
-                    sim_results["BuyTime"].notna()
-                    & (sim_results["BuyTime"] < accounting_start_utc)
-                    & (
-                        sim_results["SellTime"].isna()
-                        | (sim_results["SellTime"] >= accounting_start_utc)
-                    )
-                )
-                open_trade_indexes = set(
-                    sim_results.index[open_at_start_mask].tolist()
-                )
-                max_open_trade_indexes = set(open_trade_indexes)
-                running_open_assets = len(open_trade_indexes)
-                max_open_assets = running_open_assets
-
-                buy_events = sim_results.loc[
-                    sim_results["BuyTime"].notna()
-                    & (sim_results["BuyTime"] >= accounting_start_utc)
-                    & (sim_results["BuyTime"] < effective_end_utc),
-                    ["BuyTime"],
-                ].copy()
-                buy_events["TradeIndex"] = buy_events.index
-                buy_events["EventTime"] = buy_events["BuyTime"]
-                buy_events["Delta"] = 1
-                buy_events["EventOrder"] = 0
-
-                sell_events = sim_results.loc[
-                    sim_results["SellTime"].notna()
-                    & (sim_results["SellTime"] >= accounting_start_utc)
-                    & (sim_results["SellTime"] < effective_end_utc),
-                    ["SellTime"],
-                ].copy()
-                sell_events["TradeIndex"] = sell_events.index
-                sell_events["EventTime"] = sell_events["SellTime"]
-                sell_events["Delta"] = -1
-                sell_events["EventOrder"] = 1
-
-                open_events = pd.concat(
-                    [
-                        buy_events[
-                            ["TradeIndex", "EventTime", "Delta", "EventOrder"]
-                        ],
-                        sell_events[
-                            ["TradeIndex", "EventTime", "Delta", "EventOrder"]
-                        ],
-                    ],
-                    ignore_index=True,
-                ).sort_values(
-                    ["EventTime", "EventOrder"],
-                    ascending=[True, True],
-                )
-
-                for _, open_event in open_events.iterrows():
-                    trade_index = open_event["TradeIndex"]
-                    if int(open_event["Delta"]) > 0:
-                        open_trade_indexes.add(trade_index)
-                    else:
-                        open_trade_indexes.discard(trade_index)
-
-                    running_open_assets = len(open_trade_indexes)
-                    if running_open_assets > max_open_assets:
-                        max_open_assets = running_open_assets
-                        max_open_trade_indexes = set(open_trade_indexes)
-
-                input_eur = float(
-                    pd.to_numeric(
-                        sim_results.loc[
-                            list(max_open_trade_indexes),
-                            "_LogsInputEUR",
-                        ],
-                        errors="coerce",
-                    ).fillna(0.0).sum()
-                )
-
-                if max_open_assets > 0:
-                    profit_on_input = float(sold_diff.sum()) / max_open_assets
-
-            # Count positions that are still OPEN exactly at the 03:00 EOB
-            # boundary. A trade is open at EOB when it was bought before the
-            # boundary and has either not been sold yet or was sold afterwards.
-            #
-            # For the current incomplete accounting day, show the current open
-            # count at the latest available timestamp instead of pretending the
-            # future 03:00 EOB state is already known.
-            state_time_utc = (
-                accounting_end_utc
-                if last_local >= accounting_end_local
-                else effective_end_utc
-            )
-
-            if not sim_results.empty and state_time_utc > accounting_start_utc:
-                open_mask = (
-                    sim_results["BuyTime"].notna()
-                    & (sim_results["BuyTime"] < state_time_utc)
-                    & (
-                        sim_results["SellTime"].isna()
-                        | (sim_results["SellTime"] >= state_time_utc)
-                    )
-                )
-                open_assets_eob = int(open_mask.sum())
-
-            result_eur = profit_eur + loss_eur
 
             day_rows.append(
                 {
                     "Day": day_name,
-                    "Date": day_start_local.strftime("%d.%m.%Y"),
-                    "Bought Assets": bought_assets,
-                    "Sold Assets": sold_assets,
-                    "Max Open Assets": max_open_assets,
-                    "Open Assets EOB": open_assets_eob,
-                    "Input": f"€{input_eur:.0f}",
-                    "ProfitOnInput": f"{profit_on_input:+.2f}%",
-                    "Profit": f"€{profit_eur:.2f}",
-                    "Loss": f"€{loss_eur:.2f}",
-                    "Result": f"€{result_eur:.2f}",
+                    "Buy Assets": buy_assets,
+                    "Sell Assets": sell_assets,
+                    "Profit": profit,
                 }
             )
 
+        previous_week_end = (
+            previous_week_monday
+            + pd.Timedelta(days=4)
+        )
         st.caption(
-            "Five most recent Monday-Friday simulator accounting days, newest first, "
-            "including the current operating day even when it has no SELLs yet. "
-            "Each day runs from 03:00 local time until 03:00 on the following day; "
-            "the current row is calculated only through the latest available data time. "
-            "Bought Assets and Sold Assets are transaction counts. Max Open Assets "
-            "is the maximum number of simultaneously open positions during the day. "
-            "Open Assets EOB is the number of positions still open at the 03:00 "
-            "end-of-day boundary. Input is the sum of Qty × InitPrice for the "
-            "positions that make up Max Open Assets. ProfitOnInput is the sum of "
-            "DiffSellPrice values for normal SELLs divided by Max Open Assets. "
-            "Profit and Loss are realised EUR amounts: (DiffSellPrice / 100) × Qty "
-            "× InitPrice for positive and negative sold positions respectively. "
-            "Result = Profit + Loss."
+            "Complete calendar week before the week containing the latest "
+            f"collected market-data point: "
+            f"{previous_week_monday.strftime('%d.%m.%Y')}–"
+            f"{previous_week_end.strftime('%d.%m.%Y')}."
         )
 
-    days_df = pd.DataFrame(
-        day_rows,
-        columns=[
-            "Day",
-            "Date",
-            "Bought Assets",
-            "Sold Assets",
-            "Max Open Assets",
-            "Open Assets EOB",
-            "Input",
-            "ProfitOnInput",
-            "Profit",
-            "Loss",
-            "Result",
-        ],
-    )
-
-    days_display_df = days_df.copy()
-
-    for column in days_display_df.columns:
-        days_display_df[column] = days_display_df[column].map(
-            lambda value: "—"
-            if pd.isna(value)
-            else str(value)
-        )
-
+    days_df = pd.DataFrame(day_rows)
     st.dataframe(
-        _logs_left_table(days_display_df),
+        days_df,
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Profit": st.column_config.NumberColumn(
+                "Profit",
+                format="%.2f%%",
+            ),
+        },
     )
 
     st.markdown("**Weeks of the last year**")
@@ -4896,141 +3780,71 @@ elif page == "Logs":
             "No collected market-data timestamp is available for the "
             "52-week Sim-Trading summary."
         )
-
     else:
-        last_local = pd.Timestamp(
-            last_collected_time
-        ).tz_convert(
+        last_local = pd.Timestamp(last_collected_time).tz_convert(
             LOCAL_TIMEZONE
         )
-
         current_week_monday = (
             last_local.normalize()
             - pd.Timedelta(days=last_local.weekday())
         )
 
-        # Show the current ISO week first, followed by the previous
-        # 51 weeks in descending order. The current week may be incomplete.
+        # Use the previous 52 complete calendar weeks so partial current-week
+        # activity does not distort comparison between weeks.
         first_week_monday = (
             current_week_monday
-            - pd.Timedelta(weeks=51)
+            - pd.Timedelta(weeks=52)
         )
 
-        for week_index in reversed(range(52)):
+        for week_index in range(52):
             week_start_local = (
                 first_week_monday
                 + pd.Timedelta(weeks=week_index)
             )
-
             week_end_local = (
                 week_start_local
                 + pd.Timedelta(days=7)
             )
 
-            effective_week_end_local = min(
-                week_end_local,
-                last_local,
-            )
-
             week_start_utc = week_start_local.tz_convert("UTC")
-            effective_week_end_utc = effective_week_end_local.tz_convert("UTC")
+            week_end_utc = week_end_local.tz_convert("UTC")
 
             iso = week_start_local.isocalendar()
             week_number = int(iso.week)
 
-            # Weekly totals are calculated as the sum of the corresponding
-            # Monday-Friday 03:00 -> 03:00 simulator accounting days.
-            bought_assets = 0
-            sold_assets = 0
-            profit_percent = 0.0
-            loss_percent = 0.0
-
-            for week_day_offset in range(5):
-                accounting_day = (
-                    week_start_local
-                    + pd.Timedelta(days=week_day_offset)
-                )
-
-                accounting_start_local = (
-                    accounting_day.normalize()
-                    + pd.Timedelta(hours=3)
-                )
-                accounting_end_local = (
-                    accounting_start_local
-                    + pd.Timedelta(days=1)
-                )
-
-                if accounting_start_local >= last_local:
-                    continue
-
-                effective_day_end_local = min(
-                    accounting_end_local,
-                    last_local,
-                )
-
-                if (
-                    sim_results.empty
-                    or effective_day_end_local <= accounting_start_local
-                ):
-                    continue
-
-                accounting_start_utc = accounting_start_local.tz_convert("UTC")
-                effective_day_end_utc = effective_day_end_local.tz_convert("UTC")
-
+            if sim_results.empty:
+                buy_assets = 0
+                sell_assets = 0
+                profit = 0.0
+            else:
                 buy_mask = (
                     sim_results["BuyTime"].notna()
-                    & (sim_results["BuyTime"] >= accounting_start_utc)
-                    & (sim_results["BuyTime"] < effective_day_end_utc)
+                    & (sim_results["BuyTime"] >= week_start_utc)
+                    & (sim_results["BuyTime"] < week_end_utc)
                 )
-                bought_assets += int(buy_mask.sum())
-
                 sell_mask = (
                     sim_results["SellTime"].notna()
-                    & (sim_results["SellTime"] >= accounting_start_utc)
-                    & (sim_results["SellTime"] < effective_day_end_utc)
-                    & sim_results["_LogsSellReason"].ne("MANUAL_RESET")
+                    & (sim_results["SellTime"] >= week_start_utc)
+                    & (sim_results["SellTime"] < week_end_utc)
                 )
-                sold_assets += int(sell_mask.sum())
 
-                sold_diff = pd.to_numeric(
+                buy_assets = int(buy_mask.sum())
+                sell_assets = int(sell_mask.sum())
+                profit = float(
                     sim_results.loc[
                         sell_mask,
-                        "RelativeDifference",
-                    ],
-                    errors="coerce",
-                ).dropna()
-
-                profit_percent += float(
-                    sold_diff[sold_diff > 0].sum()
+                        "DiffSellPrice",
+                    ]
+                    .fillna(0.0)
+                    .sum()
                 )
-                loss_percent += float(
-                    sold_diff[sold_diff < 0].sum()
-                )
-
-            result_percent = profit_percent + loss_percent
-
-            normal_display_week_end = (
-                week_start_local
-                + pd.Timedelta(days=4)
-            )
-
-            display_week_end = min(
-                normal_display_week_end,
-                last_local.normalize(),
-            )
 
             week_rows.append(
                 {
                     "Week": week_number,
-                    "Dates": (
-                        f"{week_start_local.strftime('%d.%m.%Y')}-"
-                        f"{display_week_end.strftime('%d.%m.%Y')}"
-                    ),
-                    "Bought Assets": bought_assets,
-                    "Sold Assets": sold_assets,
-                    "Profit": f"{profit_percent:+.2f}%",
-                    "Loss": f"{loss_percent:+.2f}%",
-                    "Result": f"{result_percent:+.2f}%",
+                    "Buy Assets": buy_assets,
+                    "Sell Assets": sell_assets,
+                    "Profit": profit,
                 }
             )
 
@@ -5038,44 +3852,31 @@ elif page == "Logs":
         week_rows,
         columns=[
             "Week",
-            "Dates",
-            "Bought Assets",
-            "Sold Assets",
+            "Buy Assets",
+            "Sell Assets",
             "Profit",
-            "Loss",
-            "Result",
         ],
     )
 
-    weeks_display_df = weeks_df.copy()
-
-    for column in weeks_display_df.columns:
-        weeks_display_df[column] = weeks_display_df[column].map(
-            lambda value: "—"
-            if pd.isna(value)
-            else str(value)
-        )
-
     st.dataframe(
-        _logs_left_table(weeks_display_df),
+        weeks_df,
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Profit": st.column_config.NumberColumn(
+                "Profit",
+                format="%.2f%%",
+            ),
+        },
     )
 
     st.caption(
-        "Sim-Trading Results: Date uses DD.MM.YYYY. Buy Assets keeps the "
-        "calendar-day/calendar-week BUY transaction count. Sell Assets uses "
-        "simulator SELL transactions in the accounting day from 03:00 local "
-        "time until 03:00 local time on the following day. MANUAL_RESET "
-        "positions are administrative closes and are excluded from Sell Assets "
-        "and Profit. Profit is expressed in EUR and is calculated for each "
-        "normal sold position as InitPrice × DiffSellPrice / 100, where "
-        "DiffSellPrice is the percentage shown on Sim-Trading and InitPrice "
-        "uses the corresponding EUR buy/init price. Daily Profit is the sum "
-        "of those position profits. Weekly Sell Assets and Profit are the sums "
-        "of the seven corresponding 03:00–03:00 accounting days. The weekly "
-        "table contains the previous 52 ISO calendar weeks plus the current "
-        "week; the current-week row can therefore still be partial."
+        "Sim-Trading Results: Buy Assets = number of simulator BUY transactions "
+        "in the period. Sell Assets = number of simulator SELL transactions in "
+        "the period. Profit = sum of DiffSellPrice percentage values for trades "
+        "sold in that period. The weekly table contains the previous 52 complete "
+        "ISO calendar weeks, based on the simulator trade history currently "
+        "available to the dashboard."
     )
 
     # 2. Imported assets that were not tracked at simulationTimestamp.
@@ -5112,9 +3913,7 @@ elif page == "Logs":
 
     if not non_tracked_assets.empty:
         st.dataframe(
-            _logs_left_table(
-                non_tracked_assets[["Ticker", "Name", "ISIN"]]
-            ),
+            non_tracked_assets[["Ticker", "Name", "ISIN"]],
             use_container_width=True,
             hide_index=True,
         )
@@ -5214,9 +4013,7 @@ elif page == "Logs":
         },
     ]
     st.dataframe(
-        _logs_left_table(
-            pd.DataFrame(stats_rows)
-        ),
+        pd.DataFrame(stats_rows),
         use_container_width=True,
         hide_index=True,
     )
@@ -5304,8 +4101,7 @@ elif page == "Historical Data":
         ranking_df = build_live_overview_cached(
             historical,
             data_version,
-            "historical-data",
-        )
+        )        
 
         if not ranking_df.empty:
             ranked_assets = ranking_df["Ticker"].tolist()
@@ -6730,14 +5526,7 @@ elif page == "Sim-Trading":
             ].copy()
 
             live_now = (
-                build_live_overview_cached(
-                    active_market_df,
-                    (
-                        active_market_df["timestamp"].max(),
-                        active_market_df["id"].max(),
-                    ),
-                    "sim-trading",
-                )
+                build_live_overview(active_market_df)
                 if not active_market_df.empty
                 else pd.DataFrame()
             )
@@ -6926,352 +5715,6 @@ elif page == "Sim-Trading":
                 axis=1,
             )
 
-            # Show the current trading-condition values used by Zero-Trading.
-            # C2 is calculated explicitly from each ticker's latest available
-            # CloseB so a ticker does not become C2=False merely because its
-            # newest bar is older than the newest global market timestamp.
-            # C4/C5 start with the live-overview evaluation. For currently OPEN
-            # simulated positions, C4/C5 are recalculated from the latest
-            # simulated BuyTime and C6/C7 are evaluated with the same
-            # end-of-day rules used on the Zero-Trading page.
-            for condition in ["C2", "C4", "C5", "C6", "C7"]:
-                shown[condition] = False
-            shown["_SimBoughtBefore"] = pd.NA
-            shown["_SimCoreShouldSell"] = False
-            shown["_SimSellWindowOpen"] = False
-            shown["_SimSellDataReady"] = False
-            shown["_SimBoughtBefore"] = pd.NA
-            shown["_SimCoreShouldSell"] = False
-            shown["_SimSellWindowOpen"] = False
-            shown["_SimSellDataReady"] = False
-
-            if not live_now.empty and "Ticker" in live_now.columns:
-                condition_live = (
-                    live_now
-                    .dropna(subset=["Ticker"])
-                    .assign(
-                        _TickerKey=lambda frame: (
-                            frame["Ticker"]
-                            .astype(str)
-                            .str.strip()
-                            .str.upper()
-                        )
-                    )
-                    .drop_duplicates(subset=["_TickerKey"], keep="first")
-                    .set_index("_TickerKey")
-                )
-
-                # C2 is a two-stage condition:
-                # 1) market breadth must meet BUY_MIN_CLOSEB_COUNT; and
-                # 2) the individual ticker's latest CloseB must meet the
-                #    configured BUY_MIN_CLOSEB_PERCENT threshold.
-                if "CloseB" in condition_live.columns:
-                    latest_closeb = pd.to_numeric(
-                        condition_live["CloseB"],
-                        errors="coerce",
-                    )
-                    c2_qualifying_count = int(
-                        (latest_closeb >= BUY_MIN_CLOSEB_PERCENT).sum()
-                    )
-                    c2_breadth_satisfied = (
-                        c2_qualifying_count >= BUY_MIN_CLOSEB_COUNT
-                    )
-                    c2_map = (
-                        c2_breadth_satisfied
-                        & (latest_closeb >= BUY_MIN_CLOSEB_PERCENT)
-                    ).fillna(False).astype(bool).to_dict()
-                    shown["C2"] = (
-                        shown["Ticker"]
-                        .astype(str)
-                        .str.strip()
-                        .str.upper()
-                        .map(lambda ticker: bool(c2_map.get(ticker, False)))
-                    )
-
-                for condition in ["C4", "C5"]:
-                    if condition in condition_live.columns:
-                        condition_map = (
-                            condition_live[condition]
-                            .fillna(False)
-                            .astype(bool)
-                            .to_dict()
-                        )
-                        shown[condition] = (
-                            shown["Ticker"]
-                            .astype(str)
-                            .str.strip()
-                            .str.upper()
-                            .map(
-                                lambda ticker, values=condition_map:
-                                bool(values.get(ticker, False))
-                            )
-                        )
-
-            sim_latest_trade_map = {}
-            if not latest_sim.empty and "Ticker" in latest_sim.columns:
-                sim_latest_trade_map = (
-                    latest_sim
-                    .dropna(subset=["Ticker"])
-                    .drop_duplicates(subset=["Ticker"], keep="last")
-                    .set_index("Ticker")
-                    .to_dict(orient="index")
-                )
-
-            sim_movement_threshold = float(
-                SELL_CONFIG.get("movement_percent", 1.1)
-            )
-            sim_c5_hours = float(SELL_CONFIG.get("c5_hours", 24.0))
-            sim_c6_min_gain_percent = float(
-                SELL_CONFIG.get("c6_min_gain_percent", 2.0)
-            )
-            sim_c7_max_gain_percent = float(
-                SELL_CONFIG.get("c7_max_gain_percent", 5.0)
-            )
-            sim_c6_close_minutes = float(
-                SELL_CONFIG.get("c6_close_minutes", 30.0)
-            )
-            sim_c6_enabled = bool(SELL_CONFIG.get("c6_enabled", True))
-
-            for idx, sim_row in shown.iterrows():
-                if str(sim_row.get("SimStatus") or "").strip().upper() != "OPEN":
-                    continue
-
-                ticker_value = str(sim_row.get("Ticker") or "").strip().upper()
-                init_time_latest = pd.to_datetime(
-                    sim_row.get("BuyTime"),
-                    utc=True,
-                    errors="coerce",
-                )
-                if pd.isna(init_time_latest):
-                    continue
-
-                ticker_history = (
-                    active_market_df[
-                        active_market_df["ticker"].astype(str).str.upper()
-                        == ticker_value
-                    ]
-                    .sort_values(["timestamp", "id"])
-                    .drop_duplicates(subset=["timestamp"], keep="last")
-                    .copy()
-                )
-                if ticker_history.empty:
-                    continue
-
-                latest_row = ticker_history.iloc[-1]
-                latest_time = pd.to_datetime(
-                    latest_row.get("timestamp"),
-                    utc=True,
-                    errors="coerce",
-                )
-                current_price = pd.to_numeric(
-                    latest_row.get("close"),
-                    errors="coerce",
-                )
-                if (
-                    pd.isna(latest_time)
-                    or pd.isna(current_price)
-                    or float(current_price) <= 0
-                ):
-                    continue
-
-                decision = evaluate_sell_history(
-                    ticker_df=ticker_history,
-                    latest_time=latest_time,
-                    current_price=float(current_price),
-                    movement_percent=sim_movement_threshold,
-                    c5_hours=sim_c5_hours,
-                    init_time=init_time_latest,
-                )
-                shown.at[idx, "_SimBoughtBefore"] = decision.bought_before
-                shown.at[idx, "_SimCoreShouldSell"] = bool(decision.should_sell)
-                shown.at[idx, "_SimSellDataReady"] = True
-                shown.at[idx, "C4"] = bool(decision.c4_satisfied)
-                shown.at[idx, "C5"] = bool(decision.c5_satisfied)
-
-                open_trade = sim_latest_trade_map.get(ticker_value, {})
-                c6_reference_price = pd.to_numeric(
-                    open_trade.get("BuyPrice"),
-                    errors="coerce",
-                )
-                if pd.isna(c6_reference_price):
-                    c6_reference_price = pd.to_numeric(
-                        open_trade.get("InitPrice"),
-                        errors="coerce",
-                    )
-
-                c6_gain_percent = None
-                if (
-                    pd.notna(c6_reference_price)
-                    and float(c6_reference_price) > 0
-                ):
-                    c6_gain_percent = (
-                        float(current_price) / float(c6_reference_price) - 1.0
-                    ) * 100.0
-
-                market_region = market_region_for_ticker(
-                    ticker_value,
-                    latest_row.get("asset_type"),
-                )
-                market_config = (
-                    TRADING_WINDOWS.get(market_region)
-                    if market_region
-                    else None
-                )
-                sell_window = None
-                c6_remaining_minutes = None
-                if market_config:
-                    action_time = pd.Timestamp.now(tz="UTC")
-                    sell_window = trading_window_info(
-                        action_time,
-                        market_config,
-                        "sell",
-                    )
-                    regular_close_value = market_config.get("regular_close")
-                    if sell_window.is_open and regular_close_value:
-                        try:
-                            market_timezone = str(
-                                market_config.get("timezone") or "UTC"
-                            )
-                            action_local = action_time.tz_convert(market_timezone)
-                            regular_close_local = pd.Timestamp(
-                                f"{action_local.date()} {regular_close_value}",
-                                tz=market_timezone,
-                            )
-                            c6_remaining_minutes = (
-                                regular_close_local - action_local
-                            ).total_seconds() / 60.0
-                        except Exception:
-                            c6_remaining_minutes = None
-
-                shown.at[idx, "_SimSellWindowOpen"] = bool(
-                    sell_window is not None and sell_window.is_open
-                )
-
-                shown.at[idx, "C6"] = bool(
-                    sim_c6_enabled
-                    and not decision.c4_satisfied
-                    and not decision.c5_satisfied
-                    and sell_window is not None
-                    and sell_window.is_open
-                    and c6_remaining_minutes is not None
-                    and 0.0 <= c6_remaining_minutes <= sim_c6_close_minutes
-                    and c6_gain_percent is not None
-                    and c6_gain_percent < sim_c6_min_gain_percent
-                )
-
-                shown.at[idx, "C7"] = bool(
-                    not decision.c4_satisfied
-                    and not decision.c5_satisfied
-                    and sell_window is not None
-                    and sell_window.is_open
-                    and c6_remaining_minutes is not None
-                    and 0.0 <= c6_remaining_minutes <= sim_c6_close_minutes
-                    and c6_gain_percent is not None
-                    and c6_gain_percent > sim_c7_max_gain_percent
-                )
-
-            for condition in ["C2", "C4", "C5", "C6", "C7"]:
-                shown[condition] = shown[condition].map(
-                    lambda value: bool(value) if pd.notna(value) else False
-                )
-
-            def _sim_current_window_open(ticker, action):
-                ticker_key = str(ticker or "").strip().upper()
-                if not ticker_key:
-                    return False
-
-                ticker_rows = active_market_df[
-                    active_market_df["ticker"]
-                    .astype(str)
-                    .str.strip()
-                    .str.upper()
-                    == ticker_key
-                ]
-                if ticker_rows.empty:
-                    return False
-
-                latest_market_row = (
-                    ticker_rows
-                    .sort_values(["timestamp", "id"])
-                    .iloc[-1]
-                )
-
-                market_region = market_region_for_ticker(
-                    ticker_key,
-                    latest_market_row.get("asset_type"),
-                )
-                market_config = (
-                    TRADING_WINDOWS.get(market_region)
-                    if market_region
-                    else None
-                )
-                if not market_config:
-                    return False
-
-                window = trading_window_info(
-                    pd.Timestamp.now(tz="UTC"),
-                    market_config,
-                    action,
-                )
-                return bool(window.is_open)
-
-            def _sim_needed(row):
-                status = str(
-                    row.get("SimStatus") or ""
-                ).strip().upper()
-
-                ticker = row.get("Ticker")
-
-                if status == "OPEN":
-                    if not bool(row.get("_SimSellDataReady", False)):
-                        return "Latest market data"
-
-                    if not bool(row.get("_SimSellWindowOpen", False)):
-                        return "SELL window to open"
-
-                    c4 = bool(row.get("C4", False))
-                    c5 = bool(row.get("C5", False))
-                    c6 = bool(row.get("C6", False))
-                    c7 = bool(row.get("C7", False))
-
-                    if c6 or c7:
-                        return "Ready to SELL"
-
-                    if c4 or c5:
-                        bought_before = row.get("_SimBoughtBefore")
-
-                        if (
-                            pd.notna(bought_before)
-                            and not bool(bought_before)
-                        ):
-                            return "Buy must predate signal"
-
-                        if bool(row.get("_SimCoreShouldSell", False)):
-                            return "Ready to SELL"
-
-                        return "SELL eligibility"
-
-                    return "C4/C5/C6/C7 signal"
-
-                if status in {"CLOSED", "NO TRADE"}:
-                    if not bool(row.get("C2", False)):
-                        return "C2 buy signal"
-
-                    if not _sim_current_window_open(ticker, "buy"):
-                        return "BUY window to open"
-
-                    if current_open_count >= BUY_MAX_OPEN_TICKERS:
-                        return "Free portfolio slot"
-
-                    return "Ready to BUY"
-
-                return "—"
-
-            shown["Needed"] = shown.apply(
-                _sim_needed,
-                axis=1,
-            )
-
             shown["DiffSellPriceRaw"] = pd.to_numeric(
                 shown["RelativeDifference"],
                 errors="coerce",
@@ -7390,12 +5833,6 @@ elif page == "Sim-Trading":
                     "Ticker",
                     "TickerName",
                     "Reason",
-                    "Needed",
-                    "C2",
-                    "C4",
-                    "C5",
-                    "C6",
-                    "C7",
                     "InitTime",
                     "InitPrice",
                     "SellTimeDisplay",
@@ -7477,8 +5914,7 @@ elif page == "Sim-Trading":
                 "or NO TRADE. Reason gives a maximum-three-word explanation of the "
                 "transition: OPEN uses 'Buy signal' because the simulator currently "
                 "does not persist a separate BuyReason; CLOSED uses the stored "
-                "SellReason. C2, C4, C5, and C6 show the current condition values "
-                "used for the Zero-Trading decision. "
+                "SellReason (C4 = Price drop, C5 = Price static, C4+C5 = Drop + static). "
                 "InitTime and InitPrice are the latest simulated BUY time and EUR price. "
                 "SellTime and SellPrice are populated when the latest simulated trade "
                 "has been sold."
@@ -7552,40 +5988,12 @@ elif page == "Trading Efficiency":
             st.error(f"Cannot load simulation data: {exc}")
         else:
             simulation_df = pd.DataFrame(simulation_rows)
-
-            # MANUAL_RESET is an administrative synchronization event,
-            # not a strategy-generated C4/C5/C6/C7 SELL. Exclude these
-            # rows from Trading Efficiency.
-            strategy_simulation_df = simulation_df.copy()
-            if (
-                not strategy_simulation_df.empty
-                and "SellReason" in strategy_simulation_df.columns
-            ):
-                strategy_simulation_df = strategy_simulation_df[
-                    strategy_simulation_df["SellReason"]
-                    .fillna("")
-                    .astype(str)
-                    .str.strip()
-                    .str.upper()
-                    .ne("MANUAL_RESET")
-                ].copy()
-
-            selected_period = range_map[range_label]
-
             full_analysis_df = build_trade_analysis_cached(
-                df,
-                strategy_simulation_df,
-                reference_time,
-                selected_period,
+                df, simulation_df, reference_time
             )
-
-            analysis_start = reference_time - selected_period
+            analysis_start = reference_time - range_map[range_label]
             analysis_df = full_analysis_df[
-                pd.to_datetime(
-                    full_analysis_df["Time"],
-                    utc=True,
-                    errors="coerce",
-                ) >= analysis_start
+                pd.to_datetime(full_analysis_df["Time"], utc=True, errors="coerce") >= analysis_start
             ].copy()
             analysis_df = analysis_df[
                 analysis_df["Series"].isin(selected_counters)

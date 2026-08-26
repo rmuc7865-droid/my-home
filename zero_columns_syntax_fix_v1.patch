@@ -1,0 +1,18 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -2400,13 +2400,12 @@
+                 requested_columns = [
+                     "Action",
+                     "Reason",
+                     "C2",
+                     "C4",
+                     "C5",
+                     "C6",
+-                    "WeakInitTimeLatest",
+-                ])
++                ]
+                 if zero_details:
+                     requested_columns.extend([
+                         "C4Check",
+                         "C5Check",
+                         "C6Check",

@@ -1,0 +1,22 @@
+diff --git a/dashboard/streamlit_app.py b/dashboard/streamlit_app.py
+index ee6c7af..cd15f9b 100644
+--- a/dashboard/streamlit_app.py
++++ b/dashboard/streamlit_app.py
+@@ -1817,15 +1817,9 @@ elif page == "Live Overview":
+             .max()
+         )
+  
+-        active_tickers = latest_received[
+-            latest_received >= active_cutoff
+-        ].index
++        active_tickers = latest_received.index
+ 
+-        active_df = market_df[
+-            market_df["ticker"].isin(
+-                active_tickers
+-            )
+-        ].copy()
++        active_df = market_df.copy()
+ 
+         live = build_live_overview(active_df)
+         live = add_market_data_count(

@@ -1,0 +1,76 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,30 +1,54 @@
+                         def _historical_open_action(row):
+-                            key = (
+-                                str(row["ticker"]).upper(),
+-                                row["_RoundedTime"],
++                            buy_time = pd.to_datetime(
++                                row.get("_TradeBuyTime"),
++                                utc=True,
++                                errors="coerce",
+                             )
+-                            if key in historical_sell_points:
+-                                return "Sell"
+-                            if key in historical_buy_points:
++                            sell_time = pd.to_datetime(
++                                row.get("_TradeSellTime"),
++                                utc=True,
++                                errors="coerce",
++                            )
++                            point = row["_RoundedTime"]
++
++                            # SellTime itself is CLOSED, so Sell belongs to the
++                            # final OPEN 15-minute point before SellTime.
++                            if pd.notna(sell_time):
++                                sell_open_point = (
++                                    sell_time.round("15min")
++                                    - pd.Timedelta(minutes=15)
++                                )
++                                if point == sell_open_point:
++                                    return "Sell"
++
++                            if (
++                                pd.notna(buy_time)
++                                and point == buy_time.round("15min")
++                            ):
+                                 return "Buy"
++
+                             return "-"
+ 
+                         def _historical_open_reason(row):
+-                            key = (
+-                                str(row["ticker"]).upper(),
+-                                row["_RoundedTime"],
+-                            )
+-                            if key in historical_sell_points:
+-                                meta = historical_sell_points[key]
+-                                return _historical_sell_reason(
+-                                    row["ticker"],
+-                                    meta["buy_time"],
+-                                    row["timestamp"],
+-                                    meta["sell_reason"],
+-                                )
+-                            if key in historical_buy_points:
++                            action = _historical_open_action(row)
++
++                            if action == "Buy":
+                                 return _historical_close2h_reason(
+                                     row["ticker"],
+                                     row["timestamp"],
+                                 )
++
++                            if action == "Sell":
++                                buy_time = pd.to_datetime(
++                                    row.get("_TradeBuyTime"),
++                                    utc=True,
++                                    errors="coerce",
++                                )
++                                return _historical_sell_reason(
++                                    row["ticker"],
++                                    buy_time,
++                                    row["timestamp"],
++                                    row.get("_TradeSellReason"),
++                                )
++
+                             return "-"

@@ -1,0 +1,33 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1765,10 +1765,28 @@
+                     buy_decision = pd.Series(
+                         [bool(buy_decision.loc[idx]) and idx in allowed_buy_indexes for idx in advisor_live.index],
+                         index=advisor_live.index,
+                     )
+
++            # Zero-Trading actions must respect the simulator position state:
++            # - an already OPEN ticker cannot be a new BUY candidate;
++            # - a SELL recommendation is valid only for an OPEN simulator ticker.
++            ticker_is_open = (
++                advisor_live["Ticker"]
++                .astype(str)
++                .str.strip()
++                .str.upper()
++                .isin(zero_open_tickers)
++            )
++
++            buy_decision = buy_decision & ~ticker_is_open
++
+             if "ShouldSell" in advisor_live.columns:
+-                sell_decision = advisor_live["ShouldSell"].fillna(False).astype(bool)
++                sell_decision = (
++                    advisor_live["ShouldSell"]
++                    .fillna(False)
++                    .astype(bool)
++                    & ticker_is_open
++                )
+             else:
+                 sell_decision = pd.Series(False, index=advisor_live.index)
+
+             advisor = advisor_live[buy_decision | sell_decision].copy()

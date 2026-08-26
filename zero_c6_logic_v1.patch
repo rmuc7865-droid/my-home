@@ -1,0 +1,142 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,5 +1,112 @@
++                c6_reference_price = None
++                c6_reference_time = None
++                c6_reference_source = None
++                c6_gain_percent = None
++                c6_remaining_minutes = None
++
++                reference_cutoff = latest_time - pd.Timedelta(
++                    hours=c6_reference_hours
++                )
++                open_trade = zero_open_trades.get(ticker_value, {})
++
++                if init_time_latest >= reference_cutoff:
++                    buy_price = pd.to_numeric(
++                        open_trade.get("BuyPrice"),
++                        errors="coerce",
++                    )
++                    if pd.isna(buy_price):
++                        buy_price = pd.to_numeric(
++                            open_trade.get("InitPrice"),
++                            errors="coerce",
++                        )
++                    if pd.notna(buy_price) and float(buy_price) > 0:
++                        c6_reference_price = float(buy_price)
++                        c6_reference_time = init_time_latest
++                        c6_reference_source = "InitPrice"
++                else:
++                    reference_rows = ticker_history.copy()
++                    reference_rows["_CloseNumeric"] = pd.to_numeric(
++                        reference_rows["close"],
++                        errors="coerce",
++                    )
++                    reference_rows = reference_rows[
++                        reference_rows["_CloseNumeric"].notna()
++                        & (reference_rows["_CloseNumeric"] > 0)
++                    ].copy()
++                    if not reference_rows.empty:
++                        reference_rows["_ReferenceDistance"] = (
++                            reference_rows["timestamp"] - reference_cutoff
++                        ).abs()
++                        reference_row = reference_rows.sort_values(
++                            ["_ReferenceDistance", "timestamp"],
++                            ascending=[True, True],
++                        ).iloc[0]
++                        reference_distance_minutes = (
++                            reference_row["_ReferenceDistance"].total_seconds()
++                            / 60.0
++                        )
++                        if reference_distance_minutes <= c6_reference_tolerance_minutes:
++                            c6_reference_price = float(
++                                reference_row["_CloseNumeric"]
++                            )
++                            c6_reference_time = pd.to_datetime(
++                                reference_row["timestamp"],
++                                utc=True,
++                            )
++                            c6_reference_source = "LastTime-24h"
++
++                if c6_reference_price is not None and c6_reference_price > 0:
++                    c6_gain_percent = (
++                        float(current_price) / c6_reference_price - 1.0
++                    ) * 100.0
++
++                market_region = row.get("MarketRegion")
++                market_config = (
++                    TRADING_WINDOWS.get(market_region)
++                    if market_region
++                    else None
++                )
++                window = None
++                if market_config:
++                    action_time = pd.Timestamp.now(tz="UTC")
++                    window = trading_window_info(
++                        action_time,
++                        market_config,
++                        "sell",
++                    )
++                    regular_close_value = market_config.get("regular_close")
++                    if window.is_open and regular_close_value:
++                        try:
++                            market_timezone = str(
++                                market_config.get("timezone") or "UTC"
++                            )
++                            action_local = action_time.tz_convert(
++                                market_timezone
++                            )
++                            regular_close_local = pd.Timestamp(
++                                f"{action_local.date()} {regular_close_value}",
++                                tz=market_timezone,
++                            )
++                            c6_remaining_minutes = (
++                                regular_close_local - action_local
++                            ).total_seconds() / 60.0
++                        except Exception:
++                            c6_remaining_minutes = None
++
++                c6_satisfied = bool(
++                    c6_enabled
++                    and not decision.c4_satisfied
++                    and not decision.c5_satisfied
++                    and window is not None
++                    and window.is_open
++                    and c6_remaining_minutes is not None
++                    and 0.0 <= c6_remaining_minutes <= c6_close_minutes
++                    and c6_gain_percent is not None
++                    and c6_gain_percent < c6_min_gain_percent
++                )
++
+                 advisor_live.at[idx, "ShouldSell"] = bool(
+-                    decision.should_sell
++                    decision.should_sell or c6_satisfied
+                 )
+                 advisor_live.at[idx, "C4"] = bool(
+                     decision.c4_satisfied
+@@ -7,8 +114,25 @@
+                 advisor_live.at[idx, "C5"] = bool(
+                     decision.c5_satisfied
+                 )
++                advisor_live.at[idx, "C6"] = c6_satisfied
+                 advisor_live.at[idx, "BoughtBefore"] = (
+                     decision.bought_before
+                 )
++                advisor_live.at[idx, "C6Check"] = (
++                    f"{'TRUE' if c6_satisfied else 'FALSE'}: "
++                    f"gain "
++                    f"{c6_gain_percent:+.2f}%"
++                    if c6_gain_percent is not None
++                    else f"{'TRUE' if c6_satisfied else 'FALSE'}: gain unavailable"
++                )
++                if c6_gain_percent is not None:
++                    advisor_live.at[idx, "C6Check"] += (
++                        f"; threshold < {c6_min_gain_percent:.2f}%; "
++                        f"reference={c6_reference_source or '—'} "
++                        f"{format_local_timestamp(c6_reference_time)}; "
++                        f"remaining={c6_remaining_minutes:.1f}m"
++                        if c6_remaining_minutes is not None
++                        else f"; threshold < {c6_min_gain_percent:.2f}%; remaining=—"
++                    )
+ 
+                 if (

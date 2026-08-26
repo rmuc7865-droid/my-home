@@ -1,0 +1,24 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -2,6 +2,7 @@
+                         ticker,
+                         buy_time,
+                         sell_time,
++                        sell_reason,
+                     ) in historical_trade_intervals:
+                         mask = (
+                             chart_df["ticker"]
+@@ -31,6 +32,13 @@
+                             ticker_points[
+                                 "_OpenTicker"
+                             ] = ticker
++
++                            # Preserve the exact simulator interval responsible
++                            # for this OPEN point.
++                            ticker_points["_TradeBuyTime"] = buy_time
++                            ticker_points["_TradeSellTime"] = sell_time
++                            ticker_points["_TradeSellReason"] = sell_reason
++
+                             open_points_parts.append(
+                                 ticker_points
+                             )

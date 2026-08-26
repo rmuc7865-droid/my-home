@@ -1,0 +1,28 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -5816,7 +5816,25 @@
++        technology_by_system = {
++            "polygon": "REST API",
++            "crypto": "REST API",
++            "massive": "REST API",
++            "international": "REST API",
++            "x1": "Mock / simulated",
++        }
++
++        latest["Technology"] = (
++            latest["system"]
++            .astype(str)
++            .str.strip()
++            .str.lower()
++            .map(technology_by_system)
++            .fillna("Unknown")
++        )
++
+         display_health = latest[
+             [
+                 "system",
++                "Technology",
+                 "CollectorStatus",
+                 "MarketStatus",
+                 "LastReceived",
+                 "LastMarketData",

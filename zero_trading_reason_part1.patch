@@ -1,0 +1,35 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -2,4 +2,32 @@
+                     lambda value: f"{float(value):+.2f}%" if pd.notna(value) else "—"
+                 )
+ 
++                def _zero_reason(row):
++                    action = str(row.get("Action") or "").strip()
++
++                    if action == "Buy":
++                        return "Strong Close2h"
++
++                    if action == "Sell":
++                        c4 = bool(row.get("C4", False))
++                        c5 = bool(row.get("C5", False))
++                        c6 = bool(row.get("C6", False))
++
++                        if c6:
++                            return "End-of-day exit"
++                        if c4 and c5:
++                            return "Drop + static"
++                        if c4:
++                            return "Price drop"
++                        if c5:
++                            return "Price static"
++                        return "Sell signal"
++
++                    return "—"
++
++                advisor["Reason"] = advisor.apply(
++                    _zero_reason,
++                    axis=1,
++                )
++
+                 def _zero_percent(value):

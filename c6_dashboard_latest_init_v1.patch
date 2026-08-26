@@ -1,0 +1,79 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1813,12 +1813,6 @@
+             c6_close_minutes = float(
+                 SELL_CONFIG.get("c6_close_minutes", 30.0)
+             )
+-            c6_reference_hours = float(
+-                SELL_CONFIG.get("c6_reference_hours", 24.0)
+-            )
+-            c6_reference_tolerance_minutes = float(
+-                SELL_CONFIG.get("c6_reference_tolerance_minutes", 30.0)
+-            )
+             c6_enabled = bool(
+                 SELL_CONFIG.get("c6_enabled", True)
+             )
+@@
+-                reference_cutoff = latest_time - pd.Timedelta(
+-                    hours=c6_reference_hours
+-                )
+                 open_trade = zero_open_trades.get(ticker_value, {})
+
+-                if init_time_latest >= reference_cutoff:
+-                    buy_price = pd.to_numeric(
+-                        open_trade.get("BuyPrice"),
+-                        errors="coerce",
+-                    )
+-                    if pd.isna(buy_price):
+-                        buy_price = pd.to_numeric(
+-                            open_trade.get("InitPrice"),
+-                            errors="coerce",
+-                        )
+-                    if pd.notna(buy_price) and float(buy_price) > 0:
+-                        c6_reference_price = float(buy_price)
+-                        c6_reference_time = init_time_latest
+-                        c6_reference_source = "InitPrice"
+-                else:
+-                    reference_rows = ticker_history.copy()
+-                    reference_rows["_CloseNumeric"] = pd.to_numeric(
+-                        reference_rows["close"],
+-                        errors="coerce",
+-                    )
+-                    reference_rows = reference_rows[
+-                        reference_rows["_CloseNumeric"].notna()
+-                        & (reference_rows["_CloseNumeric"] > 0)
+-                    ].copy()
+-                    if not reference_rows.empty:
+-                        reference_rows["_ReferenceDistance"] = (
+-                            reference_rows["timestamp"] - reference_cutoff
+-                        ).abs()
+-                        reference_row = reference_rows.sort_values(
+-                            ["_ReferenceDistance", "timestamp"],
+-                            ascending=[True, True],
+-                        ).iloc[0]
+-                        reference_distance_minutes = (
+-                            reference_row["_ReferenceDistance"].total_seconds()
+-                            / 60.0
+-                        )
+-                        if reference_distance_minutes <= c6_reference_tolerance_minutes:
+-                            c6_reference_price = float(
+-                                reference_row["_CloseNumeric"]
+-                            )
+-                            c6_reference_time = pd.to_datetime(
+-                                reference_row["timestamp"],
+-                                utc=True,
+-                            )
+-                            c6_reference_source = "LastTime-24h"
++                buy_price = pd.to_numeric(
++                    open_trade.get("BuyPrice"),
++                    errors="coerce",
++                )
++                if pd.isna(buy_price):
++                    buy_price = pd.to_numeric(
++                        open_trade.get("InitPrice"),
++                        errors="coerce",
++                    )
++                if pd.notna(buy_price) and float(buy_price) > 0:
++                    c6_reference_price = float(buy_price)
++                    c6_reference_time = init_time_latest
++                    c6_reference_source = "InitPriceLatest"

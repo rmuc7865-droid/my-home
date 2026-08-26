@@ -1,0 +1,75 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -3564,4 +3564,8 @@
+         else:
++            # Reserve the Historical Data counter row here so it is displayed
++            # directly below the Home Monitor header and above the Assets controls.
++            historical_info_placeholder = st.empty()
++
+             control_cols = st.columns(4)
+ 
+             #
+@@ -4635,7 +4635,5 @@
+                                     "<br>Simulator status: OPEN"
+                                     "<br>Action: %{customdata[1]}"
+                                     "<br>Reason: %{customdata[2]}"
+-                                    "<br>%{x}"
+-                                    "<br>%{y:.2f}"
+                                     "<extra></extra>"
+                                 ),
+@@ -4665,7 +4665,5 @@
+                                     "<br>Simulator status: OPEN"
+                                     "<br>Action: %{customdata[1]}"
+                                     "<br>Reason: %{customdata[2]}"
+-                                    "<br>%{x}"
+-                                    "<br>%{y:.2f}"
+                                     "<extra></extra>"
+                                 ),
+@@ -4806,25 +4806,26 @@
+-                    info_cols = st.columns(4)
++                    with historical_info_placeholder.container():
++                        info_cols = st.columns(4)
+ 
+-                    info_cols[0].metric(
+-                        "Newest data",
+-                        newest_historical_text,
+-                    )
++                        info_cols[0].metric(
++                            "Newest data",
++                            newest_historical_text,
++                        )
+ 
+-                    info_cols[1].metric(
+-                        "From",
+-                        first_time.strftime(
+-                            "%d.%m %H:%M"
+-                        ),
+-                    )
++                        info_cols[1].metric(
++                            "From",
++                            first_time.strftime(
++                                "%d.%m %H:%M"
++                            ),
++                        )
+ 
+-                    info_cols[2].metric(
+-                        "To",
+-                        last_time.strftime(
+-                            "%d.%m %H:%M"
+-                        ),
+-                    )
++                        info_cols[2].metric(
++                            "To",
++                            last_time.strftime(
++                                "%d.%m %H:%M"
++                            ),
++                        )
+ 
+-                    info_cols[3].metric(
+-                        "Points",
+-                        len(chart_df),
+-                    )
++                        info_cols[3].metric(
++                            "Points",
++                            len(chart_df),
++                        )

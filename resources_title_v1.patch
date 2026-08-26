@@ -1,0 +1,6 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,2 +1,2 @@
+ elif page == "Resources":
+-    st.header("Resources")
++    st.header("Trading Efficiency")

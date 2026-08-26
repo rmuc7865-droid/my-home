@@ -1,0 +1,33 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,5 +1,9 @@
+                 relevant["LastPrice"] = last_price_numeric.map(
+                     lambda value: f"€{value:.2f}" if pd.notna(value) else "—"
++                )
++
++                relevant["_Close2hRaw"] = pd.to_numeric(
++                    relevant["CloseB"], errors="coerce"
+                 )
+ 
+                 relevant["OpenB"] = pd.to_numeric(
+@@ -10,9 +10,18 @@
+                     },
+                 )
+ 
++        st.subheader("Steps to analyse tickers")
++        st.markdown(
++            "1. Is **Close2h** very high or very low, is **DropDur2%** short, "
++            "or is **ChangeDur2%** long?\n"
++            "2. Is now the trading time?\n"
++            "3. Is **LastSelling** short?\n"
++            "4. If all are yes, review this ticker on the **Zero-Trading** page."
++        )
++
+         st.caption(
+             "Last Data shows one row for every ticker, regardless of its current BUY/SELL "
+             "decision. Rows are ordered by "
+-            "CloseB from highest to lowest. LastCollect is the timestamp of the latest market "
++            "Close2h from highest to lowest. LastCollect is the timestamp of the latest market "
+             "bar; when it is from an earlier date, LastCollect also shows DD.MM. LastPrice is "
+-            "its estimated EUR price. Records counts unique market bars from 03:00 Europe/Berlin, "
++            "its estimated EUR price. DayRecs counts unique market bars from 03:00 Europe/Berlin, "

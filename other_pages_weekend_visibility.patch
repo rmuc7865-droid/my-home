@@ -1,0 +1,23 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -4964,15 +4964,6 @@
+-            source_health_cutoff = newest_received - pd.Timedelta(minutes=30)
+-            healthy_sources = {
+-                str(source).strip().lower()
+-                for source, received_at in source_latest_received.items()
+-                if pd.notna(received_at) and received_at >= source_health_cutoff
++            # Keep configured/known tickers visible even when their source is
++            # quiet because the market is closed.
++            configured_now = {
++                str(ticker)
++                for ticker in latest_received.index
+             }
+-
+-            configured_now = set()
+-            for ticker in latest_received.index:
+-                ticker_key = str(ticker).strip().upper()
+-                configured_sources = CONFIGURED_TICKER_SOURCES.get(
+-                    ticker_key, set()
+-                )
+-                if configured_sources & healthy_sources:
+-                    configured_now.add(str(ticker))

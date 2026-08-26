@@ -1,0 +1,4315 @@
+from __future__ import annotations
+
+import io
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import json
+import math
+import httpx
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+import altair as alt
+import yaml
+
+from shared.trading_decisions import (
+    evaluate_sell_history,
+    format_duration,
+    trading_window_info,
+)
+
+API_URL = os.getenv("MONITOR_API_URL", "http://api:8000")
+API_KEY = os.getenv("MONITOR_API_KEY", "CHANGE_ME")
+HEADERS = {"X-API-Key": API_KEY}
+LOCAL_TIMEZONE = "Europe/Berlin"
+
+st.set_page_config(page_title="Home Monitor", page_icon="🏠", layout="wide")
+
+@st.cache_data(ttl=300)
+def load_alerts_cached():
+    return api_get(
+        "/api/v1/alerts",
+        {
+            "limit": 500,
+        },
+    )
+
+@st.cache_data(ttl=30)
+def load_simulation_payload_cached():
+    return api_get(
+        "/api/v1/simulation",
+        {
+            "days": 0,
+            "include_open": True,
+        },
+    )
+
+
+@st.cache_data(ttl=30)
+def load_simulation_cached():
+    payload = load_simulation_payload_cached()
+
+    if isinstance(payload, dict):
+        return (
+            payload.get("trades")
+            or payload.get("rows")
+            or payload.get("items")
+            or []
+        )
+
+    return payload or []
+
+def api_get(path: str, params: dict | None = None):
+    response = httpx.get(f"{API_URL}{path}", headers=HEADERS, params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+@st.cache_data(ttl=300)
+def load_measurement_df_cached():
+    measurements = api_get(
+        "/api/v1/measurements",
+        {
+            "limit": 50000,
+        },
+    )
+
+    measurement_rows = []
+
+    for record in measurements:
+        metadata = (
+            record.get("metadata")
+            or {}
+        )
+
+        ticker = metadata.get(
+            "ticker"
+        )
+
+        if not ticker:
+            ticker = record["system"]
+
+        asset_type = metadata.get(
+            "asset_type"
+        )
+
+        if not asset_type:
+            if record["system"] == "crypto":
+                asset_type = "crypto"
+            elif record["system"] == "polygon":
+                asset_type = "stock"
+            else:
+                asset_type = "other"
+
+        base = {
+            "id": record["id"],
+            "system": record["system"],
+            "device": record["device"],
+            "ticker": ticker,
+            "asset_type": asset_type,
+            "timestamp": pd.to_datetime(
+                record["timestamp"],
+                utc=True,
+            ),
+            "received_at": pd.to_datetime(
+                record.get("received_at"),
+                utc=True,
+            ),
+            "eur_usd": metadata.get(
+                "eur_usd"
+            ),
+        }
+
+        measurement_rows.append(
+            {
+                **base,
+                **record["measurements"],
+            }
+        )
+
+    return pd.DataFrame(
+        measurement_rows
+    )
+
+def api_post(path: str):
+    response = httpx.post(f"{API_URL}{path}", headers=HEADERS, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+try:
+    df = load_measurement_df_cached()
+    alerts = load_alerts_cached()
+
+except Exception as exc:
+    st.error(
+        f"Cannot reach monitoring API: {exc}"
+    )
+    st.stop()
+
+alerts_df = pd.DataFrame(alerts)
+
+def load_ticker_names() -> dict[str, str]:
+    path = Path("/app/config/zero.json")
+
+    if not path.exists():
+        return {}
+
+    try:
+        payload = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return {}
+
+    names = {}
+
+    if isinstance(payload, list):
+        rows = payload
+
+    elif isinstance(payload, dict):
+        rows = (
+            payload.get("tickers")
+            or payload.get("instruments")
+            or payload.get("rows")
+            or []
+        )
+
+    else:
+        rows = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        ticker = str(
+            row.get("ticker")
+            or row.get("Ticker")
+            or ""
+        ).strip().upper()
+
+        name = str(
+            row.get("name")
+            or row.get("Name")
+            or ticker
+        ).strip()
+
+        if ticker:
+            names[ticker] = name or ticker
+
+    return names
+
+TICKER_NAMES = load_ticker_names()
+
+
+def _to_utc_timestamp(value):
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    return parsed if pd.notna(parsed) else pd.NaT
+
+
+def get_simulation_timestamp(payload, market_df: pd.DataFrame):
+    """Return API simulation timestamp when supplied, otherwise latest collector receipt."""
+    if isinstance(payload, dict):
+        for key in (
+            "simulationTimestamp",
+            "simulation_timestamp",
+            "simulation_time",
+            "as_of",
+            "generated_at",
+        ):
+            if payload.get(key) is not None:
+                parsed = _to_utc_timestamp(payload.get(key))
+                if pd.notna(parsed):
+                    return parsed, key
+
+    if not market_df.empty and "received_at" in market_df.columns:
+        fallback = pd.to_datetime(
+            market_df["received_at"], utc=True, errors="coerce"
+        ).max()
+        if pd.notna(fallback):
+            return fallback, "latest received_at fallback"
+
+    return pd.Timestamp.now(tz="UTC"), "current time fallback"
+
+
+def discover_imported_asset_csvs():
+    """Find likely imported asset CSV files and return asset metadata plus used paths."""
+    candidates = []
+
+    for env_name in (
+        "ASSETS_CSV",
+        "ASSET_CSV",
+        "ZERO_ASSETS_CSV",
+        "ZERO_CSV",
+        "TICKERS_CSV",
+    ):
+        raw = os.getenv(env_name)
+        if raw:
+            candidates.append(Path(raw))
+
+    search_dirs = [
+        Path("/app/config"),
+        PROJECT_ROOT / "config",
+        PROJECT_ROOT,
+        Path(__file__).resolve().parent,
+    ]
+    for directory in search_dirs:
+        if directory.exists():
+            candidates.extend(sorted(directory.glob("*.csv")))
+
+    # Keep order while removing duplicate paths.
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve())
+        except Exception:
+            key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append(candidate)
+
+    asset_frames = []
+    used_paths = []
+    ticker_columns = (
+        "Ticker", "ticker", "TICKER",
+        "Symbol", "symbol", "SYMBOL",
+    )
+    name_columns = (
+        "Name", "name", "NAME",
+        "TickerName", "tickerName", "ticker_name",
+    )
+    isin_columns = (
+        "ISIN", "Isin", "isin",
+    )
+
+    for path in unique_candidates:
+        if not path.is_file():
+            continue
+        try:
+            imported = pd.read_csv(path)
+        except Exception:
+            continue
+
+        ticker_column = next(
+            (column for column in ticker_columns if column in imported.columns),
+            None,
+        )
+        if ticker_column is None:
+            continue
+
+        name_column = next(
+            (column for column in name_columns if column in imported.columns),
+            None,
+        )
+        isin_column = next(
+            (column for column in isin_columns if column in imported.columns),
+            None,
+        )
+
+        assets = pd.DataFrame({
+            "Ticker": imported[ticker_column].astype("string").str.strip().str.upper(),
+            "Name": (
+                imported[name_column].astype("string").str.strip()
+                if name_column else pd.Series(pd.NA, index=imported.index, dtype="string")
+            ),
+            "ISIN": (
+                imported[isin_column].astype("string").str.strip()
+                if isin_column else pd.Series(pd.NA, index=imported.index, dtype="string")
+            ),
+        })
+        assets = assets[assets["Ticker"].notna() & assets["Ticker"].ne("")]
+        if assets.empty:
+            continue
+
+        asset_frames.append(assets)
+        used_paths.append(str(path))
+
+    if not asset_frames:
+        return pd.DataFrame(columns=["Ticker", "Name", "ISIN"]), used_paths
+
+    all_assets = pd.concat(asset_frames, ignore_index=True)
+    all_assets = all_assets.drop_duplicates(subset=["Ticker"], keep="first")
+    return all_assets.sort_values("Ticker").reset_index(drop=True), used_paths
+
+
+def tracked_tickers_at(market_df: pd.DataFrame, snapshot_time):
+    """Match Live Overview's 30-minute tracked-asset definition at a historical time."""
+    if market_df.empty or pd.isna(snapshot_time):
+        return set()
+
+    work = market_df.copy()
+    work["received_at"] = pd.to_datetime(
+        work["received_at"], utc=True, errors="coerce"
+    )
+    snapshot = _to_utc_timestamp(snapshot_time)
+    work = work[
+        work["received_at"].notna()
+        & (work["received_at"] <= snapshot)
+        & (work["received_at"] >= snapshot - pd.Timedelta(minutes=30))
+    ]
+    return set(
+        work["ticker"].dropna().astype(str).str.strip().str.upper()
+    )
+
+
+def simulation_state_at(simulation_df: pd.DataFrame, snapshot_time):
+    """Count ticker state using each ticker's latest BUY record at the snapshot."""
+    if simulation_df.empty or pd.isna(snapshot_time):
+        return 0, 0
+
+    snapshot = _to_utc_timestamp(snapshot_time)
+    work = simulation_df.copy()
+    work["BuyTime"] = pd.to_datetime(work.get("BuyTime"), utc=True, errors="coerce")
+    work["SellTime"] = pd.to_datetime(work.get("SellTime"), utc=True, errors="coerce")
+    work["Ticker"] = work.get("Ticker", pd.Series(index=work.index, dtype="object")).astype(str).str.upper()
+    work = work[work["BuyTime"].notna() & (work["BuyTime"] <= snapshot)]
+    if work.empty:
+        return 0, 0
+
+    latest = (
+        work.sort_values(["Ticker", "BuyTime"])
+        .groupby("Ticker", as_index=False)
+        .tail(1)
+    )
+    is_open = latest["SellTime"].isna() | (latest["SellTime"] > snapshot)
+    return int(is_open.sum()), int((~is_open).sum())
+
+
+def closeb_over_two_at(market_df: pd.DataFrame, snapshot_time):
+    """Rebuild the Live Overview as known at a collection snapshot and count CloseB > 2%."""
+    if market_df.empty or pd.isna(snapshot_time):
+        return 0
+
+    snapshot = _to_utc_timestamp(snapshot_time)
+    known = market_df.copy()
+    known["received_at"] = pd.to_datetime(
+        known["received_at"], utc=True, errors="coerce"
+    )
+    known = known[known["received_at"].notna() & (known["received_at"] <= snapshot)]
+    if known.empty:
+        return 0
+
+    active = tracked_tickers_at(known, snapshot)
+    if not active:
+        return 0
+    known = known[
+        known["ticker"].astype(str).str.upper().isin(active)
+    ]
+    overview = build_live_overview(known)
+    if overview.empty or "CloseB" not in overview.columns:
+        return 0
+    values = pd.to_numeric(overview["CloseB"], errors="coerce")
+    return int((values > 2.0).sum())
+
+
+def previous_simulator_day_bounds(now_local=None):
+    """Previous simulator day is 03:00 local time to 03:00 local time."""
+    if now_local is None:
+        now_local = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+    else:
+        now_local = pd.Timestamp(now_local).tz_convert(LOCAL_TIMEZONE)
+
+    today_three = now_local.normalize() + pd.Timedelta(hours=3)
+    end_local = today_three if now_local >= today_three else today_three - pd.Timedelta(days=1)
+    start_local = end_local - pd.Timedelta(days=1)
+    return start_local.tz_convert("UTC"), end_local.tz_convert("UTC")
+
+
+def fmt_local_datetime(value, fmt="%Y-%m-%d %H:%M:%S %Z"):
+    parsed = _to_utc_timestamp(value)
+    if pd.isna(parsed):
+        return "—"
+    return parsed.tz_convert(LOCAL_TIMEZONE).strftime(fmt)
+
+
+def add_market_data_count(
+    result: pd.DataFrame,
+    measurements_df: pd.DataFrame,
+    *,
+    day_start_hour: int = 0,
+    output_column: str = "MarketData",
+) -> pd.DataFrame:
+    if result.empty or measurements_df.empty:
+        result[output_column] = 0
+        return result
+
+    work = measurements_df[
+        measurements_df["asset_type"].isin(
+            ["stock", "crypto"]
+        )
+    ].copy()
+
+    work["timestamp"] = pd.to_datetime(
+        work["timestamp"],
+        utc=True,
+    )
+
+    local_timestamp = work["timestamp"].dt.tz_convert(
+        LOCAL_TIMEZONE
+    )
+    now_local = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+    day_start_local = now_local.normalize() + pd.Timedelta(hours=day_start_hour)
+    if now_local < day_start_local:
+        day_start_local -= pd.Timedelta(days=1)
+
+    if day_start_hour == 0:
+        work = work[
+            local_timestamp.dt.date == now_local.date()
+        ].copy()
+    else:
+        work = work[
+            (local_timestamp >= day_start_local)
+            & (local_timestamp <= now_local)
+        ].copy()
+
+    counts = (
+        work.groupby("ticker")["timestamp"]
+        .nunique()
+    )
+
+    result[output_column] = (
+        result["Ticker"]
+        .map(counts)
+        .fillna(0)
+        .astype(int)
+    )
+
+    return result
+
+
+def trading_config_path() -> Path:
+    primary = Path("/app/server/telegram_notifications.yaml")
+    if primary.exists():
+        return primary
+    return Path(__file__).resolve().parents[1] / "server" / "telegram_notifications.yaml"
+
+
+def load_trading_config() -> dict:
+    path = trading_config_path()
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def save_trading_config(config: dict) -> tuple[Path, Path]:
+    """Atomically persist dashboard-editable settings and keep a timestamped backup."""
+    path = trading_config_path()
+    if not path.exists():
+        raise FileNotFoundError(f"Settings file does not exist: {path}")
+    if not os.access(path, os.W_OK):
+        raise PermissionError(f"Settings file is not writable by the dashboard: {path}")
+
+    stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%SZ")
+    backup = path.with_name(f"{path.name}.bak-{stamp}")
+    backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    path.write_text(
+        yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    return path, backup
+
+
+def _valid_hhmm(value: str) -> bool:
+    try:
+        datetime.strptime(str(value), "%H:%M")
+        return True
+    except Exception:
+        return False
+
+
+def _valid_timezone(value: str) -> bool:
+    try:
+        ZoneInfo(str(value))
+        return True
+    except Exception:
+        return False
+
+
+def watchlist_target_path() -> Path:
+    """Return the collector/watchlist file configured by environment, or a safe default."""
+    for name in ("ASSETS_CSV", "ASSET_CSV", "ZERO_ASSETS_CSV", "ZERO_CSV", "TICKERS_CSV"):
+        raw = os.getenv(name)
+        if raw:
+            return Path(raw)
+    return Path("/app/config/watchlist.csv")
+
+
+def validate_watchlist_csv(uploaded_file) -> tuple[pd.DataFrame, bytes]:
+    raw = uploaded_file.getvalue()
+    frame = pd.read_csv(io.BytesIO(raw))
+    ticker_column = next(
+        (c for c in ("Ticker", "ticker", "TICKER", "Symbol", "symbol", "SYMBOL") if c in frame.columns),
+        None,
+    )
+    if ticker_column is None:
+        raise ValueError("CSV must contain a Ticker or Symbol column.")
+    tickers = frame[ticker_column].astype("string").str.strip()
+    if tickers.isna().any() or tickers.eq("").any():
+        raise ValueError("Ticker/ Symbol values must not be empty.")
+    normalized = tickers.str.upper()
+    if normalized.duplicated().any():
+        duplicates = sorted(normalized[normalized.duplicated(keep=False)].unique().tolist())
+        raise ValueError("Duplicate tickers are not allowed: " + ", ".join(duplicates[:20]))
+    if len(frame) > 5000:
+        raise ValueError("Watchlist contains more than 5,000 rows; please upload a smaller list.")
+    return frame, raw
+
+
+def save_watchlist_bytes(raw: bytes) -> tuple[Path, Path | None]:
+    target = watchlist_target_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() and not os.access(target, os.W_OK):
+        raise PermissionError(f"Watchlist is not writable by the dashboard: {target}")
+    if not target.exists() and not os.access(target.parent, os.W_OK):
+        raise PermissionError(f"Watchlist directory is not writable by the dashboard: {target.parent}")
+
+    backup = None
+    if target.exists():
+        stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%SZ")
+        backup = target.with_name(f"{target.name}.bak-{stamp}")
+        backup.write_bytes(target.read_bytes())
+
+    tmp = target.with_name(f".{target.name}.tmp")
+    tmp.write_bytes(raw)
+    os.replace(tmp, target)
+    return target, backup
+
+
+def load_market_regions() -> dict[str, str]:
+    path = Path("/app/config/instruments.json")
+    if not path.exists():
+        path = Path(__file__).resolve().parents[1] / "config" / "instruments.json"
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    result = {}
+    for row in rows if isinstance(rows, list) else []:
+        ticker = str(row.get("Ticker") or row.get("ticker") or "").strip().upper()
+        region = str(row.get("MarketRegion") or "").strip().upper()
+        isin = str(row.get("ISIN") or "").strip().upper()
+        if not region:
+            if isin.startswith("US"):
+                region = "US"
+            elif isin.startswith("DE"):
+                region = "DE"
+        if ticker and region:
+            result[ticker] = region
+    return result
+
+
+def load_configured_collector_tickers() -> set[str]:
+    # Last Data needs the configured market-data universe inside the dashboard
+    # container. The dashboard does not necessarily have raspberry/config.yaml
+    # mounted, but the generated ticker files under /app/config are available.
+    project_root = Path(__file__).resolve().parents[1]
+
+    ticker_file_names = [
+        "tickers.json",
+        "crypto_tickers.json",
+        "international_tickers.json",
+    ]
+
+    result = set()
+
+    for file_name in ticker_file_names:
+        candidate = Path("/app/config") / file_name
+        if not candidate.exists():
+            candidate = project_root / "config" / file_name
+        if not candidate.exists():
+            continue
+
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        if isinstance(payload, dict):
+            rows = payload.get("tickers") or payload.get("symbols") or []
+        elif isinstance(payload, list):
+            rows = payload
+        else:
+            rows = []
+
+        for row in rows:
+            if isinstance(row, str):
+                ticker = row
+            elif isinstance(row, dict):
+                ticker = (
+                    row.get("ticker")
+                    or row.get("Ticker")
+                    or row.get("symbol")
+                    or row.get("Symbol")
+                    or ""
+                )
+            else:
+                ticker = ""
+
+            ticker = str(ticker).strip().upper()
+            if ticker:
+                result.add(ticker)
+
+    return result
+
+
+TRADING_CONFIG = load_trading_config()
+TRADING_WINDOWS = TRADING_CONFIG.get("trading_windows") or {}
+MARKET_REGIONS = load_market_regions()
+CONFIGURED_COLLECTOR_TICKERS = load_configured_collector_tickers()
+BUY_CONFIG = TRADING_CONFIG.get("buy") or {}
+BUY_MIN_CLOSEB_COUNT = int(BUY_CONFIG.get("minimum_closeb_count", BUY_CONFIG.get("minimum_closeb_ge2_count", 6)))
+BUY_MIN_CLOSEB_PERCENT = float(BUY_CONFIG.get("minimum_closeb_percent", 2.0))
+SELL_CONFIG = TRADING_CONFIG.get("sell") or {}
+
+# Display-only market phases used by Last Data. They intentionally do not
+# change C1/C3 or the configured BUY/SELL windows. Times are in each market's
+# local timezone. Optional trading_phases entries in telegram_notifications.yaml
+# can override these defaults without changing the dashboard code.
+DEFAULT_TRADING_PHASES = {
+    "US": {
+        "timezone": "America/New_York",
+        "pre_start": "04:00",
+        "opening_start": "09:30",
+        "opening_end": "16:00",
+        "post_end": "20:00",
+    },
+    "DE": {
+        "timezone": "Europe/Berlin",
+        "pre_start": "08:00",
+        "opening_start": "09:00",
+        "opening_end": "17:30",
+        "post_end": "22:00",
+    },
+    "CRYPTO": {
+        "timezone": "UTC",
+        "pre_start": "00:00",
+        "opening_start": "00:00",
+        "opening_end": "23:59",
+        "post_end": "23:59",
+    },
+}
+TRADING_PHASES = TRADING_CONFIG.get("trading_phases") or {}
+
+
+def dashboard_status_summary(measurements_df: pd.DataFrame, alerts_table: pd.DataFrame) -> dict:
+    """Return global Healthy and Market indicator states used beside the title."""
+    result = {
+        "healthy": False,
+        "market": False,
+        "collectors_ok": False,
+        "settings_ok": False,
+        "alerts_ok": False,
+        "collector_bad": [],
+        "market_bad": [],
+        "open_alerts": 0,
+    }
+
+    # The simulator in this dashboard uses these loaded configuration sections.
+    result["settings_ok"] = bool(TRADING_WINDOWS and BUY_CONFIG and SELL_CONFIG)
+
+    if alerts_table.empty:
+        open_alerts = 0
+    elif "acknowledged" in alerts_table.columns:
+        acknowledged = alerts_table["acknowledged"].fillna(False).astype(bool)
+        open_alerts = int((~acknowledged).sum())
+    else:
+        open_alerts = int(len(alerts_table))
+
+    result["open_alerts"] = open_alerts
+    result["alerts_ok"] = open_alerts == 0
+
+    if measurements_df.empty or "system" not in measurements_df.columns:
+        return result
+
+    work = measurements_df.copy()
+    work["timestamp"] = pd.to_datetime(work.get("timestamp"), utc=True, errors="coerce")
+    work["received_at"] = pd.to_datetime(work.get("received_at"), utc=True, errors="coerce")
+
+    now = pd.Timestamp.now(tz="UTC")
+    latest = (
+        work.groupby("system")
+        .agg(
+            last_market_time=("timestamp", "max"),
+            last_received_time=("received_at", "max"),
+        )
+        .reset_index()
+    )
+
+    active_cutoff = now - pd.Timedelta(hours=24)
+    latest = latest[latest["last_received_time"] >= active_cutoff].copy()
+    if latest.empty:
+        return result
+
+    latest["collector_age_minutes"] = (
+        (now - latest["last_received_time"]).dt.total_seconds() / 60
+    )
+    latest["market_age_minutes"] = (
+        (now - latest["last_market_time"]).dt.total_seconds() / 60
+    )
+
+    latest["CollectorStatus"] = latest["collector_age_minutes"].apply(
+        lambda age: "OK" if pd.notna(age) and age <= 30 else (
+            "STALE" if pd.notna(age) and age <= 120 else "OFFLINE"
+        )
+    )
+    latest["MarketStatus"] = latest["market_age_minutes"].apply(
+        lambda age: "OK" if pd.notna(age) and age <= 30 else (
+            "STALE" if pd.notna(age) and age <= 120 else "OFFLINE"
+        )
+    )
+
+    result["collector_bad"] = latest.loc[
+        latest["CollectorStatus"] != "OK", "system"
+    ].astype(str).tolist()
+    result["market_bad"] = latest.loc[
+        latest["MarketStatus"] != "OK", "system"
+    ].astype(str).tolist()
+    result["collectors_ok"] = not result["collector_bad"]
+    result["market"] = not result["market_bad"]
+    result["healthy"] = (
+        result["collectors_ok"]
+        and result["settings_ok"]
+        and result["alerts_ok"]
+    )
+    return result
+
+
+def render_dashboard_title(measurements_df: pd.DataFrame, alerts_table: pd.DataFrame) -> None:
+    status = dashboard_status_summary(measurements_df, alerts_table)
+    healthy_color = "#21c55d" if status["healthy"] else "#ef4444"
+    market_color = "#21c55d" if status["market"] else "#ef4444"
+
+    healthy_parts = []
+    if not status["collectors_ok"]:
+        healthy_parts.append(
+            "Collectors not OK: " + (", ".join(status["collector_bad"]) or "none reporting")
+        )
+    if not status["settings_ok"]:
+        healthy_parts.append("Simulator settings/configuration are incomplete")
+    if not status["alerts_ok"]:
+        healthy_parts.append(f"Open alerts: {status['open_alerts']}")
+    healthy_tip = "Healthy" if not healthy_parts else "; ".join(healthy_parts)
+
+    market_tip = (
+        "All active systems have MarketStatus OK"
+        if status["market"]
+        else "MarketStatus not OK: " + (", ".join(status["market_bad"]) or "no active systems")
+    )
+
+    html = f"""
+        <div style="display:flex;align-items:center;gap:22px;flex-wrap:wrap;margin-bottom:0.5rem;">
+          <h1 style="margin:0;">🏠 Home Monitor</h1>
+          <div title="{healthy_tip}" style="display:flex;align-items:center;gap:7px;font-size:1.05rem;font-weight:600;">
+            <span style="width:14px;height:14px;border-radius:50%;background:{healthy_color};display:inline-block;box-shadow:0 0 0 2px rgba(128,128,128,0.18);"></span>
+            <span>Healthy</span>
+          </div>
+          <div title="{market_tip}" style="display:flex;align-items:center;gap:7px;font-size:1.05rem;font-weight:600;">
+            <span style="width:14px;height:14px;border-radius:50%;background:{market_color};display:inline-block;box-shadow:0 0 0 2px rgba(128,128,128,0.18);"></span>
+            <span>Market</span>
+          </div>
+        </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def market_region_for_ticker(ticker: str, asset_type: str) -> str | None:
+    asset_type_normalized = str(asset_type).strip().lower()
+    if asset_type_normalized == "crypto":
+        return "CRYPTO"
+
+    configured_region = MARKET_REGIONS.get(str(ticker).upper())
+    if configured_region:
+        return configured_region
+
+    # Current stock collector is Polygon/Massive US equities. Some tickers
+    # are not present in the instrument-region mapping; treating them as
+    # Closed gives a false phase. Explicit mappings still win.
+    if asset_type_normalized == "stock":
+        return "US"
+
+    return None
+
+
+def _hhmm_to_minutes(value: str) -> int:
+    hour_text, minute_text = str(value).strip().split(":", 1)
+    return int(hour_text) * 60 + int(minute_text)
+
+
+def _format_hhmm_duration(delta: pd.Timedelta | None) -> str:
+    if delta is None or pd.isna(delta) or delta < pd.Timedelta(0):
+        return "-"
+    total_minutes = int(delta.total_seconds() // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def _allowed_market_date(local_date, market_config: dict | None) -> bool:
+    if not market_config or not bool(market_config.get("enabled", True)):
+        return False
+    weekdays = market_config.get("open_weekdays")
+    if weekdays:
+        allowed = {str(value).strip().lower()[:3] for value in weekdays}
+        if local_date.strftime("%a").lower()[:3] not in allowed:
+            return False
+    closed = {str(value) for value in (market_config.get("closed_dates") or [])}
+    return local_date.isoformat() not in closed
+
+
+def market_phase_info(timestamp, market_region: str | None) -> tuple[str, str, str]:
+    """Return Phase, WaitToTrade, WaitToOpening for one LastCollect time."""
+    if not market_region:
+        return "Closed", "-", "-"
+
+    market_config = TRADING_WINDOWS.get(market_region) or {}
+    phase_config = dict(DEFAULT_TRADING_PHASES.get(market_region) or {})
+    phase_config.update(TRADING_PHASES.get(market_region) or {})
+    if not phase_config:
+        return "Closed", "-", "-"
+
+    tz_name = str(phase_config.get("timezone") or market_config.get("timezone") or "UTC")
+    ts_utc = pd.Timestamp(timestamp)
+    if ts_utc.tzinfo is None:
+        ts_utc = ts_utc.tz_localize("UTC")
+    else:
+        ts_utc = ts_utc.tz_convert("UTC")
+    local_ts = ts_utc.tz_convert(tz_name)
+
+    pre_start = _hhmm_to_minutes(phase_config.get("pre_start", "00:00"))
+    opening_start = _hhmm_to_minutes(phase_config.get("opening_start", "00:00"))
+    opening_end = _hhmm_to_minutes(phase_config.get("opening_end", "23:59"))
+    post_end = _hhmm_to_minutes(phase_config.get("post_end", "23:59"))
+    minute_of_day = local_ts.hour * 60 + local_ts.minute
+    allowed_today = _allowed_market_date(local_ts.date(), market_config)
+
+    phase = "Closed"
+    if allowed_today:
+        if pre_start <= minute_of_day < opening_start:
+            phase = "Pre-Trading"
+        elif opening_start <= minute_of_day < opening_end:
+            phase = "Opening"
+        elif opening_end <= minute_of_day < post_end:
+            phase = "Post-Trading"
+
+    def next_start(target_minutes: int, zero_phases: set[str]) -> str:
+        if phase in zero_phases:
+            return "00:00"
+        base_date = local_ts.date()
+        for day_offset in range(0, 15):
+            candidate_date = base_date + pd.Timedelta(days=day_offset)
+            # pd.Timedelta added to date can return date-like Timestamp; normalize.
+            if hasattr(candidate_date, "date"):
+                candidate_date = candidate_date.date()
+            if not _allowed_market_date(candidate_date, market_config):
+                continue
+            candidate = pd.Timestamp(candidate_date, tz=tz_name) + pd.Timedelta(minutes=target_minutes)
+            if candidate > local_ts:
+                return _format_hhmm_duration(candidate - local_ts)
+        return "-"
+
+    wait_to_trade = next_start(
+        pre_start, {"Pre-Trading", "Opening", "Post-Trading"}
+    )
+    wait_to_opening = next_start(opening_start, {"Opening"})
+    return phase, wait_to_trade, wait_to_opening
+
+
+def movement_durations(
+    ticker_df: pd.DataFrame,
+    latest_time,
+    current_price,
+    movement_percent: float,
+) -> tuple[str, str]:
+    """Durations measured backwards from LastCollect using the current price band."""
+    if pd.isna(current_price) or float(current_price) <= 0:
+        return "-", "-"
+
+    history = ticker_df[ticker_df["timestamp"] <= latest_time].copy()
+    history["_close_num"] = pd.to_numeric(history["close"], errors="coerce")
+    history = history.dropna(subset=["_close_num", "timestamp"]).sort_values("timestamp")
+    if history.empty:
+        return "-", "-"
+
+    current = float(current_price)
+    fraction = float(movement_percent) / 100.0
+    upper = current * (1.0 + fraction)
+    lower = current * (1.0 - fraction)
+    last_ts = pd.Timestamp(latest_time)
+
+    # DropDuration = time since the most recent sample that was still more than
+    # movement_percent above LastPrice. From the following sample through
+    # LastCollect, price has not been higher than that threshold.
+    above = history[history["_close_num"] > upper]
+    drop_duration = "-"
+    if not above.empty:
+        drop_duration = _format_hhmm_duration(last_ts - above.iloc[-1]["timestamp"])
+
+    # StaticDuration = time since the most recent sample outside the symmetric
+    # +/- movement_percent band around LastPrice. From the following sample
+    # through LastCollect, price has remained inside the band.
+    outside = history[(history["_close_num"] < lower) | (history["_close_num"] > upper)]
+    static_duration = "-"
+    if not outside.empty:
+        static_duration = _format_hhmm_duration(last_ts - outside.iloc[-1]["timestamp"])
+
+    return drop_duration, static_duration
+
+
+def format_local_timestamp(value) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return (
+        pd.to_datetime(value, utc=True)
+        .tz_convert(LOCAL_TIMEZONE)
+        .strftime("%Y-%m-%d %H:%M")
+    )
+
+
+def build_trade_analysis(
+    measurements_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    reference_time,
+    period,
+) -> pd.DataFrame:
+    if measurements_df.empty:
+        return pd.DataFrame()
+
+    reference_time = pd.to_datetime(
+        reference_time,
+        utc=True,
+    )
+
+    start_time = (
+        reference_time
+        - period
+    )
+
+    tolerance = pd.Timedelta(
+        30,
+        unit="min",
+    )
+
+    history_start = (
+        start_time
+        - pd.Timedelta(
+            2,
+            unit="h",
+        )
+        - tolerance
+    )
+
+    #
+    # Market data required for the visible period
+    # plus the 2-hour CloseB baseline.
+    #
+    market = measurements_df[
+        measurements_df[
+            "asset_type"
+        ].isin(
+            ["stock", "crypto"]
+        )
+    ][
+        [
+            "ticker",
+            "timestamp",
+            "close",
+            "id",
+        ]
+    ].copy()
+
+    market["timestamp"] = pd.to_datetime(
+        market["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+
+    market["close"] = pd.to_numeric(
+        market["close"],
+        errors="coerce",
+    )
+
+    market = market[
+        (market["timestamp"] >= history_start)
+        & (
+            market["timestamp"]
+            <= reference_time
+        )
+    ].dropna(
+        subset=[
+            "ticker",
+            "timestamp",
+            "close",
+        ]
+    )
+
+    if market.empty:
+        return pd.DataFrame()
+
+    market["ticker"] = (
+        market["ticker"]
+        .astype(str)
+        .str.upper()
+    )
+
+    market["timepoint"] = (
+        market["timestamp"]
+        .dt.round("15min")
+    )
+
+    #
+    # One current observation per ticker/timepoint.
+    #
+    current = (
+        market[
+            market["timepoint"]
+            >= start_time
+        ]
+        .sort_values(
+            [
+                "ticker",
+                "timepoint",
+                "timestamp",
+                "id",
+            ]
+        )
+        .drop_duplicates(
+            subset=[
+                "ticker",
+                "timepoint",
+            ],
+            keep="last",
+        )
+        .copy()
+    )
+
+    if current.empty:
+        return pd.DataFrame()
+
+    #
+    # All 15-minute points where real market
+    # measurements exist. OPEN curve will only
+    # have nodes at these times.
+    #
+    market_timepoints = (
+        current["timepoint"]
+        .drop_duplicates()
+        .sort_values()
+    )
+
+    #
+    # -----------------------------
+    # Curve 1: CloseB >= configured C2 percentage
+    # -----------------------------
+    #
+    # Find the measurement nearest to 2 hours
+    # before each current timepoint, within
+    # +/-30 minutes.
+    #
+    closeb_parts = []
+
+    for ticker, ticker_current in (
+        current.groupby(
+            "ticker",
+            sort=False,
+        )
+    ):
+        history = market[
+            market["ticker"] == ticker
+        ][
+            [
+                "timestamp",
+                "close",
+            ]
+        ].sort_values(
+            "timestamp"
+        )
+
+        if history.empty:
+            continue
+
+        work = ticker_current[
+            [
+                "ticker",
+                "timepoint",
+                "close",
+            ]
+        ].copy()
+
+        work = work.rename(
+            columns={
+                "close": "current_price",
+            }
+        )
+
+        work["baseline_target"] = (
+            work["timepoint"]
+            - pd.Timedelta(
+                2,
+                unit="h",
+            )
+        )
+
+        work = work.sort_values(
+            "baseline_target"
+        )
+
+        #
+        # Previous baseline candidate.
+        #
+        backward = pd.merge_asof(
+            work,
+            history.rename(
+                columns={
+                    "timestamp": (
+                        "baseline_timestamp"
+                    ),
+                    "close": (
+                        "baseline_price"
+                    ),
+                }
+            ).sort_values(
+                "baseline_timestamp"
+            ),
+            left_on="baseline_target",
+            right_on="baseline_timestamp",
+            direction="backward",
+            tolerance=tolerance,
+        )
+
+        backward = backward.rename(
+            columns={
+                "baseline_timestamp": (
+                    "backward_timestamp"
+                ),
+                "baseline_price": (
+                    "backward_price"
+                ),
+            }
+        )
+
+        #
+        # Following baseline candidate.
+        #
+        forward = pd.merge_asof(
+            work,
+            history.rename(
+                columns={
+                    "timestamp": (
+                        "baseline_timestamp"
+                    ),
+                    "close": (
+                        "baseline_price"
+                    ),
+                }
+            ).sort_values(
+                "baseline_timestamp"
+            ),
+            left_on="baseline_target",
+            right_on="baseline_timestamp",
+            direction="forward",
+            tolerance=tolerance,
+        )
+
+        forward = forward.rename(
+            columns={
+                "baseline_timestamp": (
+                    "forward_timestamp"
+                ),
+                "baseline_price": (
+                    "forward_price"
+                ),
+            }
+        )
+
+        matched = backward[
+            [
+                "ticker",
+                "timepoint",
+                "current_price",
+                "baseline_target",
+                "backward_timestamp",
+                "backward_price",
+            ]
+        ].copy()
+
+        matched[
+            "forward_timestamp"
+        ] = pd.to_datetime(
+            forward[
+                "forward_timestamp"
+            ].reset_index(
+                drop=True
+            ),
+            utc=True,
+            errors="coerce",
+        )
+
+        matched[
+            "forward_price"
+        ] = (
+            forward[
+                "forward_price"
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
+
+        #
+        # Ensure all datetime columns use the
+        # same UTC-aware dtype before subtraction.
+        #
+        matched["baseline_target"] = pd.to_datetime(
+            matched["baseline_target"],
+            utc=True,
+            errors="coerce",
+        )
+
+        matched["backward_timestamp"] = pd.to_datetime(
+            matched["backward_timestamp"],
+            utc=True,
+            errors="coerce",
+        )
+
+        matched["forward_timestamp"] = pd.to_datetime(
+            matched["forward_timestamp"],
+            utc=True,
+            errors="coerce",
+        )
+
+        backward_distance = (
+            matched["baseline_target"]
+            - matched["backward_timestamp"]
+        ).abs()
+
+        forward_distance = (
+            matched["forward_timestamp"]
+            - matched["baseline_target"]
+        ).abs()
+
+        #
+        # Prefer the earlier point if both
+        # candidates are equally distant,
+        # matching the previous implementation.
+        #
+        use_backward = (
+            matched[
+                "backward_timestamp"
+            ].notna()
+            & (
+                matched[
+                    "forward_timestamp"
+                ].isna()
+                | (
+                    backward_distance
+                    <= forward_distance
+                )
+            )
+        )
+
+        matched["baseline_price"] = (
+            matched["forward_price"]
+        )
+
+        matched.loc[
+            use_backward,
+            "baseline_price",
+        ] = matched.loc[
+            use_backward,
+            "backward_price",
+        ]
+
+        valid = (
+            matched[
+                "baseline_price"
+            ].notna()
+            & (
+                matched[
+                    "baseline_price"
+                ] > 0
+            )
+        )
+
+        matched = matched[
+            valid
+        ].copy()
+
+        if matched.empty:
+            continue
+
+        matched["CloseB"] = (
+            matched["current_price"]
+            / matched["baseline_price"]
+            - 1.0
+        ) * 100.0
+
+        closeb_parts.append(
+            matched[
+                [
+                    "ticker",
+                    "timepoint",
+                    "CloseB",
+                ]
+            ]
+        )
+
+    if closeb_parts:
+        closeb_df = pd.concat(
+            closeb_parts,
+            ignore_index=True,
+        )
+    else:
+        closeb_df = pd.DataFrame(
+            columns=[
+                "ticker",
+                "timepoint",
+                "CloseB",
+            ]
+        )
+
+    qualifying = closeb_df[
+        closeb_df["CloseB"] >= BUY_MIN_CLOSEB_PERCENT
+    ].copy()
+
+    closeb_summary = (
+        qualifying.groupby(
+            "timepoint"
+        )["ticker"]
+        .agg(
+            lambda values:
+            sorted(
+                set(values)
+            )
+        )
+    )
+
+    #
+    # CloseB curve gets a node at every
+    # 15-minute point in the selected period,
+    # including zero-count points.
+    #
+    all_timepoints = pd.date_range(
+        start=start_time,
+        end=reference_time,
+        freq="15min",
+        tz="UTC",
+    )
+
+    result_rows = []
+
+    for timepoint in all_timepoints:
+        tickers = (
+            closeb_summary.get(
+                timepoint,
+                [],
+            )
+        )
+
+        result_rows.append(
+            {
+                "Time": timepoint,
+                "Series": f"CloseB ≥ {BUY_MIN_CLOSEB_PERCENT:g}%",
+                "Count": len(tickers),
+                "Tickers": (
+                    ", ".join(tickers)
+                    if tickers
+                    else "—"
+                ),
+            }
+        )
+
+    #
+    # -----------------------------
+    # Curve 2: OPEN trades
+    # -----------------------------
+    #
+    # Only create OPEN points where real market
+    # data exists, preserving gaps.
+    #
+    trades = trades_df.copy()
+
+    if not trades.empty:
+        trades["BuyTime"] = pd.to_datetime(
+            trades["BuyTime"],
+            utc=True,
+            errors="coerce",
+        )
+
+        trades["SellTime"] = pd.to_datetime(
+            trades["SellTime"],
+            utc=True,
+            errors="coerce",
+        )
+
+        trades["Ticker"] = (
+            trades["Ticker"]
+            .astype(str)
+            .str.upper()
+        )
+
+    open_map = {
+        timepoint: set()
+        for timepoint in market_timepoints
+    }
+
+    #
+    # There are relatively few trades, so looping
+    # over trades is much cheaper than looping
+    # over every timepoint and every trade.
+    #
+    for _, trade in trades.iterrows():
+        buy_time = trade.get(
+            "BuyTime"
+        )
+
+        sell_time = trade.get(
+            "SellTime"
+        )
+
+        ticker = str(
+            trade.get("Ticker")
+            or ""
+        )
+
+        if (
+            not ticker
+            or pd.isna(buy_time)
+        ):
+            continue
+
+        active_points = market_timepoints[
+            market_timepoints
+            >= buy_time
+        ]
+
+        if pd.notna(sell_time):
+            active_points = active_points[
+                active_points
+                < sell_time
+            ]
+
+        for timepoint in active_points:
+            open_map[
+                timepoint
+            ].add(
+                ticker
+            )
+
+    for timepoint in market_timepoints:
+        tickers = sorted(
+            open_map.get(
+                timepoint,
+                set(),
+            )
+        )
+
+        result_rows.append(
+            {
+                "Time": timepoint,
+                "Series": "OPEN",
+                "Count": len(tickers),
+                "Tickers": (
+                    ", ".join(tickers)
+                    if tickers
+                    else "—"
+                ),
+            }
+        )
+
+    return pd.DataFrame(
+        result_rows
+    )
+
+@st.cache_data(ttl=300)
+def build_trade_analysis_cached(
+    _measurements_df: pd.DataFrame,
+    _trades_df: pd.DataFrame,
+    reference_time,
+) -> pd.DataFrame:
+    return build_trade_analysis(
+        measurements_df=_measurements_df,
+        trades_df=_trades_df,
+        reference_time=reference_time,
+        period=pd.Timedelta(days=7),
+    )
+
+def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
+    if data.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for ticker, ticker_df in data.groupby("ticker"):
+        ticker_df = (
+            ticker_df
+            .sort_values(["timestamp", "id"])
+            .drop_duplicates(
+                subset=["timestamp"],
+                keep="last",
+            )
+        )
+
+        latest = ticker_df.iloc[-1]
+        latest_time = latest["timestamp"]
+        baseline_time = latest_time - pd.Timedelta(hours=2)
+
+        price = latest.get("close")
+        eur_usd = latest.get("eur_usd")
+
+        sell_time_seconds = latest.get(
+            "sell_time_seconds"
+        )
+
+        sell_time_over_seconds = latest.get(
+            "sell_time_over_seconds"
+        )
+
+        buy_qty = None
+        buy_value_eur = None
+        price_eur = None
+
+        if (
+            pd.notna(price)
+            and pd.notna(eur_usd)
+            and float(price) > 0
+            and float(eur_usd) > 0
+        ):
+            # Both stock and X:BTCUSD closes are USD-denominated in the stored
+            # market records. LastPrice is therefore known at LastCollect when
+            # the same record also contains the EUR/USD reference rate.
+            price_eur = float(price) / float(eur_usd)
+
+            if latest["asset_type"] == "stock":
+                buy_qty = math.ceil(10000.0 / price_eur)
+                buy_value_eur = buy_qty * price_eur
+
+        row = {
+            "Ticker": ticker,
+            "TickerName": TICKER_NAMES.get(
+                str(ticker).upper(),
+                ticker,
+            ),
+            "Type": latest["asset_type"],
+            "_timestamp": latest_time,
+            #"Time": latest_time.strftime("%H:%M"),
+            "Time": latest_time.tz_convert(
+                 LOCAL_TIMEZONE
+            ).strftime("%H:%M"),
+            "Price": price_eur,
+            "BuyQty": buy_qty,
+            "BuyValueEUR": buy_value_eur,
+            "SellTime": sell_time_seconds,
+            "SellTimeOver": sell_time_over_seconds,
+            "OpenB": None,
+            "LowB": None,
+            "HighB": None,
+            "CloseB": None,
+            "MarketRegion": market_region_for_ticker(ticker, latest["asset_type"]),            
+            "CanBuy": False,
+            "C1": False,
+            "C2": False,
+            "BuyInfo": "",
+
+            "ShouldSell": False,
+            "C4": False,
+            "C5": False,
+            "CanSellNow": False,
+            "BoughtBefore": None,
+            "SellTiming": "",
+            "SellInfo": "",
+            # Informational percentages exposed on the Advisor page.
+            # These do not change the existing C4/C5 / ShouldSell decisions.
+            "Drop": None,
+            "Static": None,
+        }
+
+        market_config = TRADING_WINDOWS.get(row["MarketRegion"]) if row["MarketRegion"] else None
+        if pd.notna(price) and float(price) > 0:
+            decision = evaluate_sell_history(
+                ticker_df=ticker_df,
+                latest_time=latest_time,
+                current_price=float(price),
+                movement_percent=float(SELL_CONFIG.get("movement_percent", 1.1)),
+                c5_hours=float(SELL_CONFIG.get("c5_hours", 24.0)),
+            )
+            row["ShouldSell"] = decision.should_sell
+            row["C4"] = bool(decision.c4_satisfied)
+            row["C5"] = bool(decision.c5_satisfied)
+            row["BoughtBefore"] = decision.bought_before
+
+            # Advisor numeric metrics for the same C4/C5 evaluation.
+            # Drop is anchored to decision.max_time, i.e. the exact peak time
+            # selected by the shared sell-decision logic. Static is the maximum
+            # absolute price deviation from the current price inside the exact
+            # C5 lookback window.
+            history_for_sell = ticker_df[
+                ticker_df["timestamp"] <= latest_time
+            ].copy()
+            history_for_sell["_close_num"] = pd.to_numeric(
+                history_for_sell["close"], errors="coerce"
+            )
+            history_for_sell = history_for_sell.dropna(subset=["_close_num"])
+
+            if pd.notna(decision.max_time) and float(price) > 0:
+                try:
+                    max_time_ts = pd.Timestamp(decision.max_time)
+                    if max_time_ts.tzinfo is None:
+                        max_time_ts = max_time_ts.tz_localize("UTC")
+                    else:
+                        max_time_ts = max_time_ts.tz_convert("UTC")
+
+                    at_peak = history_for_sell[
+                        history_for_sell["timestamp"] == max_time_ts
+                    ]
+                    if at_peak.empty and not history_for_sell.empty:
+                        nearest_idx = (
+                            history_for_sell["timestamp"] - max_time_ts
+                        ).abs().idxmin()
+                        peak_price = history_for_sell.loc[nearest_idx, "_close_num"]
+                    else:
+                        peak_price = at_peak.iloc[-1]["_close_num"]
+
+                    if pd.notna(peak_price) and float(peak_price) > 0:
+                        row["Drop"] = max(
+                            0.0,
+                            (float(peak_price) - float(price))
+                            / float(peak_price)
+                            * 100.0,
+                        )
+                except Exception:
+                    pass
+
+            c5_hours = float(SELL_CONFIG.get("c5_hours", 24.0))
+            static_start = latest_time - pd.Timedelta(hours=c5_hours)
+            static_history = history_for_sell[
+                history_for_sell["timestamp"] >= static_start
+            ]
+            if not static_history.empty and float(price) > 0:
+                deviations = (
+                    (static_history["_close_num"] / float(price) - 1.0).abs()
+                    * 100.0
+                )
+                if not deviations.empty:
+                    row["Static"] = float(deviations.max())
+
+            if market_config:
+                sell_window = trading_window_info(
+                    pd.Timestamp.now(tz="UTC"),
+                    market_config,
+                    "sell",
+                )
+                row["CanSellNow"] = sell_window.is_open
+                if sell_window.is_open:
+                    row["SellTiming"] = f"RemainingTime={format_duration(sell_window.remaining_time)}"
+                else:
+                    row["SellTiming"] = f"FirstNextSellTime={format_local_timestamp(sell_window.first_next_time)}"
+            row["SellInfo"] = (
+                f"C4={decision.c4_satisfied} (> {float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% drop from peak; MaxTime={format_local_timestamp(decision.max_time)}); "
+                f"C5={decision.c5_satisfied} (full {float(SELL_CONFIG.get('c5_hours', 24.0)):g}h within +/-{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% of current price; LastOneProcTime={format_local_timestamp(decision.last_one_proc_time)}); "
+                f"{row['SellTiming']}"
+            )
+
+        candidate_rows = ticker_df[
+            (
+                ticker_df["timestamp"]
+                >= baseline_time - pd.Timedelta(minutes=30)
+            )
+            &
+            (
+                ticker_df["timestamp"]
+                <= baseline_time + pd.Timedelta(minutes=30)
+            )
+        ].copy()
+
+        if candidate_rows.empty:
+            rows.append(row)
+            continue
+
+        candidate_rows["baseline_distance"] = (
+            candidate_rows["timestamp"] - baseline_time
+        ).abs()
+
+        baseline = (
+            candidate_rows
+            .sort_values(
+                ["baseline_distance", "timestamp"],
+                ascending=[True, True],
+            )
+            .iloc[0]
+        )
+
+        baseline_age = (
+             baseline_time - baseline["timestamp"]
+        ).total_seconds()
+        if baseline_age > 1800:
+            rows.append(row)
+            continue
+
+        baseline_close = baseline.get("close")
+
+        if pd.isna(baseline_close) or baseline_close == 0:
+            rows.append(row)
+            continue
+
+        window = ticker_df[
+            (ticker_df["timestamp"] >= baseline_time)
+            & (ticker_df["timestamp"] <= latest_time)
+        ]
+
+        row["OpenB"] = 0.0
+
+        if "high" in window.columns:
+            high_value = pd.to_numeric(
+                window["high"],
+                errors="coerce",
+            ).max()
+
+            if pd.notna(high_value):
+                row["HighB"] = (
+                    high_value / baseline_close - 1
+                ) * 100
+
+        if "low" in window.columns:
+            low_value = pd.to_numeric(
+                window["low"],
+                errors="coerce",
+            ).min()
+
+            if pd.notna(low_value):
+                row["LowB"] = (
+                    low_value / baseline_close - 1
+                ) * 100
+
+        if pd.notna(price):
+            row["CloseB"] = (
+                price / baseline_close - 1
+            ) * 100
+
+        rows.append(row)
+
+    result = pd.DataFrame(rows)
+
+    if not result.empty:
+        closeb_ge2_count = int(
+            (pd.to_numeric(result["CloseB"], errors="coerce") >= BUY_MIN_CLOSEB_PERCENT).sum()
+        )
+        c2_satisfied = closeb_ge2_count >= BUY_MIN_CLOSEB_COUNT
+        for index, current in result.iterrows():
+            market_region = current.get("MarketRegion")
+            market_config = TRADING_WINDOWS.get(market_region) if market_region else None
+            c1_satisfied = False
+            remaining_text = "—"
+            if market_config:
+                buy_window = trading_window_info(
+                    current["_timestamp"],
+                    market_config,
+                    "buy",
+                )
+                c1_satisfied = buy_window.is_open
+                if buy_window.is_open:
+                    remaining_text = format_duration(buy_window.remaining_time)
+            result.at[index, "C1"] = bool(c1_satisfied)
+            result.at[index, "C2"] = bool(c2_satisfied)
+            result.at[index, "CanBuy"] = bool(c1_satisfied and c2_satisfied)
+            result.at[index, "BuyInfo"] = (
+                f"C1={c1_satisfied} (RemainingTime={remaining_text}); "
+                f"C2={c2_satisfied} (CloseB>={BUY_MIN_CLOSEB_PERCENT:g}%: {closeb_ge2_count}/{BUY_MIN_CLOSEB_COUNT})"
+            )
+
+        result = result.sort_values(
+            by=["_timestamp", "CloseB"],
+            ascending=[False, False],
+            na_position="last",
+        )
+    return result
+
+@st.cache_data(ttl=300)
+def build_live_overview_cached(
+    _data: pd.DataFrame,
+    data_version,
+) -> pd.DataFrame:
+    return build_live_overview(
+        _data
+    )
+
+render_dashboard_title(df, alerts_df)
+
+page = st.sidebar.radio("Page", ["Advisor", "Last Data", "Historical Trends", "Simulation", "Trade Analysis", "System Health", "Alerts", "Settings", "Logs"])
+if st.sidebar.button(
+    "Refresh now",
+    use_container_width=True,
+):
+    st.cache_data.clear()
+    st.rerun()
+
+local_now = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+st.sidebar.caption(
+    f"Last loaded: "
+    f"{local_now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+)
+
+if page == "Advisor":
+    st.header("Advisor")
+
+    market_df = df[
+        df["asset_type"].isin(["stock", "crypto"])
+    ].copy()
+
+    if market_df.empty:
+        st.info("No measurements received yet.")
+    else:
+        # Use the same active-ticker definition and Live Overview builder so
+        # Advisor stays synchronized with the dashboard decision support.
+        newest_received = market_df["received_at"].max()
+        active_cutoff = newest_received - pd.Timedelta(minutes=30)
+        latest_received = market_df.groupby("ticker")["received_at"].max()
+        active_tickers = latest_received[
+            latest_received >= active_cutoff
+        ].index
+        active_df = market_df[
+            market_df["ticker"].isin(active_tickers)
+        ].copy()
+
+        advisor_live = build_live_overview(active_df)
+
+        if advisor_live.empty:
+            st.info("No active assets available.")
+        else:
+            closeb_numeric = pd.to_numeric(
+                advisor_live.get("CloseB"), errors="coerce"
+            )
+            c2_group_count = int(
+                (closeb_numeric >= BUY_MIN_CLOSEB_PERCENT).sum()
+            )
+
+            advisor = advisor_live[
+                advisor_live["CanBuy"].fillna(False).astype(bool)
+                | advisor_live["ShouldSell"].fillna(False).astype(bool)
+            ].copy()
+
+            if advisor.empty:
+                st.success("No current buy or sell recommendations.")
+            else:
+                advisor["Group"] = c2_group_count
+                advisor = advisor.rename(
+                    columns={
+                        "Time": "LastCollect",
+                        "SellTime": "LastSellTime",
+                    }
+                )
+
+                # True CanBuy rows first, then highest CloseB first.
+                advisor["_CloseBSort"] = pd.to_numeric(
+                    advisor["CloseB"], errors="coerce"
+                )
+                advisor = advisor.sort_values(
+                    by=["CanBuy", "_CloseBSort"],
+                    ascending=[False, False],
+                    na_position="last",
+                )
+
+                advisor["BoughtBefore"] = advisor["BoughtBefore"].map(
+                    format_local_timestamp
+                )
+
+                for column in ["CloseB"]:
+                    advisor[column] = pd.to_numeric(
+                        advisor[column], errors="coerce"
+                    ).map(
+                        lambda value: f"{value:+.2f}%"
+                        if pd.notna(value)
+                        else "—"
+                    )
+
+                for column in ["Drop", "Static"]:
+                    if column in advisor.columns:
+                        advisor[column] = pd.to_numeric(
+                            advisor[column], errors="coerce"
+                        ).map(
+                            lambda value: f"{value:.2f}%"
+                            if pd.notna(value)
+                            else "—"
+                        )
+
+                if "LastSellTime" in advisor.columns:
+                    advisor["LastSellTime"] = pd.to_numeric(
+                        advisor["LastSellTime"], errors="coerce"
+                    ).map(
+                        lambda value: f"{int(value)} s"
+                        if pd.notna(value)
+                        else "—"
+                    )
+
+                advisor_columns = [
+                    "Ticker",
+                    "TickerName",
+                    "LastCollect",
+                    "CanBuy",
+                    "Group",
+                    "CloseB",
+                    "BoughtBefore",
+                    "ShouldSell",
+                    "Drop",
+                    "Static",
+                    "CanSellNow",
+                    "LastSellTime",
+                    "SellTiming",
+                ]
+                advisor = advisor[
+                    [column for column in advisor_columns if column in advisor.columns]
+                ]
+
+                # Streamlit renders dataframe column headers in bold. The three
+                # decision columns are kept as explicit checkbox columns so
+                # CanBuy, ShouldSell, and CanSellNow are visually prominent.
+                st.dataframe(
+                    advisor,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "CanBuy": st.column_config.CheckboxColumn("CanBuy"),
+                        "ShouldSell": st.column_config.CheckboxColumn("ShouldSell"),
+                        "CanSellNow": st.column_config.CheckboxColumn("CanSellNow"),
+                        "Drop": st.column_config.TextColumn("Drop"),
+                        "Static": st.column_config.TextColumn("Static"),
+                        "Group": st.column_config.NumberColumn("Group", format="%d"),
+                    },
+                )
+
+        st.caption(
+            "Advisor columns: Ticker and TickerName identify the asset; LastCollect is the latest "
+            "market-data time used by Last Data. CanBuy is the Last Data buy decision. "
+            f"Group is the number of active tickers with CloseB >= {BUY_MIN_CLOSEB_PERCENT:g}%, "
+            "the count used for C2. CloseB is the approximately two-hour percentage price change. "
+            "BoughtBefore is the prior-buy/init time used by the sell evaluation. ShouldSell is "
+            "the Last Data sell decision. Drop is the percentage fall from the peak selected "
+            "by the shared C4 logic (decision MaxTime) to the current price. Static is the maximum "
+            "absolute percentage deviation from the current price during the configured C5 lookback "
+            "window; it is compared with the movement threshold used by C5. CanSellNow indicates whether the configured "
+            "sell window is currently open. LastSellTime is the latest liquidity-time estimate, "
+            "and SellTiming gives the remaining "
+            "sell-window time or the first next sell time."
+        )
+
+elif page == "Last Data":
+    market_df = df[
+        df["asset_type"].isin(
+            ["stock", "crypto"]
+        )
+    ].copy()
+
+    if df.empty:
+        st.info("No measurements received yet.")
+
+    else:
+        open_alerts = (
+            0
+            if alerts_df.empty
+            else int(
+                (~alerts_df["acknowledged"]).sum()
+            )
+        )
+
+        # Determine currently tracked assets using collection time, not
+        # market-bar time. This keeps delayed feeds active as long as the
+        # collector is still receiving them.
+        newest_received = market_df["received_at"].max()
+        latest_received = market_df.groupby("ticker")["received_at"].max()
+
+        # Last Data keeps historical rows, but actionable state must be based
+        # on collector configuration rather than an arbitrary freshness limit.
+        # This prevents a temporary missed/delayed bar from making a configured
+        # ticker look historical.
+        currently_collected_tickers = {
+            str(ticker)
+            for ticker in latest_received.index
+            if str(ticker).strip().upper() in CONFIGURED_COLLECTOR_TICKERS
+        }
+
+        active_tickers = latest_received.index
+        active_df = market_df.copy()
+
+        live = build_live_overview(active_df)
+        live = add_market_data_count(
+            live,
+            market_df,
+            day_start_hour=3,
+            output_column="Records",
+        )
+
+        newest_market_data = active_df["timestamp"].max()
+        sources = active_df["system"].nunique()
+        tracked_assets = len(active_tickers)
+
+        cols = st.columns(4)
+        newest_local = newest_market_data.tz_convert(LOCAL_TIMEZONE)
+        cols[0].metric("Newest data", newest_local.strftime("%H:%M %Z"))
+        cols[1].metric("Sources", sources)
+        cols[2].metric("Tracked assets", tracked_assets)
+        cols[3].metric("Open alerts", open_alerts)
+
+        st.subheader("Last Data")
+
+        if live.empty:
+            st.info("No active assets available.")
+
+        else:
+            # Last Data is the complete per-ticker trading-data view. Keep one
+            # row for every ticker regardless of its current BUY/SELL decision.
+            relevant = live.copy()
+
+            if relevant.empty:
+                st.info("No ticker data is currently available.")
+            else:
+                relevant["_CloseBSort"] = pd.to_numeric(
+                    relevant["CloseB"], errors="coerce"
+                )
+                relevant = relevant.sort_values(
+                    by="_CloseBSort",
+                    ascending=False,
+                    na_position="last",
+                )
+
+                relevant = relevant.rename(
+                    columns={
+                        "Time": "LastCollect",
+                        "Price": "LastPrice",
+                        "SellTime": "SellingTime",
+                    }
+                )
+
+                def format_selling_time(row):
+                    value = row.get("SellingTime")
+                    if pd.notna(value):
+                        return f"{int(value)}s"
+                    over = row.get("SellTimeOver")
+                    if pd.notna(over):
+                        return f">{int(over)}s"
+                    # Keep unknown rather than carrying a liquidity estimate
+                    # from another collection time. Crypto currently normally
+                    # lands here because no one-second SellTime is collected.
+                    return "—"
+
+                relevant["SellingTime"] = relevant.apply(format_selling_time, axis=1)
+
+                # For crypto, build_live_overview may not populate Price because
+                # the stock-specific EUR conversion path is not available.
+                # Use the close from the exact latest crypto bar and the latest
+                # known EUR/USD reference rate at or before that bar.
+                crypto_last_price_eur = {}
+                if "eur_usd" in active_df.columns:
+                    fx_history = active_df[["timestamp", "eur_usd"]].copy()
+                    fx_history["eur_usd"] = pd.to_numeric(
+                        fx_history["eur_usd"], errors="coerce"
+                    )
+                    fx_history = fx_history[
+                        fx_history["eur_usd"].notna()
+                        & (fx_history["eur_usd"] > 0)
+                    ].sort_values("timestamp")
+                else:
+                    fx_history = pd.DataFrame(columns=["timestamp", "eur_usd"])
+
+                for ticker in relevant["Ticker"].astype(str):
+                    source = active_df[
+                        active_df["ticker"].astype(str) == ticker
+                    ].copy()
+                    if source.empty:
+                        continue
+
+                    source = source.sort_values(["timestamp", "id"]).drop_duplicates(
+                        subset=["timestamp"], keep="last"
+                    )
+                    latest_source = source.iloc[-1]
+
+                    if str(latest_source.get("asset_type", "")).lower() != "crypto":
+                        continue
+
+                    close_value = pd.to_numeric(
+                        pd.Series([latest_source.get("close")]),
+                        errors="coerce",
+                    ).iloc[0]
+                    if pd.isna(close_value) or float(close_value) <= 0:
+                        continue
+
+                    fx_candidates = fx_history[
+                        fx_history["timestamp"] <= latest_source["timestamp"]
+                    ]
+                    if fx_candidates.empty:
+                        continue
+
+                    eur_usd = float(fx_candidates.iloc[-1]["eur_usd"])
+                    if eur_usd > 0:
+                        crypto_last_price_eur[ticker] = float(close_value) / eur_usd
+
+                last_price_numeric = pd.to_numeric(
+                    relevant["LastPrice"], errors="coerce"
+                )
+                ticker_series = relevant["Ticker"].astype(str)
+                for row_index, ticker in ticker_series.items():
+                    crypto_price = crypto_last_price_eur.get(ticker)
+                    if crypto_price is not None:
+                        last_price_numeric.at[row_index] = crypto_price
+
+                relevant["LastPrice"] = last_price_numeric.map(
+                    lambda value: f"€{value:.3f}" if pd.notna(value) else "—"
+                )
+
+                relevant["OpenB"] = pd.to_numeric(
+                    relevant["OpenB"], errors="coerce"
+                ).map(
+                    lambda value: "0%"
+                    if pd.notna(value) and abs(float(value)) < 0.0000001
+                    else (f"{value:+.2f}%" if pd.notna(value) else "—")
+                )
+
+                for column in ["LowB", "HighB", "CloseB"]:
+                    relevant[column] = pd.to_numeric(
+                        relevant[column], errors="coerce"
+                    ).map(
+                        lambda value: f"{value:+.2f}%" if pd.notna(value) else "—"
+                    )
+
+                movement_percent = float(SELL_CONFIG.get("movement_percent", 1.1))
+                phase_values = {}
+                duration_values = {}
+                last_collect_values = {}
+
+                newest_market_local_date = newest_market_data.tz_convert(
+                    LOCAL_TIMEZONE
+                ).date()
+
+                for ticker in relevant["Ticker"].astype(str):
+                    source = active_df[active_df["ticker"].astype(str) == ticker].copy()
+                    if source.empty:
+                        continue
+                    source = source.sort_values(["timestamp", "id"]).drop_duplicates(
+                        subset=["timestamp"], keep="last"
+                    )
+                    latest_source = source.iloc[-1]
+
+                    latest_local = pd.to_datetime(
+                        latest_source["timestamp"], utc=True
+                    ).tz_convert(LOCAL_TIMEZONE)
+                    if latest_local.date() == newest_market_local_date:
+                        last_collect_values[ticker] = latest_local.strftime("%H:%M")
+                    else:
+                        last_collect_values[ticker] = latest_local.strftime("%d.%m %H:%M")
+
+                    # Historical/inactive tickers remain visible in Last Data,
+                    # but a current trading phase/wait value would be misleading.
+                    if ticker not in currently_collected_tickers:
+                        phase_values[ticker] = ("-", "-", "-")
+                        duration_values[ticker] = ("-", "-")
+                        continue
+
+                    region = market_region_for_ticker(ticker, latest_source.get("asset_type"))
+                    phase_values[ticker] = market_phase_info(
+                        latest_source["timestamp"], region
+                    )
+                    duration_values[ticker] = movement_durations(
+                        source,
+                        latest_source["timestamp"],
+                        latest_source.get("close"),
+                        movement_percent,
+                    )
+
+                relevant["Phase"] = relevant["Ticker"].astype(str).map(
+                    lambda ticker: phase_values.get(ticker, ("Closed", "-", "-"))[0]
+                )
+                relevant["WaitToTrade"] = relevant["Ticker"].astype(str).map(
+                    lambda ticker: phase_values.get(ticker, ("Closed", "-", "-"))[1]
+                )
+                relevant["WaitToOpening"] = relevant["Ticker"].astype(str).map(
+                    lambda ticker: phase_values.get(ticker, ("Closed", "-", "-"))[2]
+                )
+                relevant["DropDuration"] = relevant["Ticker"].astype(str).map(
+                    lambda ticker: duration_values.get(ticker, ("-", "-"))[0]
+                )
+                relevant["StaticDuration"] = relevant["Ticker"].astype(str).map(
+                    lambda ticker: duration_values.get(ticker, ("-", "-"))[1]
+                )
+
+                relevant["LastCollect"] = relevant["Ticker"].astype(str).map(
+                    lambda ticker: last_collect_values.get(ticker, "—")
+                )
+
+                inactive_mask = ~relevant["Ticker"].astype(str).isin(
+                    currently_collected_tickers
+                )
+                relevant.loc[inactive_mask, "LastPrice"] = "—"
+                relevant.loc[inactive_mask, "SellingTime"] = "—"
+                for column in [
+                    "Phase",
+                    "DropDuration",
+                    "StaticDuration",
+                    "WaitToTrade",
+                    "WaitToOpening",
+                ]:
+                    relevant.loc[inactive_mask, column] = "-"
+
+                live_columns = [
+                    "Ticker",
+                    "TickerName",
+                    "Type",
+                    "Phase",
+                    "Records",
+                    "LastCollect",
+                    "LastPrice",
+                    "OpenB",
+                    "LowB",
+                    "HighB",
+                    "CloseB",
+                    "SellingTime",
+                    "DropDuration",
+                    "StaticDuration",
+                    "WaitToTrade",
+                    "WaitToOpening",
+                ]
+
+                display = relevant[
+                    [column for column in live_columns if column in relevant.columns]
+                ]
+
+                st.dataframe(
+                    display,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Records": st.column_config.NumberColumn(
+                            "Records",
+                            format="%d",
+                        ),
+                    },
+                )
+
+        st.caption(
+            "Last Data shows one row for every ticker, regardless of its current BUY/SELL "
+            "decision. Rows are ordered by "
+            "CloseB from highest to lowest. LastCollect is the timestamp of the latest market "
+            "bar; when it is from an earlier date, LastCollect also shows DD.MM. LastPrice is "
+            "its estimated EUR price. Records counts unique market bars from 03:00 Europe/Berlin, "
+            "which is the operating-day boundary for this view. Historical tickers that are no "
+            "longer part of an enabled collector's configured ticker universe remain visible, "
+            "but their actionable Phase/wait/price fields are shown as unavailable."
+        )
+        st.caption(
+            "OpenB, LowB, HighB and CloseB describe the approximately two-hour price block "
+            "ending at LastCollect. Values are percentage changes from the baseline price about "
+            "two hours earlier: OpenB is the block start, LowB the minimum, HighB the maximum, "
+            "and CloseB the latest price relative to that baseline."
+        )
+        st.caption(
+            "SellingTime is the estimated time needed to sell a EUR 10,000 position using "
+            "recent one-second market turnover and the configured participation assumption. "
+            "DropDuration is the shortest elapsed period ending at LastCollect during which price "
+            "did not exceed LastPrice by more than the configured C4/C5 movement threshold. "
+            "StaticDuration is the shortest elapsed period ending at LastCollect during which price "
+            "stayed inside the configured +/- movement-threshold band around LastPrice. "
+            "WaitToTrade and WaitToOpening show the remaining time to the relevant trading phase."
+        )
+        st.caption(
+            "C1 checks whether the configured BUY trading window is open at the market-data time. "
+            f"C2 is true when at least {BUY_MIN_CLOSEB_COUNT} active tickers have CloseB >= "
+            f"{BUY_MIN_CLOSEB_PERCENT:g}%. C4 is true after a drop of more than "
+            f"{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% from the sampled peak. "
+            f"C5 is true after a full {float(SELL_CONFIG.get('c5_hours', 24.0)):g} hours when "
+            f"every sampled price stays within +/-{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% "
+            "of the current price. ShouldSell = C4 or C5."
+        )
+
+elif page == "Alerts":
+    if alerts_df.empty:
+        st.success("No alerts recorded.")
+    else:
+        alerts_df["created_at"] = pd.to_datetime(alerts_df["created_at"], utc=True)
+        show_open = st.toggle("Only unacknowledged", value=True)
+        shown = alerts_df[~alerts_df["acknowledged"]] if show_open else alerts_df
+        st.dataframe(
+            shown[["id", "created_at", "severity", "system", "rule_name", "actual_value", "acknowledged"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+        alert_id = st.number_input("Alert ID to acknowledge", min_value=1, step=1)
+        if st.button("Acknowledge alert"):
+            try:
+                api_post(f"/api/v1/alerts/{int(alert_id)}/acknowledge")
+                st.success("Alert acknowledged.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+elif page == "Settings":
+    st.header("Settings")
+    config_path = trading_config_path()
+    st.caption(f"Active configuration file: {config_path}")
+
+    if st.session_state.pop("settings_saved", False):
+        st.success("Settings saved. The dashboard has reloaded and is now using the modified values.")
+    if st.session_state.pop("watchlist_saved", False):
+        st.success("Watchlist saved. It will be available to a collector that reads the configured watchlist path at its next collection cycle.")
+
+    editable_config = load_trading_config()
+    editable_windows = editable_config.setdefault("trading_windows", {})
+    editable_buy = editable_config.setdefault("buy", {})
+    editable_sell = editable_config.setdefault("sell", {})
+
+    st.subheader("Rule-based parameters")
+    st.caption(
+        "C1 uses market calendar/timezone and BUY windows. C2 uses the CloseB threshold and required ticker count. "
+        "C4 uses movement_percent; C5 uses movement_percent and c5_hours. This dashboard version does not contain "
+        "a C3 calculation, so there is no C3 parameter to edit here. SELL windows affect CanSellNow/SellTiming rather than C4/C5 themselves."
+    )
+
+    with st.form("rule_settings_form"):
+        buy_col1, buy_col2 = st.columns(2)
+        with buy_col1:
+            new_closeb_count = st.number_input(
+                "C2: minimum number of tickers",
+                min_value=1,
+                max_value=5000,
+                value=int(editable_buy.get("minimum_closeb_count", editable_buy.get("minimum_closeb_ge2_count", 6))),
+                step=1,
+                help="C2 is true only when at least this many active tickers meet the CloseB percentage threshold.",
+            )
+        with buy_col2:
+            new_closeb_percent = st.number_input(
+                "C2: CloseB threshold (%)",
+                min_value=0.01,
+                max_value=100.0,
+                value=float(editable_buy.get("minimum_closeb_percent", 2.0)),
+                step=0.1,
+                format="%.2f",
+            )
+
+        sell_col1, sell_col2 = st.columns(2)
+        with sell_col1:
+            new_movement_percent = st.number_input(
+                "C4/C5: movement threshold (%)",
+                min_value=0.01,
+                max_value=100.0,
+                value=float(editable_sell.get("movement_percent", 1.1)),
+                step=0.1,
+                format="%.2f",
+                help="C4 requires a drop greater than this percentage. C5 requires all samples to remain within +/- this percentage of current price.",
+            )
+        with sell_col2:
+            new_c5_hours = st.number_input(
+                "C5: trailing window (hours)",
+                min_value=0.25,
+                max_value=720.0,
+                value=float(editable_sell.get("c5_hours", 24.0)),
+                step=0.25,
+                format="%.2f",
+            )
+
+        st.markdown("**Market calendars and trading windows (C1 / CanSellNow)**")
+        market_values = {}
+        weekday_options = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        for region, cfg in sorted(editable_windows.items()):
+            if not isinstance(cfg, dict):
+                continue
+            st.markdown(f"##### {region}")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                enabled = st.checkbox(
+                    "Market enabled",
+                    value=bool(cfg.get("enabled", True)),
+                    key=f"settings_enabled_{region}",
+                )
+                tz_value = st.text_input(
+                    "Timezone",
+                    value=str(cfg.get("timezone", "UTC")),
+                    key=f"settings_tz_{region}",
+                    help="Must be a valid IANA timezone, for example Europe/Berlin or America/New_York.",
+                )
+            with c2:
+                buy_start = st.text_input(
+                    "BUY start (HH:MM)",
+                    value=str(cfg.get("buy_start", "00:00")),
+                    key=f"settings_buy_start_{region}",
+                )
+                buy_end = st.text_input(
+                    "BUY end (HH:MM)",
+                    value=str(cfg.get("buy_end", "23:59")),
+                    key=f"settings_buy_end_{region}",
+                )
+            with c3:
+                sell_start = st.text_input(
+                    "SELL start (HH:MM)",
+                    value=str(cfg.get("sell_start", "00:00")),
+                    key=f"settings_sell_start_{region}",
+                )
+                sell_end = st.text_input(
+                    "SELL end (HH:MM)",
+                    value=str(cfg.get("sell_end", "23:59")),
+                    key=f"settings_sell_end_{region}",
+                )
+
+            raw_weekdays = cfg.get("open_weekdays")
+            current_weekdays = weekday_options if raw_weekdays is None else [str(v).strip().lower()[:3] for v in raw_weekdays]
+            selected_weekdays = st.multiselect(
+                "Open weekdays",
+                options=weekday_options,
+                default=[d for d in current_weekdays if d in weekday_options],
+                key=f"settings_weekdays_{region}",
+            )
+            closed_dates_text = st.text_input(
+                "Closed dates (YYYY-MM-DD, comma separated)",
+                value=", ".join(str(v) for v in (cfg.get("closed_dates") or [])),
+                key=f"settings_closed_{region}",
+            )
+            market_values[region] = {
+                "enabled": enabled,
+                "timezone": tz_value.strip(),
+                "buy_start": buy_start.strip(),
+                "buy_end": buy_end.strip(),
+                "sell_start": sell_start.strip(),
+                "sell_end": sell_end.strip(),
+                "open_weekdays": selected_weekdays,
+                "closed_dates_text": closed_dates_text,
+            }
+
+        save_rules = st.form_submit_button("Save rule-based settings", type="primary")
+
+    if save_rules:
+        errors = []
+        if new_closeb_count < 1:
+            errors.append("C2 minimum ticker count must be at least 1.")
+        if not (0 < new_closeb_percent <= 100):
+            errors.append("C2 CloseB threshold must be greater than 0 and at most 100%.")
+        if not (0 < new_movement_percent <= 100):
+            errors.append("C4/C5 movement threshold must be greater than 0 and at most 100%.")
+        if not (0.25 <= new_c5_hours <= 720):
+            errors.append("C5 window must be between 0.25 and 720 hours.")
+
+        for region, values in market_values.items():
+            if not _valid_timezone(values["timezone"]):
+                errors.append(f"{region}: invalid timezone {values['timezone']!r}.")
+            for label in ("buy_start", "buy_end", "sell_start", "sell_end"):
+                if not _valid_hhmm(values[label]):
+                    errors.append(f"{region}: {label} must use HH:MM (24-hour) format.")
+            if values["enabled"] and not values["open_weekdays"]:
+                errors.append(f"{region}: select at least one open weekday while the market is enabled.")
+            closed_dates = []
+            for raw_date in [part.strip() for part in values["closed_dates_text"].split(",") if part.strip()]:
+                try:
+                    datetime.strptime(raw_date, "%Y-%m-%d")
+                    closed_dates.append(raw_date)
+                except Exception:
+                    errors.append(f"{region}: invalid closed date {raw_date!r}; use YYYY-MM-DD.")
+            values["closed_dates"] = closed_dates
+
+        if errors:
+            for error in errors:
+                st.error(error)
+        else:
+            editable_buy["minimum_closeb_count"] = int(new_closeb_count)
+            editable_buy.pop("minimum_closeb_ge2_count", None)
+            editable_buy["minimum_closeb_percent"] = float(new_closeb_percent)
+            editable_sell["movement_percent"] = float(new_movement_percent)
+            editable_sell["c5_hours"] = float(new_c5_hours)
+            for region, values in market_values.items():
+                cfg = editable_windows.setdefault(region, {})
+                cfg["enabled"] = bool(values["enabled"])
+                cfg["timezone"] = values["timezone"]
+                cfg["buy_start"] = values["buy_start"]
+                cfg["buy_end"] = values["buy_end"]
+                cfg["sell_start"] = values["sell_start"]
+                cfg["sell_end"] = values["sell_end"]
+                cfg["open_weekdays"] = values["open_weekdays"]
+                cfg["closed_dates"] = values["closed_dates"]
+            try:
+                saved_path, backup_path = save_trading_config(editable_config)
+                st.cache_data.clear()
+                st.session_state["settings_saved"] = True
+                st.session_state["settings_backup"] = str(backup_path)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save settings: {exc}")
+
+    backup_path = st.session_state.pop("settings_backup", None)
+    if backup_path:
+        st.caption(f"Previous configuration backup: {backup_path}")
+
+    st.divider()
+    st.subheader("System parameters")
+    st.caption(
+        "Only system parameters already present in a top-level 'system' section are offered for editing, and only "
+        "conservative scalar types are supported. API address/key and code/cache constants are intentionally not editable here."
+    )
+    system_cfg = editable_config.get("system")
+    if not isinstance(system_cfg, dict) or not system_cfg:
+        st.info("No safely editable top-level 'system' parameters were found in the active YAML configuration.")
+    else:
+        safe_system = {}
+        for key, value in system_cfg.items():
+            key_l = str(key).lower()
+            if isinstance(value, bool):
+                safe_system[key] = ("bool", value)
+            elif isinstance(value, int) and any(token in key_l for token in ("interval", "timeout", "minutes", "seconds", "hours", "days", "limit", "retention")):
+                safe_system[key] = ("int", value)
+            elif isinstance(value, float) and any(token in key_l for token in ("interval", "timeout", "minutes", "seconds", "hours", "days", "limit")):
+                safe_system[key] = ("float", value)
+            elif key_l in ("log_level", "timezone") and isinstance(value, str):
+                safe_system[key] = (key_l, value)
+
+        if not safe_system:
+            st.info("The 'system' section exists, but none of its values match the conservative editable allow-list.")
+        else:
+            with st.form("system_settings_form"):
+                system_values = {}
+                for key, (kind, value) in safe_system.items():
+                    if kind == "bool":
+                        system_values[key] = st.checkbox(str(key), value=bool(value), key=f"sys_{key}")
+                    elif kind == "int":
+                        system_values[key] = st.number_input(str(key), min_value=0, max_value=1000000, value=int(value), step=1, key=f"sys_{key}")
+                    elif kind == "float":
+                        system_values[key] = st.number_input(str(key), min_value=0.0, max_value=1000000.0, value=float(value), step=0.25, key=f"sys_{key}")
+                    elif kind == "log_level":
+                        levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+                        current = str(value).upper()
+                        system_values[key] = st.selectbox(str(key), levels, index=levels.index(current) if current in levels else 1, key=f"sys_{key}")
+                    elif kind == "timezone":
+                        system_values[key] = st.text_input(str(key), value=str(value), key=f"sys_{key}")
+                save_system = st.form_submit_button("Save system settings")
+            if save_system:
+                errors = []
+                for key, (kind, _) in safe_system.items():
+                    if kind == "timezone" and not _valid_timezone(system_values[key]):
+                        errors.append(f"{key}: invalid IANA timezone.")
+                    if kind in ("int", "float") and float(system_values[key]) < 0:
+                        errors.append(f"{key}: value must be non-negative.")
+                if errors:
+                    for error in errors:
+                        st.error(error)
+                else:
+                    for key, value in system_values.items():
+                        editable_config["system"][key] = value
+                    try:
+                        saved_path, backup_path = save_trading_config(editable_config)
+                        st.cache_data.clear()
+                        st.session_state["settings_saved"] = True
+                        st.session_state["settings_backup"] = str(backup_path)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not save system settings: {exc}")
+
+    st.divider()
+    st.subheader("Watchlist upload")
+    target = watchlist_target_path()
+    st.caption(f"Configured watchlist target: {target}")
+    uploaded_watchlist = st.file_uploader("Upload <name>.csv", type=["csv"], key="settings_watchlist")
+    if uploaded_watchlist is not None:
+        try:
+            preview_df, raw_watchlist = validate_watchlist_csv(uploaded_watchlist)
+            st.dataframe(preview_df.head(25), use_container_width=True, hide_index=True)
+            st.caption(f"{len(preview_df)} ticker rows validated.")
+            if st.button("Activate uploaded watchlist", type="primary"):
+                saved_target, backup_target = save_watchlist_bytes(raw_watchlist)
+                st.cache_data.clear()
+                st.session_state["watchlist_saved"] = True
+                st.session_state["watchlist_path"] = str(saved_target)
+                if backup_target is not None:
+                    st.session_state["watchlist_backup"] = str(backup_target)
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Invalid watchlist: {exc}")
+
+    saved_watchlist_path = st.session_state.pop("watchlist_path", None)
+    saved_watchlist_backup = st.session_state.pop("watchlist_backup", None)
+    if saved_watchlist_path:
+        st.caption(f"Active watchlist file: {saved_watchlist_path}")
+    if saved_watchlist_backup:
+        st.caption(f"Previous watchlist backup: {saved_watchlist_backup}")
+    st.warning(
+        "The dashboard can atomically replace the configured watchlist file, but this codebase exposes no collector reload API. "
+        "Next-15-minute-slot activation therefore depends on the collector reading this same path on each cycle. If your collector "
+        "loads the watchlist only at startup or from another path, it must be configured/restarted separately."
+    )
+
+elif page == "Logs":
+    st.header("Logs")
+
+    market_df = df[
+        df["asset_type"].isin(["stock", "crypto"])
+    ].copy()
+    market_df["received_at"] = pd.to_datetime(
+        market_df["received_at"], utc=True, errors="coerce"
+    )
+    market_df["timestamp"] = pd.to_datetime(
+        market_df["timestamp"], utc=True, errors="coerce"
+    )
+
+    try:
+        simulation_payload = load_simulation_payload_cached()
+        if isinstance(simulation_payload, dict):
+            simulation_rows = (
+                simulation_payload.get("trades")
+                or simulation_payload.get("rows")
+                or simulation_payload.get("items")
+                or []
+            )
+        else:
+            simulation_rows = simulation_payload or []
+        simulation_df = pd.DataFrame(simulation_rows)
+    except Exception as exc:
+        simulation_payload = {}
+        simulation_df = pd.DataFrame()
+        st.warning(f"Cannot load Simulation data for Logs: {exc}")
+
+    simulation_timestamp, simulation_timestamp_source = get_simulation_timestamp(
+        simulation_payload,
+        market_df,
+    )
+
+    # 1. Imported assets that were not tracked at simulationTimestamp.
+    st.subheader("1. Non-tracked imported assets")
+    st.caption(
+        "simulationTimestamp: "
+        f"{fmt_local_datetime(simulation_timestamp)} "
+        f"({simulation_timestamp_source})"
+    )
+
+    imported_assets, imported_csv_paths = discover_imported_asset_csvs()
+    imported_tickers = set(imported_assets["Ticker"].dropna().astype(str))
+    tracked_at_simulation = tracked_tickers_at(
+        market_df,
+        simulation_timestamp,
+    )
+    non_tracked_assets = imported_assets[
+        ~imported_assets["Ticker"].isin(tracked_at_simulation)
+    ].copy()
+
+    if imported_csv_paths:
+        st.caption("Imported asset CSV source(s): " + ", ".join(imported_csv_paths))
+    else:
+        st.warning(
+            "No imported asset CSV with a Ticker/Symbol column was found. "
+            "Set ASSETS_CSV (or ASSET_CSV) to the production <name>.csv path "
+            "if it is stored outside /app/config or the project directories."
+        )
+
+    asset_cols = st.columns(3)
+    asset_cols[0].metric("Imported assets", len(imported_tickers))
+    asset_cols[1].metric("Tracked at simulationTimestamp", len(tracked_at_simulation))
+    asset_cols[2].metric("Non-tracked assets", len(non_tracked_assets))
+
+    if not non_tracked_assets.empty:
+        st.dataframe(
+            non_tracked_assets[["Ticker", "Name", "ISIN"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+    elif imported_tickers:
+        st.success("All imported assets were tracked at simulationTimestamp.")
+
+    # 2. Previous simulator day statistics (03:00 -> 03:00 Europe/Berlin).
+    st.subheader("2. Previous simulator day")
+    day_start, day_end = previous_simulator_day_bounds()
+    st.caption(
+        f"Window: {fmt_local_datetime(day_start)} to "
+        f"{fmt_local_datetime(day_end)}"
+    )
+
+    day_receipts = market_df[
+        market_df["received_at"].notna()
+        & (market_df["received_at"] >= day_start)
+        & (market_df["received_at"] < day_end)
+    ]["received_at"]
+
+    first_collection = day_receipts.min() if not day_receipts.empty else pd.NaT
+    last_collection = day_receipts.max() if not day_receipts.empty else pd.NaT
+
+    if simulation_df.empty:
+        start_open = start_closed = end_open = end_closed = 0
+        bought_count = sold_count = 0
+    else:
+        sim_work = simulation_df.copy()
+        sim_work["BuyTime"] = pd.to_datetime(
+            sim_work.get("BuyTime"), utc=True, errors="coerce"
+        )
+        sim_work["SellTime"] = pd.to_datetime(
+            sim_work.get("SellTime"), utc=True, errors="coerce"
+        )
+        sim_work["Ticker"] = (
+            sim_work.get("Ticker", pd.Series(index=sim_work.index, dtype="object"))
+            .astype(str).str.upper()
+        )
+
+        start_open, start_closed = simulation_state_at(
+            sim_work,
+            first_collection,
+        )
+        end_open, end_closed = simulation_state_at(
+            sim_work,
+            last_collection,
+        )
+        bought_count = int(
+            sim_work.loc[
+                sim_work["BuyTime"].notna()
+                & (sim_work["BuyTime"] >= day_start)
+                & (sim_work["BuyTime"] < day_end),
+                "Ticker",
+            ].nunique()
+        )
+        sold_count = int(
+            sim_work.loc[
+                sim_work["SellTime"].notna()
+                & (sim_work["SellTime"] >= day_start)
+                & (sim_work["SellTime"] < day_end),
+                "Ticker",
+            ].nunique()
+        )
+
+    start_closeb2 = closeb_over_two_at(market_df, first_collection)
+    end_closeb2 = closeb_over_two_at(market_df, last_collection)
+
+    stats_rows = [
+        {
+            "Point": "Start of day",
+            "CollectionTime": fmt_local_datetime(first_collection),
+            "OpenTickers": start_open,
+            "ClosedTickers": start_closed,
+            "CloseB > 2%": start_closeb2,
+            "BoughtTickers": "—",
+            "SoldTickers": "—",
+        },
+        {
+            "Point": "During day",
+            "CollectionTime": (
+                f"{fmt_local_datetime(day_start)} – {fmt_local_datetime(day_end)}"
+            ),
+            "OpenTickers": "—",
+            "ClosedTickers": "—",
+            "CloseB > 2%": "—",
+            "BoughtTickers": bought_count,
+            "SoldTickers": sold_count,
+        },
+        {
+            "Point": "End of day",
+            "CollectionTime": fmt_local_datetime(last_collection),
+            "OpenTickers": end_open,
+            "ClosedTickers": end_closed,
+            "CloseB > 2%": end_closeb2,
+            "BoughtTickers": "—",
+            "SoldTickers": "—",
+        },
+    ]
+    st.dataframe(
+        pd.DataFrame(stats_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+    if pd.isna(first_collection) or pd.isna(last_collection):
+        st.info("No collector measurements were found for the complete previous 03:00–03:00 window.")
+
+    # 3. Timing of the newest 15-minute market-data block.
+    st.subheader("3. Latest 15-minute data collection")
+    valid_market = market_df[
+        market_df["timestamp"].notna() & market_df["received_at"].notna()
+    ].copy()
+
+    if valid_market.empty:
+        st.info("No market collection timing data is available.")
+    else:
+        newest_market_data = valid_market["timestamp"].max()
+        newest_rows = valid_market[
+            valid_market["timestamp"] == newest_market_data
+        ]
+        collection_started = newest_rows["received_at"].min()
+        collection_finished = newest_rows["received_at"].max()
+        dashboard_available = collection_finished
+        block_end = newest_market_data + pd.Timedelta(minutes=15)
+
+        timing_rows = pd.DataFrame(
+            [
+                {
+                    "Event": "Collector started",
+                    "Time": fmt_local_datetime(collection_started, "%H:%M:%S"),
+                    "Details": (
+                        "15-min delayed block "
+                        f"{fmt_local_datetime(newest_market_data, '%H:%M')}–"
+                        f"{fmt_local_datetime(block_end, '%H:%M')}"
+                    ),
+                },
+                {
+                    "Event": "Collector finished",
+                    "Time": fmt_local_datetime(collection_finished, "%H:%M:%S"),
+                    "Details": f"{len(newest_rows)} asset measurement(s) received",
+                },
+                {
+                    "Event": "Dashboard data available",
+                    "Time": fmt_local_datetime(dashboard_available, "%H:%M:%S"),
+                    "Details": (
+                        "Refresh can show Newest data = "
+                        f"{fmt_local_datetime(newest_market_data, '%H:%M')}"
+                    ),
+                },
+            ]
+        )
+        st.dataframe(
+            timing_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "Collector start/finish are the earliest/latest received_at values "
+            "for the newest market-data timestamp across stock/crypto measurements."
+        )
+
+    # 4. Measurements moved here from Live Overview.
+    st.subheader("4. Measurements")
+    st.metric("Measurements", len(market_df))
+
+elif page == "Historical Trends":
+    trends_df = df[
+        df["asset_type"].isin(
+            ["stock", "crypto"]
+        )
+    ].copy()
+
+    if trends_df.empty:
+        st.info("No historical data available.")
+
+    else:
+        historical = trends_df.copy()
+        data_version = (
+            historical["timestamp"].max()
+        )
+
+        data_version = (
+            historical["timestamp"].max()
+        )
+
+        ranking_df = build_live_overview_cached(
+            historical,
+            data_version,
+        )        
+
+        if not ranking_df.empty:
+            ranked_assets = ranking_df["Ticker"].tolist()
+        else:
+            ranked_assets = sorted(
+                historical["ticker"]
+                .dropna()
+                .astype(str)
+                .unique()
+            )
+
+        available_assets = sorted(
+            historical["ticker"]
+            .dropna()
+            .astype(str)
+            .unique()
+        )
+
+        if not available_assets:
+            st.info("No assets available.")
+
+        else:
+            control_cols = st.columns(4)
+
+            #
+            # Current Simulation OPEN positions
+            #
+            open_position_tickers = []
+            open_buy_times = {}
+
+            try:
+                simulation_trades = (
+                    load_simulation_cached()
+                )
+
+                for trade in simulation_trades:
+                    if trade.get("SellTime"):
+                        continue
+
+                    ticker = str(
+                        trade.get("Ticker") or ""
+                    ).strip().upper()
+
+                    buy_time = pd.to_datetime(
+                        trade.get("BuyTime"),
+                        utc=True,
+                        errors="coerce",
+                    )
+
+                    if ticker:
+                        open_position_tickers.append(
+                            ticker
+                        )
+
+                        if pd.notna(buy_time):
+                            open_buy_times[
+                                ticker
+                            ] = buy_time
+
+                open_position_tickers = sorted(
+                    set(open_position_tickers)
+                )
+
+            except Exception as exc:
+                st.warning(
+                    "Cannot load Simulation OPEN positions: "
+                    f"{exc}"
+                )
+
+            asset_mode = control_cols[0].selectbox(
+                "Assets",
+                [
+                    "Single",
+                    "Top K",
+                    "OPEN positions",
+                    "All",
+                    "Custom",
+                ],
+            )
+
+            if asset_mode == "Single":
+                selected_assets = [
+                    st.selectbox(
+                        "Asset",
+                        ranked_assets,
+                    )
+                ]
+
+            elif asset_mode == "Top K":
+                k = st.number_input(
+                        "Number of tickers",
+                        min_value=1,
+                        max_value=len(ranked_assets),
+                        value=min(10, len(ranked_assets)),
+                        step=1,
+                )
+
+                selected_assets = ranked_assets[:int(k)]
+                st.caption(
+                    "Selected from the current Live Overview ranking: "
+                    + ", ".join(selected_assets)
+                )
+
+            elif asset_mode == "OPEN positions":
+                selected_assets = [
+                    ticker
+                    for ticker
+                    in open_position_tickers
+                    if ticker
+                    in available_assets
+                ]
+                if selected_assets:
+                    st.caption(
+                        "Current Simulation OPEN positions: "
+                        + ", ".join(
+                            selected_assets
+                        )
+                    )
+                else:
+                    st.info(
+                        "There are currently no OPEN "
+                        "Simulation positions with "
+                        "Historical Trends data."
+                    )
+
+            elif asset_mode == "All":
+                selected_assets = ranked_assets
+                st.caption(
+                    f"Selected all {len(selected_assets)} tracked assets."
+                )
+
+            else:
+                selected_assets = st.multiselect(
+                    "Assets",
+                    ranked_assets,
+                    default=ranked_assets[:5],
+                )
+
+            asset_df = (
+                historical[
+                    historical["ticker"].isin(selected_assets)
+                ]
+            #asset_df = (
+            #    historical[
+            #        historical["ticker"] == asset
+            #    ]
+                .sort_values(["timestamp", "id"])
+                .drop_duplicates(
+                    subset=["ticker", "timestamp"],
+                    keep="last",
+                )
+                .copy()
+            )
+
+            excluded_numeric = {
+                "id",
+                "sell_time_seconds",
+                "sell_time_over_seconds",
+                "eur_usd",
+            }
+
+            preferred_metrics = [
+                "close",
+                "open",
+                "high",
+                "low",
+                "vwap",
+                "volume",
+                "transactions",
+            ]
+
+            numeric_columns = [
+                column
+                for column in asset_df.select_dtypes(
+                    include="number"
+                ).columns
+                if column not in excluded_numeric
+            ]
+
+            metric_options = [
+                metric
+                for metric in preferred_metrics
+                if metric in numeric_columns
+            ]
+
+            metric_options += [
+                metric
+                for metric in numeric_columns
+                if metric not in metric_options
+            ]
+
+            if not metric_options:
+                st.info(
+                    "This asset has no numeric measurements "
+                    "available to chart."
+                )
+
+            else:
+                default_metric_index = (
+                    metric_options.index("close")
+                    if "close" in metric_options
+                    else 0
+                )
+
+                metric = control_cols[1].selectbox(
+                    "Metric",
+                    metric_options,
+                    index=default_metric_index,
+                )
+
+                range_label = control_cols[2].selectbox(
+                    "Range",
+                    [
+                        "2h",
+                        "6h",
+                        "12h",
+                        "24h",
+                        "48h",
+                        "7d",
+                        "All",
+                    ],
+                    index=3,
+                )
+
+                norm = control_cols[3].radio(
+                    "Norm",
+                    ["Relative", "Absolute"],
+                    horizontal=True,
+                )
+
+                range_map = {
+                    "2h": pd.Timedelta(hours=2),
+                    "6h": pd.Timedelta(hours=6),
+                    "12h": pd.Timedelta(hours=12),
+                    "24h": pd.Timedelta(hours=24),
+                    "48h": pd.Timedelta(hours=48, unit="h"),
+                    "7d": pd.Timedelta(days=7),
+                }
+
+                chart_columns = [
+                    "ticker",
+                    "timestamp",
+                    metric,
+                ]
+
+                if "eur_usd" in asset_df.columns:
+                    chart_columns.append("eur_usd")
+
+                chart_df = asset_df[
+                    chart_columns
+                ].copy()
+
+                chart_df[metric] = pd.to_numeric(
+                    chart_df[metric],
+                    errors="coerce",
+                )
+                if "eur_usd" in chart_df.columns:
+                    chart_df["eur_usd"] = pd.to_numeric(
+                        chart_df["eur_usd"],
+                        errors="coerce",
+                    )
+
+                chart_df = chart_df.dropna(
+                    subset=[metric]
+                )
+
+                if chart_df.empty:
+                    st.info(
+                        "No values available for the selected "
+                        "asset and metric."
+                    )
+
+                else:
+                    latest_time = chart_df[
+                        "timestamp"
+                    ].max()
+
+                    if range_label != "All":
+                        start_time = (
+                            latest_time
+                            - range_map[range_label]
+                        )
+
+                        chart_df = chart_df[
+                            chart_df["timestamp"]
+                            >= start_time
+                        ].copy()
+
+                    if chart_df.empty:
+                        st.info(
+                            "No measurements available in "
+                            "the selected range."
+                        )
+
+                    else:
+                        chart_df["Local Time"] = (
+                            chart_df["timestamp"]
+                            .dt.tz_convert(
+                                LOCAL_TIMEZONE
+                            )
+                        )
+
+                    y_column = metric
+                    y_label = metric
+
+                    price_metrics = {
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "vwap",
+                    }
+
+                    if (
+                        norm == "Absolute"
+                        and metric in price_metrics
+                        and "eur_usd" in chart_df.columns
+                    ):
+                        chart_df["Value EUR"] = (
+                            chart_df[metric]
+                            / chart_df["eur_usd"]
+                        )
+
+                        y_column = "Value EUR"
+                        y_label = f"{metric} (EUR)"
+
+                    elif norm == "Relative":
+                        chart_df["Relative %"] = (
+                            chart_df
+                            .groupby("ticker")[metric]
+                            .transform(
+                                lambda series:
+                                (
+                                    series / series.iloc[0] - 1
+                                ) * 100
+                                if len(series) > 0
+                                and pd.notna(series.iloc[0])
+                                and series.iloc[0] != 0
+                                else float("nan")
+                            )
+                        )
+
+                        y_column = "Relative %"
+                        y_label = f"{metric} change (%)"
+
+                    #
+                    # Load currently OPEN Simulation trades.
+                    # Their Historical Trends nodes at/after
+                    # BuyTime will be highlighted in green.
+                    #
+                    open_buy_times = {}
+
+                    try:
+                        simulation_rows = (
+                            load_simulation_cached()
+                        )
+
+                        simulation_df = pd.DataFrame(
+                            simulation_rows
+                        )
+                        simulation_trades = (
+                            load_simulation_cached()
+                        )
+                        for trade in simulation_trades:
+                            if trade.get("SellTime"):
+                                continue
+
+                            ticker = str(
+                                trade.get("Ticker")
+                                or ""
+                            ).strip().upper()
+
+                            buy_time = pd.to_datetime(
+                                trade.get("BuyTime"),
+                                utc=True,
+                                errors="coerce",
+                            )
+
+                            if (
+                                ticker
+                                and pd.notna(buy_time)
+                            ):
+                                open_buy_times[
+                                    ticker
+                                ] = buy_time
+
+                    except Exception as exc:
+                        st.warning(
+                            "Cannot load OPEN trades for "
+                            f"chart highlighting: {exc}"
+                        )
+
+                    figure = px.line(
+                        chart_df,
+                        x="Local Time",
+                        y=y_column,
+                        color="ticker",
+                        markers=True,
+                        title=(
+                            f"{metric} — " 
+                            f"{len(selected_assets)} asset(s) "
+                            f"({range_label}, {norm})"
+                        ),
+                    )
+                    #
+                    # Highlight observations belonging to
+                    # currently OPEN trades.
+                    #
+                    open_points_parts = []
+
+                    for ticker, buy_time in (
+                        open_buy_times.items()
+                    ):
+                        ticker_points = chart_df[
+                            (
+                                chart_df["ticker"]
+                                .astype(str)
+                                .str.upper()
+                                == ticker
+                            )
+                            & (
+                                chart_df["timestamp"]
+                                >= buy_time
+                            )
+                        ].copy()
+
+                        if not ticker_points.empty:
+                            open_points_parts.append(
+                                ticker_points
+                            )
+
+                    if open_points_parts:
+                        open_points = pd.concat(
+                            open_points_parts,
+                            ignore_index=True,
+                        )
+
+                        figure.add_scatter(
+                            x=open_points[
+                                "Local Time"
+                            ],
+                            y=open_points[
+                                y_column
+                            ],
+                            mode="markers",
+                            marker={
+                                "color": "green",
+                                "size": 9,
+                            },
+                            name="OPEN position",
+                            customdata=open_points[
+                                ["ticker"]
+                            ],
+                            hovertemplate=(
+                                "<b>%{customdata[0]}</b>"
+                                "<br>OPEN position"
+                                "<br>%{x}"
+                                "<br>%{y:.2f}"
+                                "<extra></extra>"
+                            ),
+                        )
+
+                    figure.update_layout(
+                        xaxis_title="Local time",
+                        yaxis_title=y_label,
+                        hovermode="x unified",
+                    )
+
+                    st.plotly_chart(
+                        figure,
+                        use_container_width=True,
+                    )
+
+                    first_time = chart_df[
+                        "Local Time"
+                    ].iloc[0]
+
+                    last_time = chart_df[
+                        "Local Time"
+                    ].iloc[-1]
+
+                    info_cols = st.columns(3)
+
+                    info_cols[0].metric(
+                        "Points",
+                        len(chart_df),
+                    )
+
+                    info_cols[1].metric(
+                        "From",
+                        first_time.strftime(
+                            "%d.%m %H:%M"
+                        ),
+                    )
+
+                    info_cols[2].metric(
+                        "To",
+                        last_time.strftime(
+                            "%d.%m %H:%M"
+                        ),
+                    )
+
+elif page == "Simulation":
+    st.subheader("Simulation")
+
+    st.caption(
+        "BUY/SELL results proposed by the system and sent to Telegram. "
+        "Open BUY signals remain visible until a corresponding SELL is recorded."
+    )
+
+    try:
+        simulation_rows = load_simulation_cached()
+    except Exception as exc:
+        st.error(
+            f"Cannot load simulation data: {exc}"
+        )
+    else:
+        simulation_df = pd.DataFrame(
+            simulation_rows
+        )
+        if simulation_df.empty:
+            st.info(
+                "No BUY/SELL simulation records "
+                "are available yet."
+            )
+
+        else:
+            #
+            # Normalize timestamps.
+            #
+            simulation_df["BuyTime"] = pd.to_datetime(
+                simulation_df["BuyTime"],
+                utc=True,
+                errors="coerce",
+            )
+
+            simulation_df["SellTime"] = pd.to_datetime(
+                simulation_df["SellTime"],
+                utc=True,
+                errors="coerce",
+            )
+
+            simulation_df = add_market_data_count(
+                simulation_df,
+                df,
+            )
+
+            #
+            # Numeric columns.
+            #
+            for column in [
+                "BuyPriceEUR",
+                "SellPriceEUR",
+                "RelativeDifference",
+            ]:
+                if column in simulation_df.columns:
+                    simulation_df[column] = (
+                        pd.to_numeric(
+                            simulation_df[column],
+                            errors="coerce",
+                        )
+                    )
+
+            #
+            # Correct known incomplete ticker names.
+            #
+            ticker_name_overrides = {
+                "COIN": "Coinbase",
+            }
+
+            if "TickerName" in simulation_df.columns:
+                simulation_df["TickerName"] = (
+                    simulation_df.apply(
+                        lambda row:
+                        ticker_name_overrides.get(
+                            row["Ticker"],
+                            row["TickerName"],
+                        )
+                        if (
+                            pd.isna(row["TickerName"])
+                            or str(row["TickerName"]).strip()
+                            == str(row["Ticker"]).strip()
+                        )
+                        else row["TickerName"],
+                        axis=1,
+                    )
+                )
+
+            #
+            # Use exactly the same idea as Live Overview
+            # to determine the newest current market-data
+            # timestamp.
+            #
+            reference_time = pd.Timestamp.now(
+                tz="UTC"
+            )
+
+            current_price_map = {}
+            decision_maps = {}
+
+            if not df.empty:
+                newest_received = (
+                    df["received_at"].max()
+                )
+
+                active_cutoff = (
+                    newest_received
+                    - pd.Timedelta(minutes=30)
+                )
+
+                latest_received = (
+                    df.groupby("ticker")[
+                        "received_at"
+                    ]
+                    .max()
+                )
+
+                active_tickers = (
+                    latest_received[
+                        latest_received
+                        >= active_cutoff
+                    ].index
+                )
+
+                active_df = df[
+                    df["ticker"].isin(
+                        active_tickers
+                    )
+                ].copy()
+
+                if not active_df.empty:
+                    reference_time = (
+                        active_df[
+                            "timestamp"
+                        ].max()
+                    )
+
+                    live_now = (
+                        build_live_overview(
+                            active_df
+                        )
+                    )
+
+                    if not live_now.empty:
+                        current_price_map = (
+                            live_now
+                            .dropna(
+                                subset=["Ticker"]
+                            )
+                            .drop_duplicates(
+                                subset=["Ticker"],
+                                keep="first",
+                            )
+                            .set_index("Ticker")[
+                                "Price"
+                            ]
+                            .to_dict()
+                        )
+                        live_index = (
+                            live_now
+                            .dropna(subset=["Ticker"])
+                            .drop_duplicates(subset=["Ticker"], keep="first")
+                            .set_index("Ticker")
+                        )
+                        for decision_column in [
+                            "CanBuy",
+                            "BuyInfo",
+                            "ShouldSell",
+                            "CanSellNow",
+                            "BoughtBefore",
+                            "SellTiming",
+                            "SellInfo",
+                        ]:
+                            if decision_column in live_index.columns:
+                                decision_maps[decision_column] = live_index[decision_column].to_dict()
+
+
+            #
+            # Period selector.
+            #
+            period = st.selectbox(
+                "Period",
+                [
+                    "Day",
+                    "Week",
+                    "Month",
+                    "Year",
+                    "All",
+                ],
+                index=4,
+            )
+
+            period_delta = {
+                "Day": pd.Timedelta(days=1),
+                "Week": pd.Timedelta(days=7),
+                "Month": pd.Timedelta(days=30),
+                "Year": pd.Timedelta(days=365),
+                "All": None,
+            }[period]
+
+            if period_delta is None:
+                cutoff_time = None
+
+            else:
+                cutoff_time = (
+                    reference_time
+                    - period_delta
+                )
+
+            #
+            # Closed trades belong to a period according
+            # to SellTime.
+            #
+            closed_all = simulation_df[
+                simulation_df["Status"]
+                == "CLOSED"
+            ].copy()
+
+            if cutoff_time is None:
+                closed_period = (
+                    closed_all.copy()
+                )
+
+            else:
+                closed_period = closed_all[
+                    (
+                        closed_all[
+                            "SellTime"
+                        ] >= cutoff_time
+                    )
+                    & (
+                        closed_all[
+                            "SellTime"
+                        ] <= reference_time
+                    )
+                ].copy()
+
+            #
+            # Open trades belong to a period according
+            # to BuyTime.
+            #
+            open_all = simulation_df[
+                simulation_df["Status"]
+                == "OPEN"
+            ].copy()
+
+            if cutoff_time is None:
+                open_period = (
+                    open_all.copy()
+                )
+
+            else:
+                open_period = open_all[
+                    (
+                        open_all[
+                            "BuyTime"
+                        ] >= cutoff_time
+                    )
+                    & (
+                        open_all[
+                            "BuyTime"
+                        ] <= reference_time
+                    )
+                ].copy()
+
+            #
+            # Summary statistics.
+            #
+            closed_count = len(
+                closed_period
+            )
+
+            open_count = len(
+                open_period
+            )
+
+            wins = (
+                int(
+                    (
+                        closed_period[
+                            "RelativeDifference"
+                        ] > 0
+                    ).sum()
+                )
+                if closed_count
+                else 0
+            )
+
+            win_rate = (
+                wins
+                / closed_count
+                * 100.0
+                if closed_count
+                else 0.0
+            )
+
+            avg_return = (
+                closed_period[
+                    "RelativeDifference"
+                ].mean()
+                if closed_count
+                else 0.0
+            )
+
+            cols = st.columns(4)
+
+            cols[0].metric(
+                "Closed trades",
+                closed_count,
+            )
+
+            cols[1].metric(
+                "Open trades",
+                open_count,
+            )
+
+            cols[2].metric(
+                "Win rate",
+                f"{win_rate:.1f}%",
+            )
+
+            cols[3].metric(
+                "Average return",
+                f"{avg_return:+.2f}%",
+            )
+            reference_local = (
+                reference_time.tz_convert(
+                    LOCAL_TIMEZONE
+                )
+            )
+
+            st.caption(
+                "Win rate = percentage of closed "
+                "trades with a positive RelDiff. "
+                "Average return = arithmetic mean "
+                "of RelDiff for closed trades. "
+                f"Period reference: "
+                f"{reference_local.strftime('%Y-%m-%d %H:%M %Z')}."
+            )
+
+            #
+            # Apply period to table as well.
+            #
+            shown = pd.concat(
+                [
+                    closed_period,
+                    open_period,
+                ],
+                ignore_index=True,
+            )
+
+            #
+            # User filters.
+            #
+            ticker_options = (
+                ["All"]
+                + sorted(
+                    shown["Ticker"]
+                    .dropna()
+                    .unique()
+                    .tolist()
+                )
+            )
+
+            selected_ticker = st.selectbox(
+                "Ticker",
+                ticker_options,
+            )
+
+            status_filter = st.multiselect(
+                "Status",
+                [
+                    "OPEN",
+                    "CLOSED",
+                ],
+                default=[
+                    "OPEN",
+                    "CLOSED",
+                ],
+            )
+
+            if selected_ticker != "All":
+                shown = shown[
+                    shown["Ticker"]
+                    == selected_ticker
+                ]
+
+            if status_filter:
+                shown = shown[
+                    shown["Status"].isin(
+                        status_filter
+                    )
+                ]
+
+            else:
+                shown = shown.iloc[0:0]
+
+            #
+            # Current EUR price from Live Overview.
+            #
+            shown = shown.copy()
+
+            for decision_column, mapping in decision_maps.items():
+                shown[decision_column] = shown["Ticker"].map(mapping)
+            if "BoughtBefore" in shown.columns:
+                shown["BoughtBefore"] = shown["BoughtBefore"].map(format_local_timestamp)
+
+            shown["CurrPriceEUR"] = (
+                shown["Ticker"].map(
+                    current_price_map
+                )
+            )
+            shown["CurrRelDiff"] = pd.NA
+
+            buy_price_eur_numeric = pd.to_numeric(
+                shown["BuyPriceEUR"],
+                errors="coerce",
+            )
+
+            current_price_eur_numeric = pd.to_numeric(
+                shown["CurrPriceEUR"],
+                errors="coerce",
+            )
+
+            valid_prices = (
+                buy_price_eur_numeric.notna()
+                & current_price_eur_numeric.notna()
+                & (buy_price_eur_numeric > 0)
+            )
+
+            shown.loc[
+                valid_prices,
+                "CurrRelDiff",
+            ] = (
+                (
+                    current_price_eur_numeric[
+                        valid_prices
+                    ]
+                    /
+                    buy_price_eur_numeric[
+                        valid_prices
+                    ]
+                )
+                - 1.0
+            ) * 100.0
+
+
+            #
+            # Display column names.
+            #
+            shown["RelDiff"] = (
+                shown[
+                    "RelativeDifference"
+                ]
+            )
+
+            #
+            # Local CEST/CET timestamps.
+            #
+            shown["BuyTime"] = (
+                shown["BuyTime"]
+                .dt.tz_convert(
+                    LOCAL_TIMEZONE
+                )
+                .dt.strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            )
+
+            shown["SellTime"] = (
+                shown["SellTime"]
+                .dt.tz_convert(
+                    LOCAL_TIMEZONE
+                )
+                .dt.strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            )
+
+            shown["SellTime"] = (
+                shown["SellTime"]
+                .fillna("—")
+            )
+
+            #
+            # Human-readable formatting.
+            #
+            shown["RelDiff"] = (
+                shown["RelDiff"].map(
+                    lambda value:
+                    f"{float(value):+.2f}%"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+
+            shown["BuyPrice"] = (
+                shown["BuyPrice"].map(
+                    lambda value:
+                    f"{float(value):,.2f}"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+
+            shown["SellPrice"] = (
+                shown["SellPrice"].map(
+                    lambda value:
+                    f"{float(value):,.2f}"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+
+            shown["CurrPriceEUR"] = (
+                shown["CurrPriceEUR"].map(
+                    lambda value:
+                    f"{float(value):,.2f}"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+            shown["CurrRelDiff"] = (
+                shown["CurrRelDiff"].map(
+                    lambda value:
+                    f"{float(value):+.2f}%"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+
+            for column, default_value in {
+                "CanBuy": False,
+                "ShouldSell": False,
+                "CanSellNow": False,
+                "BoughtBefore": "—",
+                "SellTiming": "—",
+            }.items():
+                if column not in shown.columns:
+                    shown[column] = default_value
+
+            required_columns = [
+                "Ticker",
+                "TickerName",
+                "BuyTime",
+                "MarketData",
+                "BuyPriceEUR",
+                "CloseB>0",
+                "CloseB>2",
+                "SellTime",
+                "SellPriceEUR",
+                "RelDiff",
+                "CurrPriceEUR",
+                "CurrRelDiff",
+                "Status",
+            ]
+
+            display = shown[
+                required_columns
+            ].copy()
+
+            display = display.sort_values(
+                by="BuyTime",
+                ascending=False,
+            )
+
+            display = display.rename(
+                columns={
+                    "BuyTime": "SimBuyTime",
+                    "SellTime": "SimSellIime",
+                    "RelDiff": "PriceDiff",
+                    "CurrRelDiff": "CurrPriceDiff",
+                    "Status": "SimStatus",
+                }
+            )
+
+            st.dataframe(
+                display,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(
+                "SellReason: "
+                "Rule1 = after at least 48 hours, SELL if all observed prices "
+                "during the first 48 hours after BuyTime remained within ±1% "
+                "of BuyPrice; "
+                "Rule2 = SELL if CurrentPrice is at least 2% below BuyPrice; "
+                "Rule3 = SELL if CurrentPrice is at least 2% below the highest "
+                "previously observed price after BuyTime; "
+                "multiple rules may appear together, e.g. Rule2+Rule3. "
+                "CloseB>0 = number of Live Overview tickers with CloseB > 0% "
+                "at BuyTime; "
+                "CloseB>2 = number of Live Overview tickers with CloseB > 2% "
+                "at BuyTime."
+            )
+            st.caption(
+                "Rule4 = BUY US-tickers after 14:00 and German-tickers after 12:00;"
+                "Rule5 = SELL US-tickers before 21:30 and German-tickers before 17:30."
+            )
+
+            st.caption(
+                "LegacyRule1 = historical SELL created under the previous "
+                "Rule1 definition; under the current strategy no "
+                "Rule1/Rule2/Rule3 condition existed at that SellTime. "
+            )
+
+elif page == "Trade Analysis":
+    st.header("Trade Analysis")
+
+    range_label = st.selectbox(
+        "Range",
+        [
+            "7 days",
+            "12 hours",
+            "6 hours",
+            "2 hours",
+        ],
+        index=0,
+    )
+
+    range_map = {
+        "7 days": pd.Timedelta(days=7),
+        "12 hours": pd.Timedelta(hours=12),
+        "6 hours": pd.Timedelta(hours=6),
+        "2 hours": pd.Timedelta(hours=2),
+    }
+
+    st.caption(
+        f"Selected period: {range_label}. "
+        "Each node represents a 15-minute timepoint. "
+        f"CloseB ≥ {BUY_MIN_CLOSEB_PERCENT:g}% shows the number of market tickers whose "
+        f"price was at least {BUY_MIN_CLOSEB_PERCENT:g}% above its approximately 2-hour "
+        "baseline. OPEN shows the number of Simulation tickers "
+        "that were open at that time. OPEN nodes are omitted "
+        "when no market data exists for that timepoint."
+    )
+
+    market_df = df[
+        df["asset_type"].isin(
+            ["stock", "crypto"]
+        )
+    ].copy()
+
+    reference_time = (
+        pd.to_datetime(
+            market_df["timestamp"],
+            utc=True,
+        ).max()
+    )
+
+    try:
+        simulation_rows = load_simulation_cached()
+    except Exception as exc:
+        st.error(
+            f"Cannot load simulation data: {exc}"
+        )
+
+    else:
+        simulation_df = pd.DataFrame(
+            simulation_rows
+        )
+
+        if simulation_df.empty:
+            st.info(
+                "No BUY/SELL simulation records "
+                "are available yet."
+            )
+
+        else:
+            full_analysis_df = (
+                build_trade_analysis_cached(
+                    df,
+                    simulation_df,
+                    reference_time,
+                )
+            )
+
+            analysis_start = (
+                reference_time
+                - range_map[range_label]
+            )
+
+            analysis_df = full_analysis_df[
+                pd.to_datetime(
+                    full_analysis_df["Time"],
+                    utc=True,
+                )
+                >= analysis_start
+            ].copy()
+
+            if analysis_df.empty:
+                st.info(
+                    "No Trade Analysis data available."
+                )
+
+            else:
+                analysis_df["TimeLocal"] = (
+                    pd.to_datetime(
+                        analysis_df["Time"],
+                        utc=True,
+                    )
+                    .dt.tz_convert(
+                        LOCAL_TIMEZONE
+                    )
+                )
+
+                base = alt.Chart(
+                    analysis_df
+                ).encode(
+                    x=alt.X(
+                        "TimeLocal:T",
+                        title="Time",
+                    ),
+                    y=alt.Y(
+                        "Count:Q",
+                        title="Number of tickers",
+                        scale=alt.Scale(
+                            zero=True,
+                        ),
+                    ),
+                    color=alt.Color(
+                        "Series:N",
+                        title="",
+                    ),
+                )
+
+                lines = base.mark_line()
+
+                points = base.mark_circle(
+                    size=55,
+                ).encode(
+                    tooltip=[
+                        alt.Tooltip(
+                            "TimeLocal:T",
+                            title="Time",
+                            format=(
+                                "%Y-%m-%d %H:%M"
+                            ),
+                        ),
+                        alt.Tooltip(
+                            "Series:N",
+                            title="Series",
+                        ),
+                        alt.Tooltip(
+                            "Count:Q",
+                            title="Count",
+                        ),
+                        alt.Tooltip(
+                            "Tickers:N",
+                            title="Tickers",
+                        ),
+                    ]
+                )
+
+                chart = (
+                    lines
+                    + points
+                ).properties(
+                    height=500,
+                ).interactive()
+
+                st.altair_chart(
+                    chart,
+                    use_container_width=True,
+                )
+
+elif page == "System Health":
+    if df.empty:
+        st.warning(
+            "No systems have reported data."
+        )
+
+    else:
+        now = pd.Timestamp.now(
+            tz="UTC"
+        )
+
+        latest = (
+            df.groupby("system")
+            .agg(
+                last_market_time=(
+                    "timestamp",
+                    "max",
+                ),
+                last_received_time=(
+                    "received_at",
+                    "max",
+                ),
+            )
+            .reset_index()
+        )
+
+        latest[
+            "collector_age_minutes"
+        ] = (
+            (
+                now
+                - latest[
+                    "last_received_time"
+                ]
+            )
+            .dt.total_seconds()
+            / 60
+        )
+
+        latest[
+            "market_age_minutes"
+        ] = (
+            (
+                now
+                - latest[
+                    "last_market_time"
+                ]
+            )
+            .dt.total_seconds()
+            / 60
+        )
+
+        def health_status(age):
+            if pd.isna(age):
+                return "UNKNOWN"
+
+            if age <= 30:
+                return "OK"
+
+            if age <= 120:
+                return "STALE"
+
+            return "OFFLINE"
+
+        latest[
+            "CollectorStatus"
+        ] = (
+            latest[
+                "collector_age_minutes"
+            ]
+            .apply(
+                health_status
+            )
+        )
+
+        latest[
+            "MarketStatus"
+        ] = (
+            latest[
+                "market_age_minutes"
+            ]
+            .apply(
+                health_status
+            )
+        )
+
+        latest[
+            "LastReceived"
+        ] = (
+            latest[
+                "last_received_time"
+            ]
+            .dt.tz_convert(
+                LOCAL_TIMEZONE
+            )
+            .dt.strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        )
+
+        latest[
+            "LastMarketData"
+        ] = (
+            latest[
+                "last_market_time"
+            ]
+            .dt.tz_convert(
+                LOCAL_TIMEZONE
+            )
+            .dt.strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        )
+        active_system_cutoff = (
+            now - pd.Timedelta(hours=24)
+        )
+
+        latest = latest[
+            latest["last_received_time"]
+            >= active_system_cutoff
+        ].copy()
+
+        display_health = latest[
+            [
+                "system",
+                "CollectorStatus",
+                "MarketStatus",
+                "LastReceived",
+                "LastMarketData",
+            ]
+        ].copy()
+
+        st.dataframe(
+            display_health,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "CollectorStatus is based on when "
+            "the server last received a record. "
+            "MarketStatus is based on the timestamp "
+            "of the latest market observation. "
+            "If CollectorStatus is OK but MarketStatus "
+            "is STALE or OFFLINE, the collector and "
+            "network connection are working; check the "
+            "upstream market-data provider or the age "
+            "of the provider's latest bar."
+        )
+

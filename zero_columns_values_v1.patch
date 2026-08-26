@@ -1,0 +1,27 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,13 +1,15 @@
+                 advisor["Drop24h"] = advisor["_Drop24hRaw"].map(_zero_percent)
+                 movement_threshold = float(SELL_CONFIG.get("movement_percent", 1.1))
+-                advisor["DropInitTimeLatest"] = advisor["_DropInitTimeLatestRaw"].map(
+-                    lambda value: _zero_percent(value)
+-                    if pd.notna(value) and abs(float(value)) > movement_threshold
++                advisor["DropInitTimeLatest"] = advisor["_DropInitTimeLatestRaw"].map(_zero_percent)
++                advisor["Change24h"] = advisor["_Change24hRaw"].map(_zero_percent)
++                advisor["ChangeInitTimeLatest"] = advisor["_ChangeInitTimeLatestRaw"].map(_zero_percent)
++                advisor["WeakInitTimeLatest"] = advisor["_WeakInitTimeLatestRaw"].map(
++                    lambda value: f"{float(value):+.2f}%"
++                    if pd.notna(value)
+                     else "—"
+                 )
+-                advisor["Change24h"] = advisor["_Change24hRaw"].map(_zero_percent)
+-                advisor["ChangeInitTimeLatest"] = advisor["_ChangeInitTimeLatestRaw"].map(
+-                    lambda value: _zero_percent(value)
+-                    if pd.notna(value) and abs(float(value)) > movement_threshold
+-                    else "—"
+-                )
++                advisor["C2"] = bool(c2_group_count >= BUY_MIN_CLOSEB_COUNT)
++                for bool_column in ["C4", "C5", "C6"]:
++                    if bool_column not in advisor.columns:
++                        advisor[bool_column] = False
++                    advisor[bool_column] = advisor[bool_column].fillna(False).astype(bool)

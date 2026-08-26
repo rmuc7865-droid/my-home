@@ -1,0 +1,205 @@
+--- a/dashboard/streamlit_app.py
++++ b/dashboard/streamlit_app.py
+@@ -5702,6 +5702,181 @@
+                 axis=1,
+             )
+ 
++            # Show the current trading-condition values used by Zero-Trading.
++            # C2/C4/C5 start with the live-overview evaluation. For currently
++            # OPEN simulated positions, C4/C5 are recalculated from the latest
++            # simulated BuyTime and C6 is evaluated with the same end-of-day
++            # rule used on the Zero-Trading page.
++            for condition in ["C2", "C4", "C5", "C6"]:
++                shown[condition] = False
++
++            if not live_now.empty and "Ticker" in live_now.columns:
++                condition_live = (
++                    live_now
++                    .dropna(subset=["Ticker"])
++                    .drop_duplicates(subset=["Ticker"], keep="first")
++                    .set_index("Ticker")
++                )
++                for condition in ["C2", "C4", "C5"]:
++                    if condition in condition_live.columns:
++                        condition_map = (
++                            condition_live[condition]
++                            .fillna(False)
++                            .astype(bool)
++                            .to_dict()
++                        )
++                        shown[condition] = shown["Ticker"].map(
++                            lambda ticker, values=condition_map:
++                            bool(values.get(ticker, False))
++                        )
++
++            sim_latest_trade_map = {}
++            if not latest_sim.empty and "Ticker" in latest_sim.columns:
++                sim_latest_trade_map = (
++                    latest_sim
++                    .dropna(subset=["Ticker"])
++                    .drop_duplicates(subset=["Ticker"], keep="last")
++                    .set_index("Ticker")
++                    .to_dict(orient="index")
++                )
++
++            sim_movement_threshold = float(
++                SELL_CONFIG.get("movement_percent", 1.1)
++            )
++            sim_c5_hours = float(SELL_CONFIG.get("c5_hours", 24.0))
++            sim_c6_min_gain_percent = float(
++                SELL_CONFIG.get("c6_min_gain_percent", 2.0)
++            )
++            sim_c6_close_minutes = float(
++                SELL_CONFIG.get("c6_close_minutes", 30.0)
++            )
++            sim_c6_enabled = bool(SELL_CONFIG.get("c6_enabled", True))
++
++            for idx, sim_row in shown.iterrows():
++                if str(sim_row.get("SimStatus") or "").strip().upper() != "OPEN":
++                    continue
++
++                ticker_value = str(sim_row.get("Ticker") or "").strip().upper()
++                init_time_latest = pd.to_datetime(
++                    sim_row.get("BuyTime"),
++                    utc=True,
++                    errors="coerce",
++                )
++                if pd.isna(init_time_latest):
++                    continue
++
++                ticker_history = (
++                    active_market_df[
++                        active_market_df["ticker"].astype(str).str.upper()
++                        == ticker_value
++                    ]
++                    .sort_values(["timestamp", "id"])
++                    .drop_duplicates(subset=["timestamp"], keep="last")
++                    .copy()
++                )
++                if ticker_history.empty:
++                    continue
++
++                latest_row = ticker_history.iloc[-1]
++                latest_time = pd.to_datetime(
++                    latest_row.get("timestamp"),
++                    utc=True,
++                    errors="coerce",
++                )
++                current_price = pd.to_numeric(
++                    latest_row.get("close"),
++                    errors="coerce",
++                )
++                if (
++                    pd.isna(latest_time)
++                    or pd.isna(current_price)
++                    or float(current_price) <= 0
++                ):
++                    continue
++
++                decision = evaluate_sell_history(
++                    ticker_df=ticker_history,
++                    latest_time=latest_time,
++                    current_price=float(current_price),
++                    movement_percent=sim_movement_threshold,
++                    c5_hours=sim_c5_hours,
++                    init_time=init_time_latest,
++                )
++                shown.at[idx, "C4"] = bool(decision.c4_satisfied)
++                shown.at[idx, "C5"] = bool(decision.c5_satisfied)
++
++                open_trade = sim_latest_trade_map.get(ticker_value, {})
++                c6_reference_price = pd.to_numeric(
++                    open_trade.get("BuyPrice"),
++                    errors="coerce",
++                )
++                if pd.isna(c6_reference_price):
++                    c6_reference_price = pd.to_numeric(
++                        open_trade.get("InitPrice"),
++                        errors="coerce",
++                    )
++
++                c6_gain_percent = None
++                if (
++                    pd.notna(c6_reference_price)
++                    and float(c6_reference_price) > 0
++                ):
++                    c6_gain_percent = (
++                        float(current_price) / float(c6_reference_price) - 1.0
++                    ) * 100.0
++
++                market_region = market_region_for_ticker(
++                    ticker_value,
++                    latest_row.get("asset_type"),
++                )
++                market_config = (
++                    TRADING_WINDOWS.get(market_region)
++                    if market_region
++                    else None
++                )
++                sell_window = None
++                c6_remaining_minutes = None
++                if market_config:
++                    action_time = pd.Timestamp.now(tz="UTC")
++                    sell_window = trading_window_info(
++                        action_time,
++                        market_config,
++                        "sell",
++                    )
++                    regular_close_value = market_config.get("regular_close")
++                    if sell_window.is_open and regular_close_value:
++                        try:
++                            market_timezone = str(
++                                market_config.get("timezone") or "UTC"
++                            )
++                            action_local = action_time.tz_convert(market_timezone)
++                            regular_close_local = pd.Timestamp(
++                                f"{action_local.date()} {regular_close_value}",
++                                tz=market_timezone,
++                            )
++                            c6_remaining_minutes = (
++                                regular_close_local - action_local
++                            ).total_seconds() / 60.0
++                        except Exception:
++                            c6_remaining_minutes = None
++
++                shown.at[idx, "C6"] = bool(
++                    sim_c6_enabled
++                    and not decision.c4_satisfied
++                    and not decision.c5_satisfied
++                    and sell_window is not None
++                    and sell_window.is_open
++                    and c6_remaining_minutes is not None
++                    and 0.0 <= c6_remaining_minutes <= sim_c6_close_minutes
++                    and c6_gain_percent is not None
++                    and c6_gain_percent < sim_c6_min_gain_percent
++                )
++
++            for condition in ["C2", "C4", "C5", "C6"]:
++                shown[condition] = shown[condition].map(
++                    lambda value: bool(value) if pd.notna(value) else False
++                )
++
+             shown["DiffSellPriceRaw"] = pd.to_numeric(
+                 shown["RelativeDifference"],
+                 errors="coerce",
+@@ -5820,6 +5995,10 @@
+                     "Ticker",
+                     "TickerName",
+                     "Reason",
++                    "C2",
++                    "C4",
++                    "C5",
++                    "C6",
+                     "InitTime",
+                     "InitPrice",
+                     "SellTimeDisplay",
+@@ -5901,7 +6080,8 @@
+                 "or NO TRADE. Reason gives a maximum-three-word explanation of the "
+                 "transition: OPEN uses 'Buy signal' because the simulator currently "
+                 "does not persist a separate BuyReason; CLOSED uses the stored "
+-                "SellReason (C4 = Price drop, C5 = Price static, C4+C5 = Drop + static). "
++                "SellReason. C2, C4, C5, and C6 show the current condition values "
++                "used for the Zero-Trading decision. "
+                 "InitTime and InitPrice are the latest simulated BUY time and EUR price. "
+                 "SellTime and SellPrice are populated when the latest simulated trade "
+                 "has been sold."

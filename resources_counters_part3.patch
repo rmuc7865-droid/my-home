@@ -1,0 +1,33 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,7 +1,27 @@
+                 st.caption(
+-                    "Counter definitions: CloseB >= 2% and CloseB >= 1% count tickers whose "
++                    "Counter definitions: Close2h >= 2% and CloseB >= 1% count tickers whose "
+                     "market price is at least that percentage above the approximately two-hour "
+                     "baseline. OPEN counts simulator positions active at the timepoint. "
+-                    "OPEN & Profit counts OPEN positions with market price > InitPrice. BUY and "
+-                    "SELL count simulator buy/sell actions occurring at the timepoint."
++                    "OPEN & Profit counts OPEN positions with market price > InitPrice; "
++                    "OPEN & Loss counts the remaining OPEN positions. "
++                    "CLOSED & Close2h>=2% counts CLOSED simulator tickers with Close2h >= 2%. "
++                    "BUY and SELL count simulator buy/sell actions occurring at the timepoint."
+                 )
++
++                st.subheader(
++                    "Steps to analyse the effectiveness of this system"
++                )
++                st.markdown(
++                    "1. Select **OPEN & Loss** and **SELL**. Is the number of OPEN tickers "
++                    "with loss high? If yes, decrease **MinProfit** in the Settings page.\n"
++                    "2. Select **OPEN** and **OPEN & Profit**. Does the number of OPEN tickers "
++                    "vary strongly through time? If yes, decrease **Maximum OPEN tickers** "
++                    "in the Settings page.\n"
++                    "3. Select **OPEN** and **OPEN & Profit**. Is the number of OPEN tickers "
++                    "with profit much smaller than the number of OPEN tickers? If yes, "
++                    "decrease the **movement threshold** in the Settings page.\n"
++                    "4. Select **CLOSED & Close2h>=2%** and **BUY**. Is the number of bought "
++                    "tickers much smaller than the number of CLOSED tickers with "
++                    "Close2h >= 2%? If yes, decrease the **CloseB threshold** in the "
++                    "Settings page."
++                )

@@ -1,0 +1,39 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,11 +1,26 @@
+-                    if action == "Sell":
+-                        for display_column, raw_column in [
+-                            ("Drop24h", "_Drop24hRaw"),
+-                            ("DropInitTimeLatest", "_DropInitTimeLatestRaw"),
+-                            ("Change24h", "_Change24hRaw"),
+-                            ("ChangeInitTimeLatest", "_ChangeInitTimeLatestRaw"),
+-                        ]:
+-                            numeric = pd.to_numeric(raw.get(raw_column), errors="coerce")
+-                            if pd.notna(numeric) and float(numeric) > 2.0:
+-                                bold(display_column)
++                    for display_column, raw_column in [
++                        ("Drop24h", "_Drop24hRaw"),
++                        ("DropInitTimeLatest", "_DropInitTimeLatestRaw"),
++                    ]:
++                        numeric = pd.to_numeric(raw.get(raw_column), errors="coerce")
++                        if pd.notna(numeric) and float(numeric) > movement_threshold:
++                            bold(display_column)
++
++                    for display_column, raw_column in [
++                        ("Change24h", "_Change24hRaw"),
++                        ("ChangeInitTimeLatest", "_ChangeInitTimeLatestRaw"),
++                    ]:
++                        numeric = pd.to_numeric(raw.get(raw_column), errors="coerce")
++                        if pd.notna(numeric) and float(numeric) < movement_threshold:
++                            bold(display_column)
++
++                    weak_init_value = pd.to_numeric(
++                        raw.get("_WeakInitTimeLatestRaw"),
++                        errors="coerce",
++                    )
++                    if (
++                        pd.notna(weak_init_value)
++                        and float(weak_init_value) < c6_min_gain_percent
++                    ):
++                        bold("WeakInitTimeLatest")
+                     return styles

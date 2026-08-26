@@ -1,0 +1,59 @@
+--- a/dashboard/streamlit_app.py
++++ b/dashboard/streamlit_app.py
+@@ -1668,8 +1668,17 @@
+         closeb_ge2_count = int(
+             (pd.to_numeric(result["CloseB"], errors="coerce") >= BUY_MIN_CLOSEB_PERCENT).sum()
+         )
+-        c2_satisfied = closeb_ge2_count >= BUY_MIN_CLOSEB_COUNT
++        c2_breadth_satisfied = closeb_ge2_count >= BUY_MIN_CLOSEB_COUNT
+         for index, current in result.iterrows():
++            current_closeb = pd.to_numeric(
++                current.get("CloseB"),
++                errors="coerce",
++            )
++            c2_satisfied = bool(
++                c2_breadth_satisfied
++                and pd.notna(current_closeb)
++                and float(current_closeb) >= BUY_MIN_CLOSEB_PERCENT
++            )
+             market_region = current.get("MarketRegion")
+             market_config = TRADING_WINDOWS.get(market_region) if market_region else None
+             c1_satisfied = False
+@@ -2326,7 +2335,9 @@
+                     if pd.notna(value)
+                     else "—"
+                 )
+-                advisor["C2"] = bool(c2_group_count >= BUY_MIN_CLOSEB_COUNT)
++                if "C2" not in advisor.columns:
++                    advisor["C2"] = False
++                advisor["C2"] = advisor["C2"].fillna(False).astype(bool)
+                 for bool_column in ["C4", "C5", "C6"]:
+                     if bool_column not in advisor.columns:
+                         advisor[bool_column] = False
+--- a/server/telegram_notifier.py
++++ b/server/telegram_notifier.py
+@@ -744,12 +744,14 @@
+         )
+         return
+ 
++    # C2 is a two-stage condition: the global breadth requirement must pass,
++    # and the individual ticker must itself meet the configured CloseB threshold.
+     matching = [
+         row
+         for row in highb_rows
+         if (
+             row.get("closeb") is not None
+-            and row["closeb"] > 0
++            and row["closeb"] >= minimum_closeb_percent
+         )
+     ]
+ 
+@@ -927,7 +929,7 @@
+ 
+     logger.info(
+         "BUY evaluation: total=%d "
+-        "CloseB>0=%d open_excluded=%d "
++        "C2_tickers=%d open_excluded=%d "
+         "eligible=%d trading_eligible=%d",
+         len(highb_rows),
+         len(matching),

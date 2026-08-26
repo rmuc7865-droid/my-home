@@ -1,0 +1,8 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,3 +1,5 @@
+             editable_sell["movement_percent"] = float(new_movement_percent)
+             editable_sell["c5_hours"] = float(new_c5_hours)
++            editable_sell["c6_min_gain_percent"] = float(new_c6_min_gain_percent)
++            editable_sell["details"] = bool(new_details)
+             for region, values in market_values.items():

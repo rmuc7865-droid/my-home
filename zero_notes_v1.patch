@@ -1,0 +1,27 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,8 +1,19 @@
+         st.caption(
+-            "Parameters: LastSelling is the estimated liquidity time to sell; LastTops is the current "
+-            "C2 ticker count and is '-' for Sell rows; LastClose2h is the approximately two-hour CloseB. "
++            "Parameters: C2 is the global BUY breadth condition; C4 is the drop-from-peak condition; "
++            "C5 is the static-price condition; C6 is the near-market-close weak-position exit. "
++            "LastSelling is the estimated liquidity time to sell; LastTops is the current C2 ticker "
++            "count and is '-' for Sell rows; LastClose2h is the approximately two-hour CloseB. "
+             "Drop24h and Change24h use LastCollect-24h through LastCollect. DropInitTimeLatest and "
+-            "ChangeInitTimeLatest use InitTimeLatest through LastCollect. Drop is the percentage fall "
+-            "from the highest price in the interval to LastPrice. Change is the maximum absolute "
+-            "percentage deviation from LastPrice within the interval."
++            "ChangeInitTimeLatest use the latest OPEN InitTime through LastCollect. "
++            f"Drop values are bold above the C4/C5 movement threshold "
++            f"({float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}%). "
++            f"Change values are bold below that threshold. WeakInitTimeLatest is the percentage "
++            f"gain from the price at InitTimeLatest to LastPrice and is bold below the C6 minimum "
++            f"gain ({float(SELL_CONFIG.get('c6_min_gain_percent', 2.0)):.2f}%)."
+         )
++
++        if bool(SELL_CONFIG.get("details", True)):
++            st.caption(
++                "Details is enabled: C4 Check, C5 Check and C6 Check show the inputs used by each "
++                "SELL condition. Disable Details in Settings to hide these three diagnostic columns."
++            )

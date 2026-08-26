@@ -1,0 +1,23 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,4 +1,5 @@
+                 zero_open_tickers = set()
++                zero_open_buy_times = {}
+                 for trade in zero_sim_rows:
+                     ticker_value = str(trade.get("Ticker") or trade.get("ticker") or "").strip().upper()
+                     status_value = str(trade.get("Status") or trade.get("status") or "").strip().upper()
+@@ -6,7 +7,14 @@
+                     is_open_trade = status_value == "OPEN" or (not status_value and not sell_time_value)
+                     if ticker_value and is_open_trade:
+                         zero_open_tickers.add(ticker_value)
++                        raw_buy_time = trade.get("BuyTime") if "BuyTime" in trade else trade.get("buy_time")
++                        parsed_buy_time = pd.to_datetime(raw_buy_time, utc=True, errors="coerce")
++                        if pd.notna(parsed_buy_time):
++                            previous = zero_open_buy_times.get(ticker_value)
++                            if previous is None or parsed_buy_time > previous:
++                                zero_open_buy_times[ticker_value] = parsed_buy_time
+                 zero_open_count = len(zero_open_tickers)
+             except Exception:
+                 zero_open_count = 0
+                 zero_open_tickers = set()
++                zero_open_buy_times = {}

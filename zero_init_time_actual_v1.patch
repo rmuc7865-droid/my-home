@@ -1,0 +1,15 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,5 +1,8 @@
+-                advisor["_InitTimeLatestRaw"] = (
+-                    pd.to_datetime(advisor["BoughtBefore"], utc=True, errors="coerce")
+-                    if "BoughtBefore" in advisor.columns
+-                    else pd.NaT
++                advisor["_InitTimeLatestRaw"] = advisor["Ticker"].astype(str).str.strip().str.upper().map(
++                    zero_open_buy_times
+                 )
++                advisor["_InitTimeLatestRaw"] = pd.to_datetime(
++                    advisor["_InitTimeLatestRaw"],
++                    utc=True,
++                    errors="coerce",
++                )

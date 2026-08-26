@@ -1,0 +1,13 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,9 +1,2 @@
+-                    weak_init_value = pd.to_numeric(
+-                        raw.get("_WeakInitTimeLatestRaw"),
+-                        errors="coerce",
+-                    )
+-                    if (
+-                        pd.notna(weak_init_value)
+-                        and float(weak_init_value) < c6_min_gain_percent
+-                    ):
++                    if bool(raw.get("C6", False)):
+                         bold("WeakInitTimeLatest")

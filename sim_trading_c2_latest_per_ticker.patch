@@ -1,0 +1,85 @@
+--- a/dashboard/streamlit_app.py
++++ b/dashboard/streamlit_app.py
+@@ -5714,8 +5714,11 @@
+             )
+ 
+             # Show the current trading-condition values used by Zero-Trading.
+-            # C2/C4/C5 start with the live-overview evaluation. For currently
+-            # OPEN simulated positions, C4/C5 are recalculated from the latest
++            # C2 is calculated explicitly from each ticker's latest available
++            # CloseB so a ticker does not become C2=False merely because its
++            # newest bar is older than the newest global market timestamp.
++            # C4/C5 start with the live-overview evaluation. For currently OPEN
++            # simulated positions, C4/C5 are recalculated from the latest
+             # simulated BuyTime and C6 is evaluated with the same end-of-day
+             # rule used on the Zero-Trading page.
+             for condition in ["C2", "C4", "C5", "C6"]:
+@@ -5725,10 +5728,46 @@
+                 condition_live = (
+                     live_now
+                     .dropna(subset=["Ticker"])
+-                    .drop_duplicates(subset=["Ticker"], keep="first")
+-                    .set_index("Ticker")
++                    .assign(
++                        _TickerKey=lambda frame: (
++                            frame["Ticker"]
++                            .astype(str)
++                            .str.strip()
++                            .str.upper()
++                        )
++                    )
++                    .drop_duplicates(subset=["_TickerKey"], keep="first")
++                    .set_index("_TickerKey")
+                 )
+-                for condition in ["C2", "C4", "C5"]:
++
++                # C2 is a two-stage condition:
++                # 1) market breadth must meet BUY_MIN_CLOSEB_COUNT; and
++                # 2) the individual ticker's latest CloseB must meet the
++                #    configured BUY_MIN_CLOSEB_PERCENT threshold.
++                if "CloseB" in condition_live.columns:
++                    latest_closeb = pd.to_numeric(
++                        condition_live["CloseB"],
++                        errors="coerce",
++                    )
++                    c2_qualifying_count = int(
++                        (latest_closeb >= BUY_MIN_CLOSEB_PERCENT).sum()
++                    )
++                    c2_breadth_satisfied = (
++                        c2_qualifying_count >= BUY_MIN_CLOSEB_COUNT
++                    )
++                    c2_map = (
++                        c2_breadth_satisfied
++                        & (latest_closeb >= BUY_MIN_CLOSEB_PERCENT)
++                    ).fillna(False).astype(bool).to_dict()
++                    shown["C2"] = (
++                        shown["Ticker"]
++                        .astype(str)
++                        .str.strip()
++                        .str.upper()
++                        .map(lambda ticker: bool(c2_map.get(ticker, False)))
++                    )
++
++                for condition in ["C4", "C5"]:
+                     if condition in condition_live.columns:
+                         condition_map = (
+                             condition_live[condition]
+@@ -5736,9 +5775,15 @@
+                             .astype(bool)
+                             .to_dict()
+                         )
+-                        shown[condition] = shown["Ticker"].map(
+-                            lambda ticker, values=condition_map:
+-                            bool(values.get(ticker, False))
++                        shown[condition] = (
++                            shown["Ticker"]
++                            .astype(str)
++                            .str.strip()
++                            .str.upper()
++                            .map(
++                                lambda ticker, values=condition_map:
++                                bool(values.get(ticker, False))
++                            )
+                         )
+ 
+             sim_latest_trade_map = {}

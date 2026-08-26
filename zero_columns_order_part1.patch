@@ -1,0 +1,21 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1,6 +1,16 @@
+                 requested_columns = [
+                     "Action",
+                     "Reason",
+-                    "C4Check",
+-                    "C5Check",
++                    "C2",
++                    "C4",
++                    "C5",
++                    "C6",
++                ]
++                if zero_details:
++                    requested_columns.extend([
++                        "C4Check",
++                        "C5Check",
++                        "C6Check",
++                    ])
++                requested_columns.extend([
+                     "Ticker",

@@ -1,0 +1,58 @@
+diff --git a/dashboard/streamlit_app.py b/dashboard/streamlit_app.py
+--- a/dashboard/streamlit_app.py
++++ b/dashboard/streamlit_app.py
+@@ -1,12 +1,8 @@
+                     use_container_width=True,
+                     hide_index=True,
+                     column_config={
+-                        "RecordsToday": st.column_config.NumberColumn(
+-                            "RecordsToday",
+-                            format="%d",
++                        "Records": st.column_config.NumberColumn(
++                            "Records", format="%d"
+                         ),
+-                        "C1": st.column_config.CheckboxColumn("C1"),
+-                        "C2": st.column_config.CheckboxColumn("C2"),
+-                        "C4": st.column_config.CheckboxColumn("C4"),
+-                        "C5": st.column_config.CheckboxColumn("C5"),
+                     },
+                 )
+@@ -1,7 +1,6 @@
+         st.caption(
+-            "Last Data shows only tickers for which the existing trading logic currently has "
+-            "CanBuy=True (the BUY/ShouldBuy decision) or ShouldSell=True. Rows are ordered by "
+-            "CloseB from highest to lowest. LastCollect is the timestamp of the latest market "
+-            "bar, while LastPrice is its estimated EUR price. RecordsToday counts unique market "
+-            "bars from 03:00 Europe/Berlin, which is the operating-day boundary for this view."
++            "Last Data uses the latest stored market bar for each ticker. LastCollect is the "
++            "bar time; LastPrice is the EUR value calculated from that exact bar's close and "
++            "EUR/USD reference rate. SellingTime stays unknown when that exact bar does not "
++            "contain a liquidity estimate."
+         )
+@@ -1,7 +1,6 @@
+         st.caption(
+-            "LastSellTime is the estimated time needed to sell a EUR 10,000 position using "
+-            "recent one-second market turnover and the configured participation assumption. "
+-            "DropPrice is the percentage fall from the peak selected by C4. ChangePrice is the "
+-            "maximum absolute percentage deviation from the current price over the configured "
+-            "C5 lookback window."
++            "Phase is derived from LastCollect and the market session: Pre-Trading, Opening, "
++            "Post-Trading or Closed. Records counts unique market bars from 03:00 Europe/Berlin. "
++            "WaitToTrade is zero during any trading phase; WaitToOpening is zero only during "
++            "Opening. Both waits respect configured open weekdays and closed dates."
+         )
+@@ -1,10 +1,8 @@
+         st.caption(
+-            "C1 checks whether the configured BUY trading window is open at the market-data time. "
+-            f"C2 is true when at least {BUY_MIN_CLOSEB_COUNT} active tickers have CloseB >= "
+-            f"{BUY_MIN_CLOSEB_PERCENT:g}%. C4 is true after a drop of more than "
+-            f"{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% from the sampled peak. "
+-            f"C5 is true after a full {float(SELL_CONFIG.get('c5_hours', 24.0)):g} hours when "
+-            f"every sampled price stays within +/-{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% "
+-            "of the current price. ShouldSell = C4 or C5."
++            f"DropDuration is the time since the most recent price more than "
++            f"{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% above LastPrice. "
++            f"StaticDuration is the time since the most recent price outside +/-"
++            f"{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% of LastPrice. "
++            "A dash means the required boundary sample does not exist in retained history."
+         )

@@ -1,0 +1,65 @@
+--- a/server/telegram_notifier.py
++++ b/server/telegram_notifier.py
+@@ -1490,7 +1490,9 @@
+         c6_reference_time = None
+         c6_reference_source = None
+ 
+-        reference_cutoff = latest_time - pd.Timedelta(hours=c6_reference_hours)
++        reference_cutoff = latest_time - pd.Timedelta(
++            hours=float(c6_reference_hours)
++        )
+         if buy_time >= reference_cutoff:
+             if pd.notna(buy_price) and float(buy_price) > 0:
+                 c6_reference_price = float(buy_price)
+@@ -1529,11 +1531,29 @@
+                 float(current_price) / c6_reference_price - 1.0
+             ) * 100.0
+ 
++        # C6 counts down to the end of the regular Opening phase, not to
++        # sell_end. sell_end remains the independent execution-safety cutoff.
+         c6_remaining_minutes = None
+-        if window.is_open and window.remaining_time is not None:
+-            c6_remaining_minutes = (
+-                pd.Timedelta(window.remaining_time).total_seconds() / 60.0
+-            )
++        regular_close_value = market_config.get("regular_close")
++        if window.is_open and regular_close_value:
++            try:
++                market_timezone = str(market_config.get("timezone") or "UTC")
++                action_local = action_time.tz_convert(market_timezone)
++                regular_close_time = parse_hhmm(str(regular_close_value))
++                regular_close_local = pd.Timestamp(
++                    datetime.combine(action_local.date(), regular_close_time),
++                    tz=ZoneInfo(market_timezone),
++                )
++                c6_remaining_minutes = (
++                    regular_close_local - action_local
++                ).total_seconds() / 60.0
++            except Exception:
++                logger.exception(
++                    "SELL %s C6: invalid regular_close=%r for market %s",
++                    ticker,
++                    regular_close_value,
++                    market_region,
++                )
+ 
+         c6_satisfied = bool(
+             c6_enabled
+--- a/server/telegram_notifications.yaml
++++ b/server/telegram_notifications.yaml
+@@ -14,6 +14,7 @@
+     - fri
+     closed_dates: []
+     timezone: America/New_York
++    regular_close: '16:00'
+     buy_start: 09:45
+     buy_end: '15:50'
+     sell_start: 09:35
+@@ -29,6 +30,7 @@
+     - fri
+     closed_dates: []
+     timezone: Europe/Berlin
++    regular_close: '17:30'
+     buy_start: 09:15
+     buy_end: '17:20'
+     sell_start: 09:05

@@ -1,0 +1,5 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -1 +1 @@
+-page = st.sidebar.radio("Page", ["Zero-Trading", "Last Data", "Historical Data", "Sim-Trading", "Resources", "System Health", "Alerts", "Settings", "Logs"])
++page = st.sidebar.radio("Page", ["Zero-Trading", "Last Data", "Historical Data", "Sim-Trading", "Trading Efficiency", "System Health", "Alerts", "Settings", "Logs"])

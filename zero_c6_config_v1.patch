@@ -1,0 +1,29 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -4,5 +4,26 @@
+             c5_hours = float(
+                 SELL_CONFIG.get("c5_hours", 24.0)
+             )
++            c6_min_gain_percent = float(
++                SELL_CONFIG.get("c6_min_gain_percent", 2.0)
++            )
++            c6_close_minutes = float(
++                SELL_CONFIG.get("c6_close_minutes", 30.0)
++            )
++            c6_reference_hours = float(
++                SELL_CONFIG.get("c6_reference_hours", 24.0)
++            )
++            c6_reference_tolerance_minutes = float(
++                SELL_CONFIG.get("c6_reference_tolerance_minutes", 30.0)
++            )
++            c6_enabled = bool(
++                SELL_CONFIG.get("c6_enabled", True)
++            )
++            zero_details = bool(
++                SELL_CONFIG.get("details", True)
++            )
++
++            advisor_live["C6"] = False
++            advisor_live["C6Check"] = "—"
+ 
+             for idx, row in advisor_live.iterrows():

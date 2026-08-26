@@ -1,0 +1,35 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -27,7 +27,31 @@
+                 ),
+             )
+ 
++        c6_col1, c6_col2 = st.columns(2)
++        with c6_col1:
++            new_c6_min_gain_percent = st.number_input(
++                "C6: minimum gain (%)",
++                min_value=-100.0,
++                max_value=1000.0,
++                value=float(editable_sell.get("c6_min_gain_percent", 2.0)),
++                step=0.1,
++                format="%.2f",
++                help=(
++                    "C6 may trigger near the regular market close when C4 and C5 are false "
++                    "and the gain versus the C6 reference price is below this percentage."
++                ),
++            )
++        with c6_col2:
++            new_details = st.checkbox(
++                "Details",
++                value=bool(editable_sell.get("details", True)),
++                help=(
++                    "Show C4 Check, C5 Check and C6 Check columns on Zero-Trading."
++                ),
++            )
++
+         st.caption(
+             "Parameter names: movement_percent = the percentage threshold shared by C4 and C5; "
+-            "c5_hours = the C5 static-price window length in hours."
++            "c5_hours = the C5 static-price window length; c6_min_gain_percent = the minimum "
++            "gain required by C6 near market close; Details controls the Zero-Trading check columns."
+         )

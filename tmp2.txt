@@ -24,7 +24,6 @@ sell:
   rule1_tolerance_minutes: 30
   rule2_max_data_age_minutes: 30
   c6_min_gain_percent: 2.0
-  c7_max_gain_percent: 5.0
   details: true
 trading_windows:
   US:
@@ -44,37 +43,3 @@ trading_windows:
     sell_end: '15:55'
     max_buy_sell_time_seconds: 120
   DE:
-    enabled: true
-    open_weekdays:
-    - mon
-    - tue
-    - wed
-    - thu
-    - fri
-    closed_dates: []
-    timezone: Europe/Berlin
-    regular_close: '17:30'
-    buy_start: 09:15
-    buy_end: '17:20'
-    sell_start: 09:05
-    sell_end: '17:25'
-    max_buy_sell_time_seconds: 120
-  CRYPTO:
-    enabled: true
-    open_weekdays:
-    - mon
-    - tue
-    - wed
-    - thu
-    - fri
-    - sat
-    - sun
-    closed_dates: []
-    timezone: UTC
-    buy_start: 00:00
-    buy_end: '23:59'
-    sell_start: 00:00
-    sell_end: '23:59'
-    max_buy_sell_time_seconds: null
-alerts:
-  enabled: true

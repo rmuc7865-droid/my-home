@@ -1,0 +1,81 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -4976,8 +4976,11 @@
+                 utc=True,
+                 errors="coerce",
+             )
+-            shown["DiffLastTime"] = (
++            shown["DiffLastTimeRaw"] = (
+                 shown["LastTimeRaw"] - shown["BuyTime"]
+-            ).map(format_elapsed)
++            )
++            shown["DiffLastTime"] = shown["DiffLastTimeRaw"].map(
++                format_elapsed
++            )
+ 
+             def format_local_time(value):
+@@ -5067,10 +5067,63 @@
+                 }
+             )
+ 
++            raw_lookup = shown[
++                [
++                    "SimStatus",
++                    "DiffLastPriceRaw",
++                    "DiffLastTimeRaw",
++                ]
++            ].loc[display.index].copy()
++
++            def _sim_trading_row_style(row):
++                raw = raw_lookup.loc[row.name]
++                styles = ["" for _ in row.index]
++                is_open = str(raw.get("SimStatus") or "").strip().upper() == "OPEN"
++
++                def bold(column):
++                    if column in row.index:
++                        styles[row.index.get_loc(column)] = "font-weight: 700;"
++
++                if is_open:
++                    bold("SimStatus")
++
++                    diff_last_price = pd.to_numeric(
++                        raw.get("DiffLastPriceRaw"),
++                        errors="coerce",
++                    )
++                    if (
++                        pd.notna(diff_last_price)
++                        and abs(float(diff_last_price)) >= 2.0
++                    ):
++                        bold("DiffLastPrice")
++
++                    diff_last_time = raw.get("DiffLastTimeRaw")
++                    if (
++                        pd.notna(diff_last_time)
++                        and diff_last_time >= pd.Timedelta(hours=48)
++                    ):
++                        bold("DiffLastTime")
++
++                return styles
++
++            styled_display = display.style.apply(
++                _sim_trading_row_style,
++                axis=1,
++            )
++
+             st.dataframe(
+-                display,
++                styled_display,
+                 use_container_width=True,
+                 hide_index=True,
+             )
+ 
++            st.subheader("Steps to analyse the simulator results")
++            st.markdown(
++                "1. Is **DiffLastPrice** very high or very low, or is "
++                "**DiffLastTime** very long?\n"
++                "2. If yes, review the ticker in the **Historical Data** and "
++                "**Last Data** pages to understand why the simulator has not "
++                "sold the ticker."
++            )
++
+             st.caption(

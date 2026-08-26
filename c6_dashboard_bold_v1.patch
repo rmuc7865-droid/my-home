@@ -1,0 +1,22 @@
+--- dashboard/streamlit_app.py
++++ dashboard/streamlit_app.py
+@@ -2440,6 +2440,7 @@
+                 raw_lookup = advisor[[
+                     "Action", "_WaitToTradeRaw", "_WaitToOpeningRaw", "_LastSellingRaw",
+                     "_LastClose2hRaw", "_Drop24hRaw", "_DropInitTimeLatestRaw",
+                     "_Change24hRaw", "_ChangeInitTimeLatestRaw",
+                     "_WeakInitTimeLatestRaw",
++                    "C6",
+                 ]].loc[display.index].copy()
+@@
+-                    weak_init_value = pd.to_numeric(
+-                        raw.get("_WeakInitTimeLatestRaw"),
+-                        errors="coerce",
+-                    )
+-                    if (
+-                        pd.notna(weak_init_value)
+-                        and float(weak_init_value) < c6_min_gain_percent
+-                    ):
++                    if bool(raw.get("C6", False)):
+                         bold("WeakInitTimeLatest")
+                     return styles
