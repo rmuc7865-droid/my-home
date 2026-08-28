@@ -3042,15 +3042,19 @@ if page == "Zero-Trading":
                     advisor.at[idx, "SimSellC7"] = bool(sell_conditions["C7"])
                     advisor.at[idx, "SimWaitToOpening"] = _zero_wait_is_zero(wait_opening)
 
-                # Keep current opportunities and/or tickers with an actual simulator
-                # transition in the current accounting day. This preserves current
-                # actionable rows while ensuring the table carries the day's latest
-                # simulator action at most once per ticker.
-                has_sim_action = advisor["Ticker"].astype(str).str.upper().isin(
-                    latest_event_by_ticker.keys()
-                )
+                # Keep current opportunities, tickers that are currently OPEN in
+                # Sim-Trading, and/or tickers with an actual simulator transition
+                # in the current accounting day. This keeps overnight OPEN positions
+                # visible in Zero-Trading even when they currently have neither a BUY
+                # nor a SELL signal.
+                ticker_keys = advisor["Ticker"].astype(str).str.strip().str.upper()
+                has_sim_action = ticker_keys.isin(latest_event_by_ticker.keys())
+                is_currently_open = ticker_keys.isin(zero_open_tickers)
                 advisor = advisor[
-                    advisor["ToSell"] | advisor["ToBuy"] | has_sim_action
+                    advisor["ToSell"]
+                    | advisor["ToBuy"]
+                    | has_sim_action
+                    | is_currently_open
                 ].copy()
 
                 buy_asset_count = 0
@@ -3058,8 +3062,8 @@ if page == "Zero-Trading":
 
                 if advisor.empty:
                     st.success(
-                        "No current Buy/Sell opportunities and no simulator actions "
-                        "in the active 03:00–03:00 accounting day."
+                        "No current Buy/Sell opportunities, currently OPEN simulator positions, "
+                        "or simulator actions in the active 03:00–03:00 accounting day."
                     )
                 else:
                     # Required ordering: ToSell, ToBuy, LastClose2h.
