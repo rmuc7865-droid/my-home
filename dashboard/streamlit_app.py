@@ -3052,6 +3052,9 @@ if page == "Zero-Trading":
                     advisor["ToSell"] | advisor["ToBuy"] | has_sim_action
                 ].copy()
 
+                buy_asset_count = 0
+                sell_asset_count = 0
+
                 if advisor.empty:
                     st.success(
                         "No current Buy/Sell opportunities and no simulator actions "
@@ -3166,6 +3169,12 @@ if page == "Zero-Trading":
                     buy_asset_count = int(display["ToBuy"].fillna(False).sum())
                     sell_asset_count = int(display["ToSell"].fillna(False).sum())
 
+                    st.dataframe(
+                        styled_display,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
                 newest_display = pd.to_datetime(
                     newest_market_data,
                     utc=True,
@@ -3180,12 +3189,6 @@ if page == "Zero-Trading":
                 )
 
                 render_zero_summary(buy_asset_count, sell_asset_count)
-
-                st.dataframe(
-                    styled_display,
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
         st.caption(
             "Zero-Trading shows at most one row per ticker. LastTime is the ticker's latest "
