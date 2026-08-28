@@ -4508,11 +4508,7 @@ elif page == "Settings":
 elif page == "Logs":
     st.header("Logs")
     logs_market_df = df[df["asset_type"].isin(["stock", "crypto"])].copy()
-    logs_summary_cols = st.columns(4)
-    logs_summary_cols[0].metric("Newest Data", format_newest_data(logs_market_df))
-    logs_summary_cols[1].metric("Assets", count_market_assets(logs_market_df))
-    logs_summary_cols[2].metric("Measurements", len(logs_market_df))
-    logs_summary_cols[3].metric("Alerts", count_open_alerts(alerts_df))
+    logs_summary_placeholder = st.empty()
 
     def _logs_left_table(frame: pd.DataFrame):
         """Left-align values and headers in Logs tables."""
@@ -4761,9 +4757,15 @@ elif page == "Logs":
             {
                 "Day": day_name,
                 "Date": "—",
-                "Buy Assets": 0,
-                "Sell Assets": 0,
+                "Bought Assets": 0,
+                "Sold Assets": 0,
+                "Max Open Assets": 0,
+                "Open Assets EOB": 0,
+                "Input": "€0",
+                "ProfitOnInput": "+0.00%",
                 "Profit": "€0.00",
+                "Loss": "€0.00",
+                "Result": "€0.00",
             }
             for day_name in day_names
         ]
@@ -5115,8 +5117,8 @@ elif page == "Logs":
             # Monday-Friday 03:00 -> 03:00 simulator accounting days.
             bought_assets = 0
             sold_assets = 0
-            profit_percent = 0.0
-            loss_percent = 0.0
+            profit_eur = 0.0
+            loss_eur = 0.0
 
             for week_day_offset in range(5):
                 accounting_day = (
@@ -5165,22 +5167,31 @@ elif page == "Logs":
                 )
                 sold_assets += int(sell_mask.sum())
 
+                sold_profit_eur = pd.to_numeric(
+                    sim_results.loc[
+                        sell_mask,
+                        "_LogsProfitEUR",
+                    ],
+                    errors="coerce",
+                )
                 sold_diff = pd.to_numeric(
                     sim_results.loc[
                         sell_mask,
-                        "RelativeDifference",
+                        "_LogsDiffSellPrice",
                     ],
                     errors="coerce",
-                ).dropna()
-
-                profit_percent += float(
-                    sold_diff[sold_diff > 0].sum()
-                )
-                loss_percent += float(
-                    sold_diff[sold_diff < 0].sum()
                 )
 
-            result_percent = profit_percent + loss_percent
+                # Use exactly the same daily Profit/Loss definition as the
+                # daily table, then sum those daily EUR values into the week.
+                profit_eur += float(
+                    sold_profit_eur[sold_diff > 0].fillna(0.0).sum()
+                )
+                loss_eur += float(
+                    sold_profit_eur[sold_diff < 0].fillna(0.0).sum()
+                )
+
+            result_eur = profit_eur + loss_eur
 
             normal_display_week_end = (
                 week_start_local
@@ -5201,9 +5212,9 @@ elif page == "Logs":
                     ),
                     "Bought Assets": bought_assets,
                     "Sold Assets": sold_assets,
-                    "Profit": f"{profit_percent:+.2f}%",
-                    "Loss": f"{loss_percent:+.2f}%",
-                    "Result": f"{result_percent:+.2f}%",
+                    "Profit": f"€{profit_eur:.2f}",
+                    "Loss": f"€{loss_eur:.2f}",
+                    "Result": f"€{result_eur:.2f}",
                 }
             )
 
@@ -5235,6 +5246,34 @@ elif page == "Logs":
         hide_index=True,
     )
 
+    curr_day_profit = (
+        str(days_df.iloc[0]["Result"])
+        if not days_df.empty and "Result" in days_df.columns
+        else "—"
+    )
+    curr_week_profit = (
+        str(weeks_df.iloc[0]["Result"])
+        if not weeks_df.empty and "Result" in weeks_df.columns
+        else "—"
+    )
+    with logs_summary_placeholder.container():
+        logs_summary_cols = st.columns(6)
+        logs_summary_cols[0].metric(
+            "Newest Data",
+            format_newest_data(logs_market_df),
+        )
+        logs_summary_cols[1].metric("CurrDayProfit", curr_day_profit)
+        logs_summary_cols[2].metric("CurrWeekProfit", curr_week_profit)
+        logs_summary_cols[3].metric(
+            "Assets",
+            count_market_assets(logs_market_df),
+        )
+        logs_summary_cols[4].metric("Measurements", len(logs_market_df))
+        logs_summary_cols[5].metric(
+            "Alerts",
+            count_open_alerts(alerts_df),
+        )
+
     st.caption(
         "Sim-Trading Results: Date uses DD.MM.YYYY. Buy Assets keeps the "
         "calendar-day/calendar-week BUY transaction count. Sell Assets uses "
@@ -5245,8 +5284,9 @@ elif page == "Logs":
         "normal sold position as InitPrice × DiffSellPrice / 100, where "
         "DiffSellPrice is the percentage shown on Sim-Trading and InitPrice "
         "uses the corresponding EUR buy/init price. Daily Profit is the sum "
-        "of those position profits. Weekly Sell Assets and Profit are the sums "
-        "of the seven corresponding 03:00–03:00 accounting days. The weekly "
+        "of those position profits. Weekly Profit, Loss and Result are the sums "
+        "of the corresponding daily EUR values from the same Monday-Friday "
+        "03:00–03:00 accounting days. The weekly "
         "table contains the previous 52 ISO calendar weeks plus the current "
         "week; the current-week row can therefore still be partial."
     )
@@ -5255,7 +5295,7 @@ elif page == "Logs":
     st.subheader("2. Non-tracked imported assets")
     st.caption(
         "simulationTimestamp: "
-        f"{fmt_local_datetime(simulation_timestamp)} "
+        f"{fmt_local_datetime(simulation_timestamp, '%Y-%m-%d %H:%M:%S')} "
         f"({simulation_timestamp_source})"
     )
 
@@ -5279,9 +5319,9 @@ elif page == "Logs":
         )
 
     asset_cols = st.columns(3)
-    asset_cols[0].metric("Imported assets", len(imported_tickers))
-    asset_cols[1].metric("Tracked at simulationTimestamp", len(tracked_at_simulation))
-    asset_cols[2].metric("Non-tracked assets", len(non_tracked_assets))
+    asset_cols[0].metric("ImportedTickers", len(imported_tickers))
+    asset_cols[1].metric("TrackedTickersLastTime", len(tracked_at_simulation))
+    asset_cols[2].metric("NonTrackedTickersLastTime", len(non_tracked_assets))
 
     if not non_tracked_assets.empty:
         st.dataframe(
@@ -5298,8 +5338,8 @@ elif page == "Logs":
     st.subheader("3. Previous simulator day")
     day_start, day_end = previous_simulator_day_bounds()
     st.caption(
-        f"Window: {fmt_local_datetime(day_start)} to "
-        f"{fmt_local_datetime(day_end)}"
+        f"Window: {fmt_local_datetime(day_start, '%Y-%m-%d %H:%M:%S')} to "
+        f"{fmt_local_datetime(day_end, '%Y-%m-%d %H:%M:%S')}"
     )
 
     day_receipts = market_df[
@@ -5358,7 +5398,9 @@ elif page == "Logs":
     stats_rows = [
         {
             "Point": "Start of day",
-            "CollectionTime": fmt_local_datetime(first_collection),
+            "CollectionTime": fmt_local_datetime(
+                first_collection, "%Y-%m-%d %H:%M:%S"
+            ),
             "OpenTickers": start_open,
             "ClosedTickers": start_closed,
             "CloseB > 2%": start_closeb2,
@@ -5368,7 +5410,8 @@ elif page == "Logs":
         {
             "Point": "During day",
             "CollectionTime": (
-                f"{fmt_local_datetime(day_start)} – {fmt_local_datetime(day_end)}"
+                f"{fmt_local_datetime(day_start, '%Y-%m-%d %H:%M:%S')} – "
+                f"{fmt_local_datetime(day_end, '%Y-%m-%d %H:%M:%S')}"
             ),
             "OpenTickers": "—",
             "ClosedTickers": "—",
@@ -5378,7 +5421,9 @@ elif page == "Logs":
         },
         {
             "Point": "End of day",
-            "CollectionTime": fmt_local_datetime(last_collection),
+            "CollectionTime": fmt_local_datetime(
+                last_collection, "%Y-%m-%d %H:%M:%S"
+            ),
             "OpenTickers": end_open,
             "ClosedTickers": end_closed,
             "CloseB > 2%": end_closeb2,
@@ -5418,7 +5463,9 @@ elif page == "Logs":
             [
                 {
                     "Event": "Collector started",
-                    "Time": fmt_local_datetime(collection_started, "%H:%M:%S"),
+                    "Time": fmt_local_datetime(
+                        collection_started, "%Y-%m-%d %H:%M:%S"
+                    ),
                     "Details": (
                         "15-min delayed block "
                         f"{fmt_local_datetime(newest_market_data, '%H:%M')}–"
@@ -5427,12 +5474,16 @@ elif page == "Logs":
                 },
                 {
                     "Event": "Collector finished",
-                    "Time": fmt_local_datetime(collection_finished, "%H:%M:%S"),
+                    "Time": fmt_local_datetime(
+                        collection_finished, "%Y-%m-%d %H:%M:%S"
+                    ),
                     "Details": f"{len(newest_rows)} asset measurement(s) received",
                 },
                 {
                     "Event": "Dashboard data available",
-                    "Time": fmt_local_datetime(dashboard_available, "%H:%M:%S"),
+                    "Time": fmt_local_datetime(
+                        dashboard_available, "%Y-%m-%d %H:%M:%S"
+                    ),
                     "Details": (
                         "Refresh can show Newest data = "
                         f"{fmt_local_datetime(newest_market_data, '%H:%M')}"
@@ -5452,7 +5503,7 @@ elif page == "Logs":
 
     # 4. Measurements moved here from Live Overview.
     st.subheader("4. Measurements")
-    st.metric("Measurements", len(market_df))
+    st.metric("Mesurements in local database", len(market_df))
 
 elif page == "Historical Data":
     st.header("Historical Data")
