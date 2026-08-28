@@ -20,7 +20,7 @@ buy:
 sell:
   enabled: true
   movement_percent: 2.0
-  c5_hours: 24.0
+  c5_hours: 12.0
   rule1_tolerance_minutes: 30
   rule2_max_data_age_minutes: 30
   c6_min_gain_percent: 2.0
@@ -78,3 +78,7 @@ trading_windows:
     max_buy_sell_time_seconds: null
 alerts:
   enabled: true
+dashboard:
+  last_rule_change:
+    time: '2026-08-26T22:01:44.129803+00:00'
+    description: C5 window 24h→12h
