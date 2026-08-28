@@ -1396,6 +1396,7 @@ def build_trade_analysis(
             ("OPEN", open_sorted),
             ("OPEN & Profit", profit_sorted),
             ("OPEN & Loss", loss_sorted),
+            ("CLOSED", sorted(closed_tickers)),
             ("CLOSED & Close2h>=2%", closed_close2h_sorted),
             ("BUY", buy_sorted),
             ("SELL", sell_sorted),
@@ -7717,11 +7718,15 @@ elif page == "Sim-Trading":
 elif page == "Trading Efficiency":
     st.header("Trading Efficiency")
     efficiency_market_df = df[df["asset_type"].isin(["stock", "crypto"])].copy()
-    efficiency_summary_cols = st.columns(4)
+    efficiency_summary_cols = st.columns(5)
     efficiency_summary_cols[0].metric("Newest Data", format_newest_data(efficiency_market_df))
     efficiency_summary_cols[1].metric("Assets", count_market_assets(efficiency_market_df))
-    efficiency_summary_cols[2].metric("Measurements", len(efficiency_market_df))
-    efficiency_summary_cols[3].metric("Max Assets", BUY_MAX_OPEN_TICKERS)
+    last_open_profit_metric = efficiency_summary_cols[2].empty()
+    last_open_loss_metric = efficiency_summary_cols[3].empty()
+    last_close2h_metric = efficiency_summary_cols[4].empty()
+    last_open_profit_metric.metric("LastOPENProfit / LastOPEN", "—")
+    last_open_loss_metric.metric("LastOPENLoss / LastSell", "—")
+    last_close2h_metric.metric("LastClose2h / CLOSED", "—")
 
     range_label = st.selectbox(
         "Range",
@@ -7804,6 +7809,32 @@ elif page == "Trading Efficiency":
                 selected_period,
             )
 
+            if not full_analysis_df.empty:
+                summary_times = pd.to_datetime(
+                    full_analysis_df["Time"], utc=True, errors="coerce"
+                )
+                latest_summary_time = summary_times.max()
+                latest_summary = full_analysis_df[
+                    summary_times.eq(latest_summary_time)
+                ].copy()
+                latest_count_map = {
+                    str(row["Series"]): int(row["Count"])
+                    for _, row in latest_summary.iterrows()
+                    if pd.notna(row.get("Count"))
+                }
+                last_open_profit_metric.metric(
+                    "LastOPENProfit / LastOPEN",
+                    f"{latest_count_map.get('OPEN & Profit', 0)}/{latest_count_map.get('OPEN', 0)}",
+                )
+                last_open_loss_metric.metric(
+                    "LastOPENLoss / LastSell",
+                    f"{latest_count_map.get('OPEN & Loss', 0)}/{latest_count_map.get('SELL', 0)}",
+                )
+                last_close2h_metric.metric(
+                    "LastClose2h / CLOSED",
+                    f"{latest_count_map.get('CLOSED & Close2h>=2%', 0)}/{latest_count_map.get('CLOSED', 0)}",
+                )
+
             analysis_start = reference_time - selected_period
             analysis_df = full_analysis_df[
                 pd.to_datetime(
@@ -7824,6 +7855,33 @@ elif page == "Trading Efficiency":
                 analysis_df["TimeLocal"] = pd.to_datetime(
                     analysis_df["Time"], utc=True, errors="coerce"
                 ).dt.tz_convert(LOCAL_TIMEZONE)
+
+                # Keep the first and last plotted nodes at 10% and 90% of the
+                # x-axis respectively. Therefore the visible axis span is 125%
+                # of the node-to-node span, with 12.5% of that span added on
+                # each side.
+                first_node_time = analysis_df["TimeLocal"].min()
+                last_node_time = analysis_df["TimeLocal"].max()
+                if (
+                    pd.notna(first_node_time)
+                    and pd.notna(last_node_time)
+                    and last_node_time > first_node_time
+                ):
+                    node_span = last_node_time - first_node_time
+                    axis_padding = node_span / 8
+                else:
+                    axis_padding = selected_period / 8
+                axis_domain_start = first_node_time - axis_padding
+                axis_domain_end = last_node_time + axis_padding
+                # Altair scale domains accept only UTC-aware or naive datetimes.
+                # Keep the plotted data in Europe/Berlin local time, but express
+                # the domain endpoints as the equivalent UTC instants.
+                shared_time_scale = alt.Scale(
+                    domain=[
+                        axis_domain_start.tz_convert("UTC").to_pydatetime(),
+                        axis_domain_end.tz_convert("UTC").to_pydatetime(),
+                    ]
+                )
 
                 polygon_config = TRADING_WINDOWS.get("US") or {}
                 polygon_open_intervals = []
@@ -7936,6 +7994,7 @@ elif page == "Trading Efficiency":
                     x=alt.X(
                         "TimeLocal:T",
                         title="Local time",
+                        scale=shared_time_scale,
                         axis=alt.Axis(
                             format="%H:%M",
                             labelAngle=0,
@@ -7980,6 +8039,7 @@ elif page == "Trading Efficiency":
                             x=alt.X(
                                 "StartLocal:T",
                                 title=None,
+                                scale=shared_time_scale,
                                 axis=alt.Axis(
                                     format="%H:%M",
                                     labelAngle=0,
@@ -8020,6 +8080,7 @@ elif page == "Trading Efficiency":
                             x=alt.X(
                                 "StartLocal:T",
                                 title="Time",
+                                scale=shared_time_scale,
                                 axis=alt.Axis(
                                     format="%H:%M",
                                     labelAngle=0,
