@@ -6,6 +6,8 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import asyncio
+
 import httpx
 
 from shared.models import MeasurementRecord
@@ -34,6 +36,23 @@ class TwelveDataCollector(Collector):
                 "timeout_seconds",
                 30,
             )
+        )
+
+        self.requests_per_minute = max(
+            1,
+            int(
+                config.get(
+                    "requests_per_minute",
+                    8,
+                )
+            ),
+        )
+
+        # Leave a small safety margin so Twelve Data's rolling/minute
+        # credit window is not exceeded.
+        self.request_spacing_seconds = max(
+            0.0,
+            60.0 / float(self.requests_per_minute) + 0.5,
         )
 
         self.base_url = str(
@@ -148,7 +167,10 @@ class TwelveDataCollector(Collector):
         async with httpx.AsyncClient(
             timeout=self.timeout_seconds,
         ) as client:
-            for instrument in instruments:
+            for index, instrument in enumerate(instruments):
+                if index > 0 and self.request_spacing_seconds > 0:
+                    await asyncio.sleep(self.request_spacing_seconds)
+
                 try:
                     record = (
                         await self._collect_instrument(
