@@ -1396,6 +1396,30 @@ def evaluate_sell(
     market_regions = load_ticker_market_regions()
     trading_windows = config.get("trading_windows") or {}
     advisories = state.setdefault("sell_advisories", {})
+
+    # Process open positions chronologically by their newest available
+    # market-data timestamp. This keeps Telegram SELL messages in the same
+    # time order as the timestamp displayed at the start of each message.
+    latest_measurement_time = (
+        df.groupby("ticker")["timestamp"]
+        .max()
+        .to_dict()
+    )
+
+    open_trades.sort(
+        key=lambda trade: (
+            latest_measurement_time.get(
+                str(
+                    trade.get("Ticker") or ""
+                ).strip().upper(),
+                pd.Timestamp.max.tz_localize("UTC"),
+            ),
+            str(
+                trade.get("Ticker") or ""
+            ).strip().upper(),
+        )
+    )
+
     active_open_tickers = {
         str(trade.get("Ticker") or "").strip().upper()
         for trade in open_trades
