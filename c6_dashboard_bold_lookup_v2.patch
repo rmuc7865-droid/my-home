@@ -1,9 +1,0 @@
---- dashboard/streamlit_app.py
-+++ dashboard/streamlit_app.py
-@@ -2,5 +2,5 @@
-                     "Action", "_WaitToTradeRaw", "_WaitToOpeningRaw", "_LastSellingRaw",
-                     "_LastClose2hRaw", "_Drop24hRaw", "_DropInitTimeLatestRaw",
-                     "_Change24hRaw", "_ChangeInitTimeLatestRaw",
--                    "_WeakInitTimeLatestRaw",
-+                    "_WeakInitTimeLatestRaw", "C6",
-                 ]].loc[display.index].copy()

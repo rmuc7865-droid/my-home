@@ -1,8 +1,0 @@
---- dashboard/streamlit_app.py
-+++ dashboard/streamlit_app.py
-@@ -2,4 +2,5 @@
-                 drop_init = {}
-                 change24 = {}
-                 change_init = {}
-+                weak_init = {}
-                 for idx, row in advisor.iterrows():

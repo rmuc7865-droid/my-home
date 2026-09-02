@@ -1,7 +1,0 @@
---- dashboard/streamlit_app.py
-+++ dashboard/streamlit_app.py
-@@ -1,3 +1,3 @@
-         "simulated positions that are open. OPEN & Profit counts OPEN positions whose "
--        "market price is above InitPrice; OPEN & Loss counts the remaining OPEN "
-+        "DiffLastPrice is at least 2%; OPEN & Loss counts the remaining OPEN "
-         "positions. CLOSED & Close2h>=2% counts CLOSED simulator tickers whose "

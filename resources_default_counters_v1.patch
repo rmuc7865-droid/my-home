@@ -1,9 +1,0 @@
---- dashboard/streamlit_app.py
-+++ dashboard/streamlit_app.py
-@@ -1,5 +1,5 @@
-     selected_counters = st.multiselect(
-         "Counters",
-         counter_options,
--        default=["Close2h >= 2%", "OPEN"],
-+        default=["OPEN", "OPEN & Profit"],
-     )

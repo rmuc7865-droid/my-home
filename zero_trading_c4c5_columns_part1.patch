@@ -1,9 +1,0 @@
---- dashboard/streamlit_app.py
-+++ dashboard/streamlit_app.py
-@@ -1,4 +1,6 @@
-             "ShouldSell": False,
-             "C4": False,
-             "C5": False,
-+            "C4Check": "—",
-+            "C5Check": "—",
-             "CanSellNow": False,

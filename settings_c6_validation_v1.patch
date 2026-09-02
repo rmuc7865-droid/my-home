@@ -1,9 +1,0 @@
---- dashboard/streamlit_app.py
-+++ dashboard/streamlit_app.py
-@@ -1,4 +1,6 @@
-         if not (0.25 <= new_c5_hours <= 720):
-             errors.append("C5 static-price window must be between 0.25 and 720 hours.")
-+        if not (-100.0 <= new_c6_min_gain_percent <= 1000.0):
-+            errors.append("C6 minimum gain must be between -100% and 1000%.")
- 
-         for region, values in market_values.items():

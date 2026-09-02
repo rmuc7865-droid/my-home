@@ -16,3 +16,14 @@ config/crypto_tickers.json
 config/unresolved_tickers.json
 config/watchlist_membership.json
 .env
+
+# Temporary development / patch files
+*.patch
+*.orig
+*.bak
+*.bak-*
+
+# macOS metadata
+.DS_Store
+._*
+__MACOSX/

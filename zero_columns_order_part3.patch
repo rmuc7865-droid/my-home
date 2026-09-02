@@ -1,8 +1,0 @@
---- dashboard/streamlit_app.py
-+++ dashboard/streamlit_app.py
-@@ -1,4 +1,5 @@
-                     columns={
-                         "C4Check": "C4 Check",
-                         "C5Check": "C5 Check",
-+                        "C6Check": "C6 Check",
-                     }

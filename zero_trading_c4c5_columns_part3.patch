@@ -1,9 +1,0 @@
---- dashboard/streamlit_app.py
-+++ dashboard/streamlit_app.py
-@@ -1,4 +1,6 @@
-                 requested_columns = [
-                     "Action",
-                     "Reason",
-+                    "C4Check",
-+                    "C5Check",
-                     "Ticker",
