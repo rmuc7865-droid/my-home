@@ -43,6 +43,43 @@ def load_alerts_cached():
     )
 
 @st.cache_data(ttl=300)
+def load_instrument_metadata_cached():
+    """Load instrument metadata used for informational dashboard columns."""
+    try:
+        rows = api_get(
+            "/api/v1/instruments",
+            {
+                "active": False,
+            },
+        )
+    except Exception:
+        return {}
+
+    if not isinstance(rows, list):
+        return {}
+
+    result = {}
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        ticker = str(row.get("Ticker") or "").strip().upper()
+        if not ticker:
+            continue
+
+        isin = str(row.get("ISIN") or "").strip()
+        source = str(row.get("Source") or "").strip().upper()
+
+        result[ticker] = {
+            "ISIN": isin or "—",
+            "Gainer": source == "AUTO_GAINER",
+        }
+
+    return result
+
+
+@st.cache_data(ttl=300)
 def load_ticker_news_cached():
     """Load recent stored ticker news without making trading pages depend on it."""
     try:
@@ -1851,6 +1888,7 @@ if page == "Zero-Trading":
     zero_news_map = latest_ticker_news_map(
         load_ticker_news_cached()
     )
+    zero_instrument_metadata = load_instrument_metadata_cached()
     market_df = df[df["asset_type"].isin(["stock", "crypto"])].copy()
     zero_summary_placeholder = st.empty()
 
@@ -3086,11 +3124,22 @@ if page == "Zero-Trading":
                 # Informational context only. This column is deliberately
                 # added after all trading-condition calculations so news cannot
                 # influence ToBuy, ToSell, C2, C4, C5, C6, or C7.
-                advisor["News"] = (
+                zero_ticker_keys = (
                     advisor["Ticker"]
                     .astype(str)
                     .str.strip()
                     .str.upper()
+                )
+
+                advisor["ISIN"] = zero_ticker_keys.map(
+                    lambda ticker: zero_instrument_metadata.get(
+                        ticker,
+                        {},
+                    ).get("ISIN", "—")
+                )
+
+                advisor["News"] = (
+                    zero_ticker_keys
                     .map(zero_news_map)
                     .fillna("—")
                 )
@@ -3132,6 +3181,7 @@ if page == "Zero-Trading":
                         "ToBuy",
                         "Ticker",
                         "TickerName",
+                        "ISIN",
                         "News",
                         "BuyTs",
                         "BuyC2",
@@ -3304,6 +3354,9 @@ if page == "Zero-Trading":
 
 elif page == "Last Data":
     st.header("Last Data")
+
+    last_data_instrument_metadata = load_instrument_metadata_cached()
+
     market_df = df[
         df["asset_type"].isin(
             ["stock", "crypto"]
@@ -3752,6 +3805,32 @@ elif page == "Last Data":
                     }
                 )
 
+                # Instrument origin metadata is display-only. AUTO_GAINER means
+                # the ticker was proposed by automatic gainer discovery rather
+                # than originating from a manually imported watching list.
+                last_data_ticker_keys = (
+                    relevant["Ticker"]
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                )
+
+                relevant["ISIN"] = last_data_ticker_keys.map(
+                    lambda ticker: last_data_instrument_metadata.get(
+                        ticker,
+                        {},
+                    ).get("ISIN", "—")
+                )
+
+                relevant["Gainer"] = last_data_ticker_keys.map(
+                    lambda ticker: bool(
+                        last_data_instrument_metadata.get(
+                            ticker,
+                            {},
+                        ).get("Gainer", False)
+                    )
+                )
+
                 # DayRecs is a display value. Keep it as text so Streamlit
                 # follows the table's left alignment instead of right-aligning
                 # it as a numeric column.
@@ -3762,6 +3841,8 @@ elif page == "Last Data":
                 live_columns = [
                     "Ticker",
                     "TickerName",
+                    "ISIN",
+                    "Gainer",
                     "DayRecs",
                     "LastCollect",
                     "LastPrice",
