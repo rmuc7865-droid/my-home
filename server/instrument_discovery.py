@@ -639,11 +639,26 @@ async def resolve_isin(
             client,
             cik=cik,
         )
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "SEC CUSIP lookup failed for %s: HTTP %s %s",
+            ticker,
+            exc.response.status_code,
+            exc.response.reason_phrase,
+        )
+        return None, "SEC_ERROR"
+    except httpx.RequestError as exc:
+        logger.warning(
+            "SEC CUSIP lookup failed for %s: %s",
+            ticker,
+            type(exc).__name__,
+        )
+        return None, "SEC_ERROR"
     except Exception as exc:
         logger.warning(
             "SEC CUSIP lookup failed for %s: %s",
             ticker,
-            exc,
+            type(exc).__name__,
         )
         return None, "SEC_ERROR"
 
@@ -659,12 +674,29 @@ async def resolve_isin(
                 cusip=cusip,
                 massive_details=massive_details,
             )
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "OpenFIGI lookup failed for %s/%s: HTTP %s %s",
+                ticker,
+                cusip,
+                exc.response.status_code,
+                exc.response.reason_phrase,
+            )
+            continue
+        except httpx.RequestError as exc:
+            logger.warning(
+                "OpenFIGI lookup failed for %s/%s: %s",
+                ticker,
+                cusip,
+                type(exc).__name__,
+            )
+            continue
         except Exception as exc:
             logger.warning(
                 "OpenFIGI lookup failed for %s/%s: %s",
                 ticker,
                 cusip,
-                exc,
+                type(exc).__name__,
             )
             continue
 
@@ -755,13 +787,33 @@ async def discover_top_gainers(
         timeout=45,
         follow_redirects=True,
     ) as client:
-        response = await client.get(
-            "https://api.polygon.io"
-            + MASSIVE_GAINERS_PATH,
-            params={"apiKey": massive_key},
-        )
+        try:
+            response = await client.get(
+                "https://api.polygon.io"
+                + MASSIVE_GAINERS_PATH,
+                params={"apiKey": massive_key},
+            )
 
-        response.raise_for_status()
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "Massive gainers request failed: HTTP %s %s",
+                exc.response.status_code,
+                exc.response.reason_phrase,
+            )
+            return {
+                "status": "skipped",
+                "reason": "massive_http_error",
+            }
+        except httpx.RequestError as exc:
+            logger.error(
+                "Massive gainers request failed: %s",
+                type(exc).__name__,
+            )
+            return {
+                "status": "skipped",
+                "reason": "massive_request_error",
+            }
 
         movers = (
             response.json().get("tickers")
@@ -786,11 +838,24 @@ async def discover_top_gainers(
                     ticker,
                     massive_key,
                 )
+            except httpx.HTTPStatusError as exc:
+                logger.warning(
+                    "Ticker details failed for %s: HTTP %s %s",
+                    ticker,
+                    exc.response.status_code,
+                    exc.response.reason_phrase,
+                )
+            except httpx.RequestError as exc:
+                logger.warning(
+                    "Ticker details failed for %s: %s",
+                    ticker,
+                    type(exc).__name__,
+                )
             except Exception as exc:
                 logger.warning(
                     "Ticker details failed for %s: %s",
                     ticker,
-                    exc,
+                    type(exc).__name__,
                 )
                 skipped["reference_error"].append(
                     ticker
@@ -839,11 +904,26 @@ async def discover_top_gainers(
                     ticker=ticker,
                     massive_key=massive_key,
                 )
+            except httpx.HTTPStatusError as exc:
+                logger.warning(
+                    "Volume lookup failed for %s: HTTP %s %s",
+                    ticker,
+                    exc.response.status_code,
+                    exc.response.reason_phrase,
+                )
+                volume = None
+            except httpx.RequestError as exc:
+                logger.warning(
+                    "Volume lookup failed for %s: %s",
+                    ticker,
+                    type(exc).__name__,
+                )
+                volume = None
             except Exception as exc:
                 logger.warning(
                     "Volume lookup failed for %s: %s",
                     ticker,
-                    exc,
+                    type(exc).__name__,
                 )
                 volume = None
 

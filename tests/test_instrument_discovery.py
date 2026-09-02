@@ -348,3 +348,79 @@ def test_cap_refuses_new_ticker_when_no_safe_replacement_exists():
             Instrument.ticker == "NEWONE"
         )
     ) is None
+
+
+def test_massive_gainers_http_error_does_not_log_api_key():
+    import asyncio
+    import logging
+    import os
+    from io import StringIO
+    from unittest.mock import patch
+
+    import httpx
+
+    from server.instrument_discovery import discover_top_gainers
+
+    db = _db()
+
+    secret = "SUPER_SECRET_TEST_KEY"
+
+    request = httpx.Request(
+        "GET",
+        "https://api.polygon.io/v2/snapshot/"
+        "locale/us/markets/stocks/gainers"
+        f"?apiKey={secret}",
+    )
+    response = httpx.Response(
+        401,
+        request=request,
+    )
+
+    async def fake_get(*args, **kwargs):
+        raise httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=request,
+            response=response,
+        )
+
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+
+    logger = logging.getLogger(
+        "server.instrument_discovery"
+    )
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+
+    old_key = os.environ.get("POLYGON_API_KEY")
+    os.environ["POLYGON_API_KEY"] = secret
+
+    try:
+        with patch(
+            "server.instrument_discovery.httpx.AsyncClient.get",
+            new=fake_get,
+        ):
+            result = asyncio.run(
+                discover_top_gainers(db)
+            )
+    finally:
+        if old_key is None:
+            os.environ.pop("POLYGON_API_KEY", None)
+        else:
+            os.environ["POLYGON_API_KEY"] = old_key
+
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+    log_output = stream.getvalue()
+
+    assert result == {
+        "status": "skipped",
+        "reason": "massive_http_error",
+    }
+
+    assert secret not in log_output
+    assert "apiKey=" not in log_output
+    assert "401" in log_output
+    assert "Unauthorized" in log_output
