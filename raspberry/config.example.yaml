@@ -31,7 +31,7 @@ collectors:
     system: polygon
     ticker_file: /opt/home-monitor/config/tickers.json
     registry_url: http://100.78.241.4:8000/api/v1/instruments/massive-tickers
-    registry_api_key: CHANGE_ME
+    registry_api_key_env: MONITOR_API_KEY
     base_url: https://api.polygon.io
     api_key_env: POLYGON_API_KEY
     multiplier: 15

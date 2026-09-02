@@ -21,7 +21,14 @@ class PolygonCollector(Collector):
         self.system = config["system"]
         self.ticker_file = Path(config["ticker_file"])
         self.registry_url = str(config.get("registry_url") or "").strip()
-        self.registry_api_key = str(config.get("registry_api_key") or "").strip()
+        registry_api_key_env = str(
+            config.get("registry_api_key_env") or ""
+        ).strip()
+        self.registry_api_key = str(
+            os.environ.get(registry_api_key_env, "")
+            if registry_api_key_env
+            else config.get("registry_api_key") or ""
+        ).strip()
         self.multiplier = int(config.get("multiplier", 15))
         self.timespan = config.get("timespan", "minute")
         self.adjusted = bool(config.get("adjusted", True))
