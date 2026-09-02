@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -24,6 +25,10 @@ NEWS_REQUEST_LIMIT = 10
 
 # Keep the dashboard context intentionally compact.
 MAX_NEWS_PER_TICKER = 2
+
+# Avoid sending the complete ticker universe as an API burst.
+NEWS_REQUEST_INTERVAL_SECONDS = 0.25
+NEWS_429_RETRY_SECONDS = 2.0
 
 
 CATEGORY_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -125,10 +130,16 @@ def _parse_timestamp(value: object) -> datetime | None:
 
 
 def classify_news(title: str, description: str = "") -> str:
-    text = f"{title} {description}".lower()
+    # Category describes the headline event only. Descriptions often contain
+    # background references to earnings, revenue, guidance, etc. that are not
+    # the actual event being reported.
+    title_text = _normalize(title).lower()
 
     for category, patterns in CATEGORY_PATTERNS:
-        if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns):
+        if any(
+            re.search(pattern, title_text, flags=re.IGNORECASE)
+            for pattern in patterns
+        ):
             return category
 
     return "Other"
@@ -168,6 +179,39 @@ def _company_terms(instrument: Instrument) -> set[str]:
     return terms
 
 
+def headline_is_low_value(title: str) -> bool:
+    title_lower = _normalize(title).lower()
+
+    # These headlines are predominantly investment opinion, forecasts,
+    # generic valuation commentary, or investor-solicitation material.
+    # They are poor evidence for a concrete company catalyst.
+    patterns = (
+        r"\bbuying opportunity\b",
+        r"\bonce-in-a-lifetime\b",
+        r"\bgenerational buying opportunity\b",
+        r"\bprediction:",
+        r"\bstock price in a year\b",
+        r"\bwould (?:still )?buy\b",
+        r"\bi(?:'|’)d (?:still )?buy\b",
+        r"\bbuy and hold\b",
+        r"\bis .* stock (?:a )?buy\b",
+        r"\bis .* cheap\b",
+        r"\bhere(?:'|’)s the math\b",
+        r"\bfurther upside\b",
+        r"\bpoised to beat earnings estimates\b",
+        r"\bencouraged to contact .* law firm\b",
+        r"\bsuffered losses\b",
+        r"\binvestor news:",
+        r"\bvaluation reality\b",
+        r"\bvaluation (?:risk|risks|concern|concerns)\b",
+    )
+
+    return any(
+        re.search(pattern, title_lower, flags=re.IGNORECASE)
+        for pattern in patterns
+    )
+
+
 def article_is_relevant(article: dict, instrument: Instrument) -> bool:
     ticker = instrument.ticker.upper()
 
@@ -179,6 +223,9 @@ def article_is_relevant(article: dict, instrument: Instrument) -> bool:
 
     title = _normalize(article.get("title"))
     title_lower = title.lower()
+
+    if headline_is_low_value(title):
+        return False
 
     terms = _company_terms(instrument)
 
@@ -228,6 +275,8 @@ def article_is_relevant(article: dict, instrument: Instrument) -> bool:
         r"\btop \d+\b",
         r"\b\d+ stocks?\b",
         r"\bmagnificent seven\b",
+        r"\b\d+ trending stocks?\b",
+        r"^[A-Z.]+(?:,\s*[A-Z.]+)+(?:,?\s+and\s+[A-Z.]+)?:",
     )
 
     if any(
@@ -240,6 +289,100 @@ def article_is_relevant(article: dict, instrument: Instrument) -> bool:
     # a market/sector roundup rather than a ticker-specific catalyst.
     if len(article_tickers) >= 4:
         return False
+
+    description = _normalize(article.get("description")).lower()
+
+    # Reject headlines whose primary subject is another company/product and
+    # the target company is merely the technology supplier. Use all known
+    # company terms, not only the ticker symbol (for example NVIDIA vs NVDA).
+    powered_by_target = any(
+        re.search(
+            r"\bpowered by\s+" + re.escape(term.lower()) + r"\b",
+            title_lower,
+            flags=re.IGNORECASE,
+        )
+        for term in terms
+        if len(term) >= 3
+    )
+
+    if powered_by_target:
+        return False
+
+    # Generic stock-price-movement stories are useful only when their
+    # description identifies a concrete company-specific catalyst.
+    #
+    # Cover both:
+    #   "Why Arm Holdings Stock Fell..."
+    #   "BlackRock Declines More Than Market..."
+    price_move_terms = (
+        r"fell",
+        r"falling",
+        r"sank",
+        r"sinking",
+        r"rose",
+        r"rising",
+        r"jumped",
+        r"surged",
+        r"gained",
+        r"dropped",
+        r"declined",
+        r"declines",
+        r"stepped on the gas",
+    )
+
+    price_move_headline = any(
+        re.search(
+            rf"\b{term}\b",
+            title_lower,
+            flags=re.IGNORECASE,
+        )
+        for term in price_move_terms
+    )
+
+    if price_move_headline:
+        catalyst_patterns = (
+            r"\bfiling\b",
+            r"\binsider\b",
+            r"\bsold\s+[\d,]+\s+shares\b",
+            r"\bleak(?:ed|s|ing)?\b",
+            r"\bdelay(?:ed|s)?\b",
+            r"\blaunch(?:ed|es)?\b",
+            r"\bapproval\b",
+            r"\bfda\b",
+            r"\bcontract\b",
+            r"\bdeal\b",
+            r"\bacquisition\b",
+            r"\bmerger\b",
+            r"\bguidance\b",
+            r"\breported\b.*\bresults\b",
+            r"\bearnings report\b",
+            r"\bceo\b",
+            r"\bcfo\b",
+        )
+
+        if not any(
+            re.search(
+                pattern,
+                description,
+                flags=re.IGNORECASE,
+            )
+            for pattern in catalyst_patterns
+        ):
+            return False
+
+        # A catalyst concerning another named business is not automatically
+        # a catalyst for the target ticker. This catches cases such as a
+        # Tesla article whose explanation is primarily a SpaceX development.
+        if (
+            ticker == "TSLA"
+            and "spacex" in description
+            and re.search(
+                r"\bspacex\b.*\b(?:manufactur|develop|build|launch|post)",
+                description,
+                flags=re.IGNORECASE,
+            )
+        ):
+            return False
 
     return True
 
@@ -303,17 +446,33 @@ async def collect_ticker_news(
             ticker = instrument.ticker.upper()
 
             try:
+                await asyncio.sleep(NEWS_REQUEST_INTERVAL_SECONDS)
+
+                request_params = {
+                    "ticker": ticker,
+                    "published_utc.gte": published_after.isoformat(),
+                    "limit": NEWS_REQUEST_LIMIT,
+                    "order": "desc",
+                    "sort": "published_utc",
+                    "apiKey": api_key,
+                }
+
                 response = await client.get(
                     MASSIVE_NEWS_URL,
-                    params={
-                        "ticker": ticker,
-                        "published_utc.gte": published_after.isoformat(),
-                        "limit": NEWS_REQUEST_LIMIT,
-                        "order": "desc",
-                        "sort": "published_utc",
-                        "apiKey": api_key,
-                    },
+                    params=request_params,
                 )
+
+                if response.status_code == 429:
+                    logger.warning(
+                        "Ticker news %s: HTTP 429; retrying once",
+                        ticker,
+                    )
+                    await asyncio.sleep(NEWS_429_RETRY_SECONDS)
+                    response = await client.get(
+                        MASSIVE_NEWS_URL,
+                        params=request_params,
+                    )
+
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 logger.warning(
