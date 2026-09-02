@@ -113,8 +113,24 @@ class PolygonCollector(Collector):
                     seen.add(ticker)
                     merged.append(ticker)
             return merged
-        except Exception:
-            logger.exception("Could not load dynamic ticker registry; using local ticker file")
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "Could not load dynamic ticker registry; using local ticker file: HTTP %s %s",
+                exc.response.status_code,
+                exc.response.reason_phrase,
+            )
+            return local
+        except httpx.RequestError as exc:
+            logger.error(
+                "Could not load dynamic ticker registry; using local ticker file: %s",
+                type(exc).__name__,
+            )
+            return local
+        except Exception as exc:
+            logger.error(
+                "Could not load dynamic ticker registry; using local ticker file: %s",
+                type(exc).__name__,
+            )
             return local
 
     async def collect(self) -> list[MeasurementRecord]:
@@ -164,10 +180,29 @@ class PolygonCollector(Collector):
                     if record is not None:
                         records.append(record)
 
-                except Exception:
-                    logger.exception(
-                        "Failed to collect ticker %s",
+                except httpx.HTTPStatusError as exc:
+                    # Do not log the exception itself: httpx includes the full
+                    # request URL, which may contain the API key.
+                    logger.error(
+                        "Failed to collect ticker %s: HTTP %s %s",
                         ticker,
+                        exc.response.status_code,
+                        exc.response.reason_phrase,
+                    )
+                except httpx.RequestError as exc:
+                    # Request errors may also include the request URL.
+                    logger.error(
+                        "Failed to collect ticker %s: %s",
+                        ticker,
+                        type(exc).__name__,
+                    )
+                except Exception as exc:
+                    # Avoid logger.exception() here because nested HTTP
+                    # exceptions can expose credential-bearing request URLs.
+                    logger.error(
+                        "Failed to collect ticker %s: %s",
+                        ticker,
+                        type(exc).__name__,
                     )
 
         if not records:
@@ -264,10 +299,24 @@ class PolygonCollector(Collector):
                     self.liquidity_window_seconds
                 )
 
-        except Exception:
-            logger.exception(
-                "Liquidity estimate failed for %s",
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "Liquidity estimate failed for %s: HTTP %s %s",
                 ticker,
+                exc.response.status_code,
+                exc.response.reason_phrase,
+            )
+        except httpx.RequestError as exc:
+            logger.error(
+                "Liquidity estimate failed for %s: %s",
+                ticker,
+                type(exc).__name__,
+            )
+        except Exception as exc:
+            logger.error(
+                "Liquidity estimate failed for %s: %s",
+                ticker,
+                type(exc).__name__,
             )
         measurements = {}
 
