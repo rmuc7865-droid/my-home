@@ -20,6 +20,8 @@ class PolygonCollector(Collector):
     def __init__(self, config: dict):
         self.system = config["system"]
         self.ticker_file = Path(config["ticker_file"])
+        self.registry_url = str(config.get("registry_url") or "").strip()
+        self.registry_api_key = str(config.get("registry_api_key") or "").strip()
         self.multiplier = int(config.get("multiplier", 15))
         self.timespan = config.get("timespan", "minute")
         self.adjusted = bool(config.get("adjusted", True))
@@ -92,8 +94,32 @@ class PolygonCollector(Collector):
 
         return tickers
 
+    async def _load_runtime_tickers(self, client: httpx.AsyncClient) -> list[str]:
+        local = self._load_tickers()
+        if not self.registry_url:
+            return local
+        try:
+            response = await client.get(
+                self.registry_url,
+                headers={"X-API-Key": self.registry_api_key} if self.registry_api_key else {},
+            )
+            response.raise_for_status()
+            remote = response.json().get("tickers") or []
+            merged: list[str] = []
+            seen: set[str] = set()
+            for item in [*local, *remote]:
+                ticker = str(item or "").strip().upper()
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                    merged.append(ticker)
+            return merged
+        except Exception:
+            logger.exception("Could not load dynamic ticker registry; using local ticker file")
+            return local
+
     async def collect(self) -> list[MeasurementRecord]:
-        tickers = self._load_tickers()
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as registry_client:
+            tickers = await self._load_runtime_tickers(registry_client)
 
         logger.info(
             "Loaded %d tickers from %s",

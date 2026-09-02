@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
@@ -10,10 +11,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from shared.models import TradeSignal, UploadBatch, UploadResult
-from .database import Alert, Measurement, SimulationTrade, SessionLocal, init_db
+from .database import Alert, Instrument, Measurement, SimulationTrade, SessionLocal, init_db
 from .rules import evaluate_rule, load_rules
 from .settings import settings
 from .telegram import send_alert
+from .instrument_discovery import discover_top_gainers, seed_manual_instruments
 
 
 def get_db():
@@ -82,7 +84,30 @@ def cleanup_old_measurements() -> None:
 async def lifespan(_: FastAPI):
     init_db()
     cleanup_old_measurements()
-    yield
+    db = SessionLocal()
+    try:
+        seed_manual_instruments(db)
+    finally:
+        db.close()
+
+    scheduler = AsyncIOScheduler(timezone="Europe/Berlin")
+
+    async def discovery_job() -> None:
+        job_db = SessionLocal()
+        try:
+            result = await discover_top_gainers(job_db)
+            print(f"Automatic gainer discovery: {result}")
+        except Exception as exc:
+            print(f"Automatic gainer discovery failed: {exc}")
+        finally:
+            job_db.close()
+
+    scheduler.add_job(discovery_job, "cron", hour=3, minute=0, max_instances=1, coalesce=True)
+    scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
 
 app = FastAPI(title="Home Monitor API", version="1.0.0", lifespan=lifespan)
 
@@ -505,3 +530,37 @@ def simulation(
         }
         for row in rows
     ]
+
+
+@app.get("/api/v1/instruments", dependencies=[Depends(require_api_key)])
+def instruments(active: bool = Query(default=True), db: Session = Depends(get_db)) -> list[dict]:
+    statement = select(Instrument).order_by(Instrument.ticker.asc())
+    if active:
+        statement = statement.where(Instrument.active.is_(True))
+    rows = db.scalars(statement).all()
+    return [
+        {
+            "Ticker": row.ticker, "Name": row.name, "ISIN": row.isin,
+            "AssetType": row.asset_type, "Provider": row.provider,
+            "Source": row.source, "Active": row.active,
+            "DiscoveredAt": row.discovered_at, "GainerPercent": row.gainer_percent,
+            "GainerVolume": row.gainer_volume, "PreviousClose": row.previous_close,
+        } for row in rows
+    ]
+
+
+@app.get("/api/v1/instruments/massive-tickers", dependencies=[Depends(require_api_key)])
+def massive_tickers(db: Session = Depends(get_db)) -> dict[str, list[str]]:
+    tickers = list(db.scalars(
+        select(Instrument.ticker).where(
+            Instrument.active.is_(True),
+            Instrument.provider == "massive",
+            Instrument.asset_type == "stock",
+        ).order_by(Instrument.ticker.asc())
+    ).all())
+    return {"tickers": tickers}
+
+
+@app.post("/api/v1/instruments/discover", dependencies=[Depends(require_api_key)])
+async def run_instrument_discovery(db: Session = Depends(get_db)) -> dict:
+    return await discover_top_gainers(db)

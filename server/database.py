@@ -48,6 +48,27 @@ class Alert(Base):
     telegram_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     measurement: Mapped[Measurement] = relationship(back_populates="alerts")
 
+
+class Instrument(Base):
+    __tablename__ = "instruments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(256), default="")
+    isin: Mapped[str] = mapped_column(String(32), default="", index=True)
+    asset_type: Mapped[str] = mapped_column(String(32), default="stock")
+    provider: Mapped[str] = mapped_column(String(32), default="massive")
+    source: Mapped[str] = mapped_column(String(32), default="MANUAL", index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    gainer_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gainer_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    previous_close: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_gainer_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class SimulationTrade(Base):
     __tablename__ = "simulation_trades"
 
