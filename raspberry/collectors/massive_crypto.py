@@ -115,15 +115,25 @@ class MassiveCryptoCollector(Collector):
             date_text = query_date.isoformat()
             try:
                 bars = await self._fetch_bars_for_day(client, ticker, date_text)
-            except httpx.HTTPError as exc:
-                # Access/availability can differ by UTC day for delayed plans.
-                # Keep bars already fetched for other days instead of discarding
-                # the entire ticker when one date (often today) is unavailable.
+            except httpx.HTTPStatusError as exc:
+                # Never log the exception itself here: httpx includes the full
+                # request URL, which may contain the API key in the query string.
+                logger.warning(
+                    "Massive crypto %s %s: request failed; skipping day: HTTP %s %s",
+                    ticker,
+                    date_text,
+                    exc.response.status_code,
+                    exc.response.reason_phrase,
+                )
+                continue
+            except httpx.RequestError as exc:
+                # Request errors can also contain the request URL. Log only the
+                # exception type so credentials in query parameters stay private.
                 logger.warning(
                     "Massive crypto %s %s: request failed; skipping day: %s",
                     ticker,
                     date_text,
-                    exc,
+                    type(exc).__name__,
                 )
                 continue
 

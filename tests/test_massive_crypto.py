@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 
+import httpx
 import pytest
 
 from raspberry.collectors.massive_crypto import MassiveCryptoCollector
@@ -104,3 +105,34 @@ async def test_collect_ticker_deduplicates_overlapping_api_bars(tmp_path, monkey
 
     assert len(records) == 1
     assert records[0].timestamp == same
+
+@pytest.mark.asyncio
+async def test_collect_ticker_keeps_prior_day_when_today_is_forbidden(tmp_path, monkeypatch) -> None:
+    collector = make_collector(tmp_path, monkeypatch)
+    first = datetime(2026, 8, 20, 23, 30, tzinfo=timezone.utc)
+    second = datetime(2026, 8, 20, 23, 45, tzinfo=timezone.utc)
+
+    class PartialAccessClient:
+        async def get(self, url: str, params: dict):
+            date_text = url.rsplit("/", 2)[-1]
+            if date_text == "2026-08-21":
+                request = httpx.Request("GET", url)
+                response = httpx.Response(403, request=request)
+                raise httpx.HTTPStatusError(
+                    "Client error '403 Forbidden'",
+                    request=request,
+                    response=response,
+                )
+            return FakeResponse({
+                "status": "DELAYED",
+                "results": [bar(first, 100), bar(second, 101)],
+            })
+
+    records = await collector._collect_ticker(
+        PartialAccessClient(),
+        "X:BTCUSD",
+        [date(2026, 8, 20), date(2026, 8, 21)],
+    )
+
+    assert [record.timestamp for record in records] == [first, second]
+    assert [record.measurements["close"] for record in records] == [100, 101]
