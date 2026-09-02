@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .database import Instrument, TickerNews
@@ -19,6 +19,7 @@ MASSIVE_NEWS_URL = "https://api.polygon.io/v2/reference/news"
 
 # We want current context, not old company history.
 NEWS_LOOKBACK_DAYS = 3
+NEWS_RETENTION_DAYS = 7
 
 # Ask Massive for several candidates because some will be rejected as weak.
 NEWS_REQUEST_LIMIT = 10
@@ -401,6 +402,26 @@ def build_summary(title: str, description: str, category: str) -> str:
     return f"{category}: {source}"
 
 
+def cleanup_old_ticker_news(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    retention_days: int = NEWS_RETENTION_DAYS,
+) -> int:
+    """Delete ticker news older than the configured retention window."""
+    current_time = now or datetime.now(timezone.utc)
+    cutoff = current_time - timedelta(days=retention_days)
+
+    result = db.execute(
+        delete(TickerNews).where(
+            TickerNews.published_at < cutoff
+        )
+    )
+    db.commit()
+
+    return int(result.rowcount or 0)
+
+
 async def collect_ticker_news(
     db: Session,
     *,
@@ -408,6 +429,11 @@ async def collect_ticker_news(
     dry_run: bool = False,
 ) -> dict:
     now = now or datetime.now(timezone.utc)
+
+    retention_deleted = cleanup_old_ticker_news(
+        db,
+        now=now,
+    )
 
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -573,5 +599,6 @@ async def collect_ticker_news(
         "rejected": rejected,
         "request_errors": request_errors,
         "ticker_results": ticker_results,
+        "retention_deleted": retention_deleted,
         "dry_run": dry_run,
     }

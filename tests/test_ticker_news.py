@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from server.database import Base, Instrument, TickerNews
 from server.ticker_news import (
+    cleanup_old_ticker_news,
     article_is_relevant,
     build_summary,
     classify_news,
@@ -473,6 +474,94 @@ def test_production_news_quality_cases() -> None:
             f"expected={expected}, actual={actual}"
         )
 
+
+def test_ticker_news_retention() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import create_engine, func, select
+    from sqlalchemy.orm import sessionmaker
+
+    from server.database import Base, TickerNews
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+
+    TestSession = sessionmaker(bind=engine)
+    db = TestSession()
+
+    now = datetime(
+        2026,
+        9,
+        2,
+        12,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+    def add_news(
+        article_id: str,
+        age_days: int,
+    ) -> None:
+        db.add(
+            TickerNews(
+                article_id=article_id,
+                ticker="AAPL",
+                published_at=now - timedelta(days=age_days),
+                title=f"Test article {article_id}",
+                description="Retention test",
+                publisher="Test",
+                article_url=f"https://example.com/{article_id}",
+                category="Other",
+                summary="Other: retention test",
+                collected_at=now,
+            )
+        )
+
+    # 8 days old -> delete
+    add_news("old-8", 8)
+
+    # Exactly 7 days old -> keep because cleanup uses < cutoff
+    add_news("boundary-7", 7)
+
+    # 6 days old -> keep
+    add_news("recent-6", 6)
+
+    db.commit()
+
+    try:
+        deleted = cleanup_old_ticker_news(
+            db,
+            now=now,
+            retention_days=7,
+        )
+
+        assert deleted == 1, deleted
+
+        remaining = set(
+            db.scalars(
+                select(TickerNews.article_id)
+            ).all()
+        )
+
+        assert remaining == {
+            "boundary-7",
+            "recent-6",
+        }, remaining
+
+        count = db.scalar(
+            select(func.count()).select_from(TickerNews)
+        )
+
+        assert count == 2, count
+
+    finally:
+        db.close()
+        engine.dispose()
+
+
 if __name__ == "__main__":
     tests = [
         test_news_classification,
@@ -490,6 +579,7 @@ if __name__ == "__main__":
         test_same_article_can_be_stored_for_multiple_tickers,
         test_article_id_prevents_duplicate_storage,
         test_production_news_quality_cases,
+        test_ticker_news_retention,
     ]
 
     passed = 0
