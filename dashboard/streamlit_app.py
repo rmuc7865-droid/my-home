@@ -42,6 +42,41 @@ def load_alerts_cached():
         },
     )
 
+@st.cache_data(ttl=300)
+def load_ticker_news_cached():
+    """Load recent stored ticker news without making trading pages depend on it."""
+    try:
+        rows = api_get(
+            "/api/v1/instruments/news",
+            {
+                "days": 7,
+            },
+        )
+    except Exception:
+        return []
+
+    return rows if isinstance(rows, list) else []
+
+
+def latest_ticker_news_map(rows) -> dict[str, str]:
+    """Return the newest stored news summary for each ticker."""
+    result: dict[str, str] = {}
+
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+
+        ticker = str(row.get("Ticker") or "").strip().upper()
+        summary = str(row.get("Summary") or "").strip()
+
+        if not ticker or not summary or ticker in result:
+            continue
+
+        result[ticker] = summary
+
+    return result
+
+
 @st.cache_data(ttl=30)
 def load_simulation_payload_cached():
     return api_get(
@@ -1810,6 +1845,12 @@ def count_open_alerts(alerts_table: pd.DataFrame) -> int:
 
 if page == "Zero-Trading":
     st.header("Zero-Trading")
+
+    # News is informational only. Failure to load it must never prevent
+    # Zero-Trading or any trading-rule calculation from working.
+    zero_news_map = latest_ticker_news_map(
+        load_ticker_news_cached()
+    )
     market_df = df[df["asset_type"].isin(["stock", "crypto"])].copy()
     zero_summary_placeholder = st.empty()
 
@@ -3042,6 +3083,18 @@ if page == "Zero-Trading":
                     advisor.at[idx, "SimSellC7"] = bool(sell_conditions["C7"])
                     advisor.at[idx, "SimWaitToOpening"] = _zero_wait_is_zero(wait_opening)
 
+                # Informational context only. This column is deliberately
+                # added after all trading-condition calculations so news cannot
+                # influence ToBuy, ToSell, C2, C4, C5, C6, or C7.
+                advisor["News"] = (
+                    advisor["Ticker"]
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                    .map(zero_news_map)
+                    .fillna("—")
+                )
+
                 # Keep current opportunities, tickers that are currently OPEN in
                 # Sim-Trading, and/or tickers with an actual simulator transition
                 # in the current accounting day. This keeps overnight OPEN positions
@@ -3079,6 +3132,7 @@ if page == "Zero-Trading":
                         "ToBuy",
                         "Ticker",
                         "TickerName",
+                        "News",
                         "BuyTs",
                         "BuyC2",
                         "SellC4",
@@ -6849,6 +6903,12 @@ elif page == "Historical Data":
 
 elif page == "Sim-Trading":
     st.header("Sim-Trading")
+
+    # News is informational only. Failure to load it must never prevent
+    # Sim-Trading or any trading-rule calculation from working.
+    sim_news_map = latest_ticker_news_map(
+        load_ticker_news_cached()
+    )
     sim_market_for_summary = df[df["asset_type"].isin(["stock", "crypto"])].copy()
     sim_summary_placeholder = st.empty()
 
@@ -7575,6 +7635,18 @@ elif page == "Sim-Trading":
                 axis=1,
             )
 
+            # Informational context only. Add news after C2-C7 and Needed
+            # have already been calculated so it cannot influence simulator
+            # state or any BUY/SELL decision.
+            shown["News"] = (
+                shown["Ticker"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .map(sim_news_map)
+                .fillna("—")
+            )
+
             shown["DiffSellPriceRaw"] = pd.to_numeric(
                 shown["RelativeDifference"],
                 errors="coerce",
@@ -7713,6 +7785,7 @@ elif page == "Sim-Trading":
                 "SimStatus",
                 "Ticker",
                 "TickerName",
+                "News",
                 "InitTime",
                 "InitPrice",
                 "SellTimeDisplay",
