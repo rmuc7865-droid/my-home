@@ -562,6 +562,129 @@ def test_ticker_news_retention() -> None:
         engine.dispose()
 
 
+
+def test_ticker_news_read_api() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import server.app as app_module
+    from server.database import Base, TickerNews
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+
+    TestSession = sessionmaker(bind=engine)
+    db = TestSession()
+
+    now = datetime.now(timezone.utc)
+
+    def add_news(
+        article_id: str,
+        ticker: str,
+        age_hours: float,
+        category: str = "Other",
+    ) -> None:
+        db.add(
+            TickerNews(
+                article_id=article_id,
+                ticker=ticker,
+                published_at=now - timedelta(hours=age_hours),
+                title=f"Title {article_id}",
+                description=f"Description {article_id}",
+                publisher="Test Publisher",
+                article_url=f"https://example.com/{article_id}",
+                category=category,
+                summary=f"{category}: Summary {article_id}",
+                collected_at=now,
+            )
+        )
+
+    # Three recent AAPL articles -> API must expose only newest two.
+    add_news("aapl-newest", "AAPL", 1, "Earnings")
+    add_news("aapl-second", "AAPL", 2, "Guidance")
+    add_news("aapl-third", "AAPL", 3, "Other")
+
+    # One recent MSFT article.
+    add_news("msft-newest", "MSFT", 1.5, "Product")
+
+    # Older than retention/API window -> excluded.
+    add_news("nvda-old", "NVDA", 8 * 24, "Other")
+
+    db.commit()
+
+    try:
+        rows = app_module.ticker_news(
+            ticker=None,
+            days=7,
+            db=db,
+        )
+
+        assert len(rows) == 3, rows
+
+        # Overall result must be newest first.
+        assert [
+            row["Title"]
+            for row in rows
+        ] == [
+            "Title aapl-newest",
+            "Title msft-newest",
+            "Title aapl-second",
+        ], rows
+
+        aapl = [
+            row
+            for row in rows
+            if row["Ticker"] == "AAPL"
+        ]
+
+        assert len(aapl) == 2, aapl
+        assert [
+            row["Title"]
+            for row in aapl
+        ] == [
+            "Title aapl-newest",
+            "Title aapl-second",
+        ], aapl
+
+        assert not any(
+            row["Ticker"] == "NVDA"
+            for row in rows
+        ), rows
+
+        filtered = app_module.ticker_news(
+            ticker=" aapl ",
+            days=7,
+            db=db,
+        )
+
+        assert len(filtered) == 2, filtered
+        assert all(
+            row["Ticker"] == "AAPL"
+            for row in filtered
+        ), filtered
+
+        expected_fields = {
+            "Ticker",
+            "PublishedAt",
+            "Category",
+            "Summary",
+            "Title",
+            "Publisher",
+            "ArticleUrl",
+        }
+
+        assert set(rows[0]) == expected_fields, rows[0]
+
+    finally:
+        db.close()
+        engine.dispose()
+
+
 if __name__ == "__main__":
     tests = [
         test_news_classification,
@@ -580,6 +703,7 @@ if __name__ == "__main__":
         test_article_id_prevents_duplicate_storage,
         test_production_news_quality_cases,
         test_ticker_news_retention,
+        test_ticker_news_read_api,
     ]
 
     passed = 0

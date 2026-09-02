@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from shared.models import TradeSignal, UploadBatch, UploadResult
-from .database import Alert, Instrument, Measurement, SimulationTrade, SessionLocal, init_db
+from .database import Alert, Instrument, Measurement, SimulationTrade, TickerNews, SessionLocal, init_db
 from .rules import evaluate_rule, load_rules
 from .settings import settings
 from .telegram import send_alert
@@ -593,6 +593,63 @@ def massive_tickers(db: Session = Depends(get_db)) -> dict[str, list[str]]:
 @app.post("/api/v1/instruments/discover", dependencies=[Depends(require_api_key)])
 async def run_instrument_discovery(db: Session = Depends(get_db)) -> dict:
     return await discover_top_gainers(db)
+
+
+@app.get("/api/v1/instruments/news", dependencies=[Depends(require_api_key)])
+def ticker_news(
+    ticker: str | None = Query(default=None),
+    days: int = Query(default=7, ge=1, le=7),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Return recent stored ticker news, newest first."""
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    statement = (
+        select(TickerNews)
+        .where(TickerNews.published_at >= cutoff)
+        .order_by(
+            TickerNews.published_at.desc(),
+            TickerNews.id.desc(),
+        )
+    )
+
+    ticker_filter = str(ticker or "").strip().upper()
+    if ticker_filter:
+        statement = statement.where(
+            TickerNews.ticker == ticker_filter
+        )
+
+    rows = db.scalars(statement).all()
+
+    # The collector keeps at most two relevant articles per ticker per run.
+    # Retention can contain articles from several collection days, so enforce
+    # the dashboard/API contract independently here as well.
+    result = []
+    ticker_counts: dict[str, int] = {}
+
+    for row in rows:
+        ticker_key = str(row.ticker or "").strip().upper()
+
+        if ticker_counts.get(ticker_key, 0) >= 2:
+            continue
+
+        ticker_counts[ticker_key] = ticker_counts.get(ticker_key, 0) + 1
+
+        result.append(
+            {
+                "Ticker": ticker_key,
+                "PublishedAt": row.published_at,
+                "Category": row.category,
+                "Summary": row.summary,
+                "Title": row.title,
+                "Publisher": row.publisher,
+                "ArticleUrl": row.article_url,
+            }
+        )
+
+    return result
+
 
 
 @app.post("/api/v1/instruments/news", dependencies=[Depends(require_api_key)])
