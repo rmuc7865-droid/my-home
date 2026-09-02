@@ -4083,7 +4083,7 @@ elif page == "Settings":
             "Parameter names: movement_percent = the percentage threshold shared by C4 and C5; "
             "c5_hours = the C5 static-price window length; c6_min_gain_percent = the lower "
             "end-of-day gain threshold; c7_max_gain_percent = the upper end-of-day gain threshold; "
-            "Details controls the Zero-Trading simulator-action detail columns."
+            "Details controls the simulator detail columns on Zero-Trading and Sim-Trading."
         )
 
         st.markdown("**Market calendars and trading windows (C1 / CanSellNow)**")
@@ -6852,14 +6852,25 @@ elif page == "Sim-Trading":
     sim_market_for_summary = df[df["asset_type"].isin(["stock", "crypto"])].copy()
     sim_summary_placeholder = st.empty()
 
-    def render_sim_summary(open_count: int = 0) -> None:
+    def render_sim_summary(
+        open_count: int = 0,
+        day_max_open_count: int = 0,
+    ) -> None:
         available_slots = max(0, BUY_MAX_OPEN_TICKERS - int(open_count))
         with sim_summary_placeholder.container():
-            portfolio_cols = st.columns(4)
-            portfolio_cols[0].metric("Newest Data", format_newest_data(sim_market_for_summary))
-            portfolio_cols[1].metric("OPEN tickers", int(open_count))
-            portfolio_cols[2].metric("Maximum OPEN", BUY_MAX_OPEN_TICKERS)
-            portfolio_cols[3].metric("Available BUY slots", available_slots)
+            portfolio_cols = st.columns(3)
+            portfolio_cols[0].metric(
+                "Newest Data",
+                format_newest_data(sim_market_for_summary),
+            )
+            portfolio_cols[1].metric(
+                "LastOPENTickers / DayMaxOPENTickers",
+                f"{int(open_count)}/{int(day_max_open_count)}",
+            )
+            portfolio_cols[2].metric(
+                "AvailableBUYTickers",
+                available_slots,
+            )
 
     render_sim_summary()
 
@@ -7115,7 +7126,75 @@ elif page == "Sim-Trading":
             )
 
             current_open_count = int((shown["SimStatus"] == "OPEN").sum())
-            render_sim_summary(current_open_count)
+
+            # Maximum simultaneously OPEN simulator positions during the active
+            # local 03:00 -> 03:00 accounting day. Positions already OPEN at
+            # 03:00 form the starting count; BUYs add one and SELLs subtract one.
+            now_local = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+            sim_accounting_day = now_local.normalize()
+            if now_local.hour < 3:
+                sim_accounting_day = sim_accounting_day - pd.Timedelta(days=1)
+            sim_day_start_utc = (
+                sim_accounting_day + pd.Timedelta(hours=3)
+            ).tz_convert("UTC")
+            sim_day_end_utc = sim_day_start_utc + pd.Timedelta(days=1)
+            sim_effective_end_utc = min(
+                sim_day_end_utc,
+                pd.Timestamp.now(tz="UTC"),
+            )
+
+            day_max_open_count = 0
+            if not simulation_df.empty:
+                open_at_start = (
+                    simulation_df["BuyTime"].notna()
+                    & (simulation_df["BuyTime"] < sim_day_start_utc)
+                    & (
+                        simulation_df["SellTime"].isna()
+                        | (simulation_df["SellTime"] >= sim_day_start_utc)
+                    )
+                )
+                running_open_count = int(open_at_start.sum())
+                day_max_open_count = running_open_count
+
+                buy_events = simulation_df.loc[
+                    simulation_df["BuyTime"].notna()
+                    & (simulation_df["BuyTime"] >= sim_day_start_utc)
+                    & (simulation_df["BuyTime"] <= sim_effective_end_utc),
+                    ["BuyTime"],
+                ].copy()
+                buy_events["EventTime"] = buy_events["BuyTime"]
+                buy_events["Delta"] = 1
+                buy_events["EventOrder"] = 0
+
+                sell_events = simulation_df.loc[
+                    simulation_df["SellTime"].notna()
+                    & (simulation_df["SellTime"] >= sim_day_start_utc)
+                    & (simulation_df["SellTime"] <= sim_effective_end_utc),
+                    ["SellTime"],
+                ].copy()
+                sell_events["EventTime"] = sell_events["SellTime"]
+                sell_events["Delta"] = -1
+                sell_events["EventOrder"] = 1
+
+                sim_day_events = pd.concat(
+                    [
+                        buy_events[["EventTime", "Delta", "EventOrder"]],
+                        sell_events[["EventTime", "Delta", "EventOrder"]],
+                    ],
+                    ignore_index=True,
+                ).sort_values(
+                    ["EventTime", "EventOrder"],
+                    ascending=[True, True],
+                )
+
+                for _, sim_event in sim_day_events.iterrows():
+                    running_open_count += int(sim_event["Delta"])
+                    day_max_open_count = max(
+                        day_max_open_count,
+                        running_open_count,
+                    )
+
+            render_sim_summary(current_open_count, day_max_open_count)
 
             def sim_trade_reason(row):
                 status = str(row.get("SimStatus") or "").strip().upper()
@@ -7145,7 +7224,7 @@ elif page == "Sim-Trading":
 
                 return "—"
 
-            shown["Reason"] = shown.apply(
+            shown["SimReason"] = shown.apply(
                 sim_trade_reason,
                 axis=1,
             )
@@ -7560,7 +7639,27 @@ elif page == "Sim-Trading":
             shown["SellTimeDisplay"] = shown["SellTime"].map(
                 format_local_time
             )
-            shown["LastTime"] = shown["LastTimeRaw"].map(
+            # Latest simulator action for the ticker. OPEN means its latest
+            # simulator action is BUY; CLOSED means its latest action is SELL.
+            shown["SimAction"] = shown["SimStatus"].map(
+                lambda status: (
+                    "BUY"
+                    if str(status).strip().upper() == "OPEN"
+                    else (
+                        "SELL"
+                        if str(status).strip().upper() == "CLOSED"
+                        else "—"
+                    )
+                )
+            )
+            shown["SimActionTimeRaw"] = shown["BuyTime"]
+            closed_action_mask = shown["SimStatus"] == "CLOSED"
+            shown.loc[closed_action_mask, "SimActionTimeRaw"] = shown.loc[
+                closed_action_mask, "SellTime"
+            ]
+            no_trade_action_mask = ~shown["SimStatus"].isin(["OPEN", "CLOSED"])
+            shown.loc[no_trade_action_mask, "SimActionTimeRaw"] = pd.NaT
+            shown["SimActionTime"] = shown["SimActionTimeRaw"].map(
                 format_local_time
             )
 
@@ -7600,40 +7699,51 @@ elif page == "Sim-Trading":
             shown = shown.sort_values(
                 by=[
                     "_StatusSort",
-                    "_DiffSellPriceSort",
-                    "_DiffLastPriceSort",
+                    "SimActionTimeRaw",
                     "Ticker",
                 ],
-                ascending=[True, False, False, True],
+                ascending=[True, False, True],
                 na_position="last",
             )
 
-            display = shown[
-                [
-                    "SimStatus",
-                    "Ticker",
-                    "TickerName",
-                    "Reason",
+            display_columns = [
+                "SimActionTime",
+                "SimAction",
+                "SimReason",
+                "SimStatus",
+                "Ticker",
+                "TickerName",
+                "InitTime",
+                "InitPrice",
+                "SellTimeDisplay",
+                "SellPrice",
+                "DiffSellTime",
+                "DiffSellPrice",
+                "LastPrice",
+                "DiffLastTime",
+                "DiffLastPrice",
+            ]
+
+            sim_details = bool(SELL_CONFIG.get("details", True))
+            if sim_details:
+                display_columns.extend([
                     "Needed",
                     "C2",
                     "C4",
                     "C5",
                     "C6",
                     "C7",
-                    "InitTime",
-                    "InitPrice",
-                    "SellTimeDisplay",
-                    "SellPrice",
-                    "DiffSellTime",
-                    "DiffSellPrice",
-                    "LastTime",
-                    "LastPrice",
-                    "DiffLastTime",
-                    "DiffLastPrice",
-                ]
-            ].rename(
+                ])
+
+            display = shown[display_columns].rename(
                 columns={
                     "SellTimeDisplay": "SellTime",
+                    "Needed": "LastNeeded",
+                    "C2": "LastC2",
+                    "C4": "LastC4",
+                    "C5": "LastC5",
+                    "C6": "LastC6",
+                    "C7": "LastC7",
                 }
             )
 
@@ -7697,12 +7807,12 @@ elif page == "Sim-Trading":
             )
 
             st.caption(
-                "SimStatus shows the ticker's latest simulator state: OPEN, CLOSED, "
-                "or NO TRADE. Reason gives a maximum-three-word explanation of the "
-                "transition: OPEN uses 'Buy signal' because the simulator currently "
-                "does not persist a separate BuyReason; CLOSED uses the stored "
-                "SellReason. C2, C4, C5, and C6 show the current condition values "
-                "used for the Zero-Trading decision. "
+                "SimActionTime and SimAction show the latest simulator transition "
+                "for the ticker: BUY for an OPEN latest trade and SELL for a CLOSED "
+                "latest trade. SimReason explains that transition. SimStatus shows "
+                "the latest simulator state: OPEN, CLOSED, or NO TRADE. "
+                "When Settings > Details is enabled, LastNeeded and LastC2 through "
+                "LastC7 show the condition values at the ticker's latest market data. "
                 "InitTime and InitPrice are the latest simulated BUY time and EUR price. "
                 "SellTime and SellPrice are populated when the latest simulated trade "
                 "has been sold."
@@ -7714,9 +7824,8 @@ elif page == "Sim-Trading":
                 "latest collected market-data time and EUR price. DiffLastTime = "
                 "LastTime - InitTime. DiffLastPrice = percentage change from "
                 "InitPrice to LastPrice. Elapsed times use D days HH:MM. Rows are "
-                "sorted first by SimStatus, then by DiffSellPrice, and then by "
-                "DiffLastPrice; both percentage differences are ordered from "
-                "highest to lowest."
+                "sorted first by SimStatus and then by SimActionTime, newest "
+                "simulator action first within each status."
             )
 
 elif page == "Trading Efficiency":

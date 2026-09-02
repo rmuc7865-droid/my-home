@@ -1,0 +1,18 @@
+--- a/dashboard/streamlit_app.py
++++ b/dashboard/streamlit_app.py
+@@ -7822,10 +7822,13 @@
+                     axis_padding = selected_period / 8
+                 axis_domain_start = first_node_time - axis_padding
+                 axis_domain_end = last_node_time + axis_padding
++                # Altair scale domains accept only UTC-aware or naive datetimes.
++                # Keep the plotted data in Europe/Berlin local time, but express
++                # the domain endpoints as the equivalent UTC instants.
+                 shared_time_scale = alt.Scale(
+                     domain=[
+-                        axis_domain_start.to_pydatetime(),
+-                        axis_domain_end.to_pydatetime(),
++                        axis_domain_start.tz_convert("UTC").to_pydatetime(),
++                        axis_domain_end.tz_convert("UTC").to_pydatetime(),
+                     ]
+                 )
+ 
