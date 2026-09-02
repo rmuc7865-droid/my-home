@@ -967,42 +967,15 @@ def evaluate_buy(
         ]
     )
 
-    membership = load_watchlist_membership()
     recipients = config.get("recipients") or []
 
-    # Tracks which selected tickers were successfully
-    # delivered to at least one interested user.
+    # Simulator BUY recommendations are global. Every configured
+    # Telegram recipient receives the same selected ticker set,
+    # independent of imported watchlist membership.
     sent_tickers: set[str] = set()
 
     for recipient in recipients:
-        watchlist = str(
-            recipient.get("watchlist") or ""
-        ).strip().lower()
-
-        if not watchlist:
-            logger.warning(
-                "BUY skipped recipient %s: "
-                "no watchlist configured",
-                recipient.get("name", "?"),
-            )
-            continue
-
-        recipient_rows = [
-            row
-            for row in selected
-            if watchlist
-            in membership.get(
-                str(row["ticker"]).upper(),
-                set(),
-            )
-        ]
-
-        if not recipient_rows:
-            logger.info(
-                "BUY: no selected tickers for %s",
-                recipient.get("name", "?"),
-            )
-            continue
+        recipient_rows = selected
 
         tickers_text = "\n".join(
             (
@@ -1681,7 +1654,6 @@ def evaluate_sell(
                 client,
                 config,
                 message,
-                ticker=ticker,
             )
             if sent_count > 0:
                 advisories[ticker] = advisory_key
@@ -1698,7 +1670,6 @@ def evaluate_sell(
             client,
             config,
             message,
-            ticker=ticker,
         )
         if sent_count <= 0:
             continue
