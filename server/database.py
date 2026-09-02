@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 from .settings import settings
@@ -67,6 +67,71 @@ class Instrument(Base):
     gainer_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
     previous_close: Mapped[float | None] = mapped_column(Float, nullable=True)
     last_gainer_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class TickerNews(Base):
+    __tablename__ = "ticker_news"
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker",
+            "article_id",
+            name="uq_ticker_news_ticker_article",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    # Massive/Polygon article identifier. Prevents duplicate storage when
+    # the same article is returned by multiple collection runs.
+    article_id: Mapped[str] = mapped_column(
+        String(128),
+        index=True,
+    )
+
+    ticker: Mapped[str] = mapped_column(
+        String(32),
+        index=True,
+    )
+
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+
+    title: Mapped[str] = mapped_column(
+        Text,
+    )
+
+    description: Mapped[str] = mapped_column(
+        Text,
+        default="",
+    )
+
+    publisher: Mapped[str] = mapped_column(
+        String(256),
+        default="",
+    )
+
+    article_url: Mapped[str] = mapped_column(
+        Text,
+        default="",
+    )
+
+    category: Mapped[str] = mapped_column(
+        String(32),
+        default="Other",
+        index=True,
+    )
+
+    summary: Mapped[str] = mapped_column(
+        Text,
+        default="",
+    )
+
+    collected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
 
 
 class SimulationTrade(Base):

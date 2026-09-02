@@ -16,6 +16,7 @@ from .rules import evaluate_rule, load_rules
 from .settings import settings
 from .telegram import send_alert
 from .instrument_discovery import discover_top_gainers, seed_manual_instruments
+from .ticker_news import collect_ticker_news
 
 
 def get_db():
@@ -102,7 +103,35 @@ async def lifespan(_: FastAPI):
         finally:
             job_db.close()
 
-    scheduler.add_job(discovery_job, "cron", hour=3, minute=0, max_instances=1, coalesce=True)
+    async def ticker_news_job() -> None:
+        job_db = SessionLocal()
+        try:
+            result = await collect_ticker_news(job_db)
+            print(f"Automatic ticker news collection: {result}")
+        except Exception as exc:
+            print(
+                "Automatic ticker news collection failed: "
+                f"{type(exc).__name__}"
+            )
+        finally:
+            job_db.close()
+
+    scheduler.add_job(
+        discovery_job,
+        "cron",
+        hour=3,
+        minute=0,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        ticker_news_job,
+        "cron",
+        hour=4,
+        minute=0,
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
     try:
         yield
@@ -564,3 +593,10 @@ def massive_tickers(db: Session = Depends(get_db)) -> dict[str, list[str]]:
 @app.post("/api/v1/instruments/discover", dependencies=[Depends(require_api_key)])
 async def run_instrument_discovery(db: Session = Depends(get_db)) -> dict:
     return await discover_top_gainers(db)
+
+
+@app.post("/api/v1/instruments/news", dependencies=[Depends(require_api_key)])
+async def run_ticker_news_collection(
+    db: Session = Depends(get_db),
+) -> dict:
+    return await collect_ticker_news(db)
