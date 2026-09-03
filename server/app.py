@@ -13,12 +13,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from shared.models import TradeSignal, UploadBatch, UploadResult
-from .database import Alert, Instrument, Measurement, SimulationTrade, TickerNews, SessionLocal, init_db
+from .database import Alert, Instrument, Measurement, SimulationTrade, TickerDividend, TickerNews, SessionLocal, init_db
 from .rules import evaluate_rule, load_rules
 from .settings import settings
 from .telegram import send_alert
 from .instrument_discovery import discover_top_gainers, seed_manual_instruments
 from .ticker_news import collect_ticker_news
+from .ticker_dividends import collect_ticker_dividends
 
 
 def get_db():
@@ -181,6 +182,25 @@ async def lifespan(_: FastAPI):
         finally:
             job_db.close()
 
+    async def ticker_dividends_job() -> None:
+        job_db = SessionLocal()
+        try:
+            result = await collect_ticker_dividends(
+                job_db
+            )
+            print(
+                "Automatic ticker dividend collection: "
+                f"{result}"
+            )
+        except Exception as exc:
+            print(
+                "Automatic ticker dividend collection "
+                "failed: "
+                f"{type(exc).__name__}"
+            )
+        finally:
+            job_db.close()
+
     scheduler.add_job(
         discovery_job,
         "cron",
@@ -194,6 +214,14 @@ async def lifespan(_: FastAPI):
         "cron",
         hour=4,
         minute=0,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        ticker_dividends_job,
+        "cron",
+        hour=4,
+        minute=30,
         max_instances=1,
         coalesce=True,
     )
@@ -686,15 +714,67 @@ def instruments(active: bool = Query(default=True), db: Session = Depends(get_db
     if active:
         statement = statement.where(Instrument.active.is_(True))
     rows = db.scalars(statement).all()
-    return [
-        {
-            "Ticker": row.ticker, "Name": row.name, "ISIN": row.isin,
-            "AssetType": row.asset_type, "Provider": row.provider,
-            "Source": row.source, "Active": row.active,
-            "DiscoveredAt": row.discovered_at, "GainerPercent": row.gainer_percent,
-            "GainerVolume": row.gainer_volume, "PreviousClose": row.previous_close,
-        } for row in rows
-    ]
+
+    dividend_rows = db.scalars(
+        select(TickerDividend)
+    ).all()
+
+    dividends = {
+        row.ticker.upper(): row
+        for row in dividend_rows
+    }
+
+    result = []
+
+    for row in rows:
+        dividend = dividends.get(
+            row.ticker.upper()
+        )
+
+        result.append(
+            {
+                "Ticker": row.ticker,
+                "Name": row.name,
+                "ISIN": row.isin,
+                "AssetType": row.asset_type,
+                "Provider": row.provider,
+                "Source": row.source,
+                "Active": row.active,
+                "DiscoveredAt": row.discovered_at,
+                "GainerPercent": row.gainer_percent,
+                "GainerVolume": row.gainer_volume,
+                "PreviousClose": row.previous_close,
+                "LastDividend": (
+                    dividend.last_dividend_date
+                    if dividend
+                    else None
+                ),
+                "ExpNextDividend": (
+                    dividend.next_dividend_date
+                    if dividend
+                    else None
+                ),
+                "DividendEUR": (
+                    dividend.dividend_eur
+                    if dividend
+                    else None
+                ),
+                "DividendType": (
+                    (
+                        "estimated"
+                        if dividend.next_is_estimated
+                        else "announced"
+                    )
+                    if (
+                        dividend
+                        and dividend.next_dividend_date
+                    )
+                    else "-"
+                ),
+            }
+        )
+
+    return result
 
 
 @app.get("/api/v1/instruments/massive-tickers", dependencies=[Depends(require_api_key)])

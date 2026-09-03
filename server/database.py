@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 from .settings import settings
@@ -131,6 +131,79 @@ class TickerNews(Base):
     collected_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         index=True,
+    )
+
+
+class TickerDividend(Base):
+    __tablename__ = "ticker_dividends"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+
+    ticker: Mapped[str] = mapped_column(
+        String(32),
+        unique=True,
+        index=True,
+    )
+
+    last_dividend_date: Mapped[
+        date | None
+    ] = mapped_column(
+        Date,
+        nullable=True,
+        index=True,
+    )
+
+    next_dividend_date: Mapped[
+        date | None
+    ] = mapped_column(
+        Date,
+        nullable=True,
+        index=True,
+    )
+
+    next_is_estimated: Mapped[bool] = (
+        mapped_column(
+            Boolean,
+            default=False,
+        )
+    )
+
+    dividend_amount: Mapped[
+        float | None
+    ] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    dividend_currency: Mapped[str] = (
+        mapped_column(
+            String(8),
+            default="",
+        )
+    )
+
+    dividend_eur: Mapped[
+        float | None
+    ] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    frequency: Mapped[
+        int | None
+    ] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    collected_at: Mapped[datetime] = (
+        mapped_column(
+            DateTime(timezone=True),
+            index=True,
+        )
     )
 
 

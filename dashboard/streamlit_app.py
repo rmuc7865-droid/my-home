@@ -71,9 +71,30 @@ def load_instrument_metadata_cached():
         isin = str(row.get("ISIN") or "").strip()
         source = str(row.get("Source") or "").strip().upper()
 
+        last_dividend = str(
+            row.get("LastDividend") or ""
+        ).strip()
+
+        next_dividend = str(
+            row.get("ExpNextDividend") or ""
+        ).strip()
+
+        try:
+            dividend_eur = float(
+                row.get("DividendEUR")
+            )
+        except (TypeError, ValueError):
+            dividend_eur = None
+
         result[ticker] = {
             "ISIN": isin or "—",
             "Gainer": source == "AUTO_GAINER",
+            "LastDividend": last_dividend,
+            "ExpNextDividend": next_dividend,
+            "DividendEUR": dividend_eur,
+            "DividendType": str(
+                row.get("DividendType") or "-"
+            ).strip() or "-",
         }
 
     return result
@@ -3831,6 +3852,90 @@ elif page == "Last Data":
                     )
                 )
 
+                def _last_data_dividend_date(
+                    ticker,
+                    field,
+                ):
+                    value = (
+                        last_data_instrument_metadata
+                        .get(ticker, {})
+                        .get(field)
+                    )
+
+                    if not value:
+                        return "-"
+
+                    parsed = pd.to_datetime(
+                        value,
+                        errors="coerce",
+                    )
+
+                    if pd.isna(parsed):
+                        return "-"
+
+                    return parsed.strftime(
+                        "%d.%m.%Y"
+                    )
+
+                relevant["LastDividend"] = (
+                    last_data_ticker_keys.map(
+                        lambda ticker:
+                        _last_data_dividend_date(
+                            ticker,
+                            "LastDividend",
+                        )
+                    )
+                )
+
+                relevant["ExpNextDividend"] = (
+                    last_data_ticker_keys.map(
+                        lambda ticker:
+                        _last_data_dividend_date(
+                            ticker,
+                            "ExpNextDividend",
+                        )
+                    )
+                )
+
+                def _last_data_dividend_amount(
+                    ticker,
+                ):
+                    value = (
+                        last_data_instrument_metadata
+                        .get(ticker, {})
+                        .get("DividendEUR")
+                    )
+
+                    try:
+                        amount = float(value)
+                    except (TypeError, ValueError):
+                        return "-"
+
+                    if not math.isfinite(amount):
+                        return "-"
+
+                    return f"€{amount:.2f}"
+
+                relevant["Dividend"] = (
+                    last_data_ticker_keys.map(
+                        _last_data_dividend_amount
+                    )
+                )
+
+                relevant["DividendType"] = (
+                    last_data_ticker_keys.map(
+                        lambda ticker: str(
+                            last_data_instrument_metadata
+                            .get(ticker, {})
+                            .get(
+                                "DividendType",
+                                "-",
+                            )
+                            or "-"
+                        )
+                    )
+                )
+
                 # DayRecs is a display value. Keep it as text so Streamlit
                 # follows the table's left alignment instead of right-aligning
                 # it as a numeric column.
@@ -3843,6 +3948,40 @@ elif page == "Last Data":
                     "TickerName",
                     "ISIN",
                     "Gainer",
+                ]
+
+                if bool(
+                    SELL_CONFIG.get(
+                        "details",
+                        True,
+                    )
+                ):
+                    live_columns.extend(
+                        [
+                            "LastDividend",
+                        ]
+                    )
+
+                live_columns.extend(
+                    [
+                        "ExpNextDividend",
+                    ]
+                )
+
+                if bool(
+                    SELL_CONFIG.get(
+                        "details",
+                        True,
+                    )
+                ):
+                    live_columns.extend(
+                        [
+                            "Dividend",
+                            "DividendType",
+                        ]
+                    )
+
+                live_columns.extend([
                     "DayRecs",
                     "LastCollect",
                     "LastPrice",
@@ -3856,7 +3995,7 @@ elif page == "Last Data":
                     "LastSelling",
                     "WaitToTrade",
                     "WaitToOpening",
-                ]
+                ])
 
                 display = relevant[
                     [column for column in live_columns if column in relevant.columns]
