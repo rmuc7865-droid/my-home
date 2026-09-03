@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
+from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta, timezone
 
@@ -33,6 +35,59 @@ def require_api_key(x_api_key: str = Header(default="")) -> None:
 
 
 MEASUREMENT_RETENTION_DAYS = 183
+GAINER_DISCOVERY_STATE_FILE = Path(
+    "/data/gainer_discovery_state.json"
+)
+BERLIN_TIMEZONE = ZoneInfo("Europe/Berlin")
+
+
+def _gainer_discovery_date() -> str | None:
+    try:
+        with GAINER_DISCOVERY_STATE_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            state = json.load(handle)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+    value = state.get(
+        "last_successful_gainer_discovery_date"
+    )
+
+    if not isinstance(value, str):
+        return None
+
+    return value
+
+
+def _mark_gainer_discovery_success(
+    discovery_date: str,
+) -> None:
+    GAINER_DISCOVERY_STATE_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary = GAINER_DISCOVERY_STATE_FILE.with_suffix(
+        ".tmp"
+    )
+
+    temporary.write_text(
+        json.dumps(
+            {
+                "last_successful_gainer_discovery_date":
+                discovery_date,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    temporary.replace(
+        GAINER_DISCOVERY_STATE_FILE
+    )
+
 
 def cleanup_old_measurements() -> None:
     cutoff = (
@@ -98,6 +153,16 @@ async def lifespan(_: FastAPI):
         try:
             result = await discover_top_gainers(job_db)
             print(f"Automatic gainer discovery: {result}")
+
+            if result.get("status") == "ok":
+                discovery_date = (
+                    datetime.now(BERLIN_TIMEZONE)
+                    .date()
+                    .isoformat()
+                )
+                _mark_gainer_discovery_success(
+                    discovery_date
+                )
         except Exception as exc:
             print(f"Automatic gainer discovery failed: {exc}")
         finally:
@@ -133,6 +198,32 @@ async def lifespan(_: FastAPI):
         coalesce=True,
     )
     scheduler.start()
+
+    berlin_now = datetime.now(BERLIN_TIMEZONE)
+    today = berlin_now.date().isoformat()
+    discovery_due = berlin_now.replace(
+        hour=3,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    last_discovery_date = (
+        _gainer_discovery_date()
+    )
+
+    if (
+        berlin_now >= discovery_due
+        and last_discovery_date != today
+    ):
+        print(
+            "Automatic gainer discovery catch-up: "
+            f"last_successful="
+            f"{last_discovery_date!r}, "
+            f"today={today}"
+        )
+        await discovery_job()
+
     try:
         yield
     finally:
