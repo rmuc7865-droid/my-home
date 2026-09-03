@@ -651,17 +651,17 @@ def newest_local_timestamp(
     ]
 
     if not valid:
-        return datetime.now().astimezone().strftime(
-            "%Y-%m-%d %H:%M"
+        return (
+            pd.Timestamp.now(tz="Europe/Berlin")
+            .strftime("%Y-%m-%d %H:%M")
         )
 
     newest = max(valid)
 
-    if isinstance(newest, pd.Timestamp):
-        newest = newest.to_pydatetime()
-
-    return newest.astimezone().strftime(
-        "%Y-%m-%d %H:%M"
+    return (
+        pd.to_datetime(newest, utc=True)
+        .tz_convert("Europe/Berlin")
+        .strftime("%Y-%m-%d %H:%M")
     )
 
 def evaluate_buy(
