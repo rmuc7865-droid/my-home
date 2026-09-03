@@ -327,6 +327,34 @@ def record_simulation_signal(
     now = datetime.now(timezone.utc)
     ticker = signal.ticker.upper().strip()
     if signal.side == "BUY":
+        # A market-data timestamp may be evaluated by the notifier more than
+        # once. Never create a second simulation BUY for the same ticker and
+        # signal timestamp, even when the earlier position has already been
+        # closed.
+        signal_time = signal.timestamp
+        if signal_time.tzinfo is not None:
+            signal_time = signal_time.astimezone(
+                timezone.utc
+            ).replace(tzinfo=None)
+
+        existing_same_signal = db.scalar(
+            select(SimulationTrade)
+            .where(
+                SimulationTrade.ticker == ticker,
+                SimulationTrade.buy_time == signal_time,
+                SimulationTrade.buy_telegram_sent.is_(True),
+            )
+            .order_by(SimulationTrade.id.asc())
+            .limit(1)
+        )
+        if existing_same_signal:
+            return {
+                "recorded": False,
+                "reason": "duplicate_buy_timestamp",
+                "trade_id": existing_same_signal.id,
+                "ticker": ticker,
+            }
+
         existing_open = db.scalar(
             select(SimulationTrade)
             .where(

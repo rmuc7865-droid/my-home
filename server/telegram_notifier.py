@@ -835,6 +835,78 @@ def evaluate_buy(
         if row["ticker"] not in open_tickers
     ]
 
+    # Do not notify or record the same BUY signal twice. A ticker may become
+    # eligible again after its previous position is closed, but only when a
+    # newer market-data timestamp is available.
+    simulation_history = api_get(
+        client,
+        "/api/v1/simulation",
+        {
+            "days": 0,
+            "include_open": True,
+        },
+    )
+
+    used_buy_signals: set[tuple[str, pd.Timestamp]] = set()
+
+    for trade in simulation_history or []:
+        history_ticker = str(
+            trade.get("Ticker") or ""
+        ).strip().upper()
+
+        history_time = pd.to_datetime(
+            trade.get("BuyTime"),
+            utc=True,
+            errors="coerce",
+        )
+
+        if history_ticker and pd.notna(history_time):
+            used_buy_signals.add(
+                (
+                    history_ticker,
+                    history_time,
+                )
+            )
+
+    duplicate_signal_rows = []
+
+    deduplicated_eligible = []
+
+    for row in eligible:
+        ticker = str(
+            row["ticker"]
+        ).strip().upper()
+
+        signal_time = pd.to_datetime(
+            row["latest_time"],
+            utc=True,
+            errors="coerce",
+        )
+
+        if (
+            pd.notna(signal_time)
+            and (ticker, signal_time)
+            in used_buy_signals
+        ):
+            duplicate_signal_rows.append(row)
+            continue
+
+        deduplicated_eligible.append(row)
+
+    if duplicate_signal_rows:
+        logger.info(
+            "BUY excluded previously used signals: %s",
+            ", ".join(
+                (
+                    f"{row['ticker']}@"
+                    f"{pd.to_datetime(row['latest_time'], utc=True)}"
+                )
+                for row in duplicate_signal_rows
+            ),
+        )
+
+    eligible = deduplicated_eligible
+
     trading_eligible = []
 
     for row in eligible:
