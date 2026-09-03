@@ -3328,6 +3328,14 @@ if page == "Zero-Trading":
         )
 
         st.caption(
+            "News shows the newest stored relevant news item for the ticker as "
+            "Category: Text. Category is derived from the article headline; Text is the "
+            "article description (or headline if no description is available), shortened "
+            "to 180 characters. It represents one article, not a combination of multiple "
+            "news items, and does not affect trading rules."
+        )
+
+        st.caption(
             "Parameters: BuyTs is the number of tickers whose Close2h is greater than or equal to "
             f"the configured C2 threshold ({BUY_MIN_CLOSEB_PERCENT:g}%) at LastTime; BuyC2 is the "
             f"C2 result and requires at least {BUY_MIN_CLOSEB_COUNT} qualifying tickers. SellC4 is "
@@ -3375,6 +3383,11 @@ if page == "Zero-Trading":
 
 elif page == "Last Data":
     st.header("Last Data")
+
+    # News is informational only and must not influence trading calculations.
+    last_data_news_map = latest_ticker_news_map(
+        load_ticker_news_cached()
+    )
 
     last_data_instrument_metadata = load_instrument_metadata_cached()
 
@@ -3877,6 +3890,12 @@ elif page == "Last Data":
                         "%d.%m.%Y"
                     )
 
+                relevant["News"] = (
+                    last_data_ticker_keys
+                    .map(last_data_news_map)
+                    .fillna("—")
+                )
+
                 relevant["LastDividend"] = (
                     last_data_ticker_keys.map(
                         lambda ticker:
@@ -3948,6 +3967,7 @@ elif page == "Last Data":
                     "TickerName",
                     "ISIN",
                     "Gainer",
+                    "News",
                 ]
 
                 if bool(
@@ -4061,6 +4081,14 @@ elif page == "Last Data":
                     use_container_width=True,
                     hide_index=True,
                 )
+
+        st.caption(
+            "News shows the newest stored relevant news item for the ticker as "
+            "Category: Text. Category is derived from the article headline; Text is the "
+            "article description (or headline if no description is available), shortened "
+            "to 180 characters. It represents one article, not a combination of multiple "
+            "news items, and does not affect trading rules."
+        )
 
         st.subheader("Steps to analyse tickers")
         st.markdown(
@@ -8088,6 +8116,14 @@ elif page == "Sim-Trading":
                 styled_display,
                 use_container_width=True,
                 hide_index=True,
+            )
+
+            st.caption(
+                "News shows the newest stored relevant news item for the ticker as "
+                "Category: Text. Category is derived from the article headline; Text is the "
+                "article description (or headline if no description is available), shortened "
+                "to 180 characters. It represents one article, not a combination of multiple "
+                "news items, and does not affect trading rules."
             )
 
             st.subheader("Steps to analyse the simulator results")
