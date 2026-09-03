@@ -260,6 +260,40 @@ def api_post(path: str):
     return response.json()
 
 
+def api_post_json(path: str, payload: dict):
+    response = httpx.post(
+        f"{API_URL}{path}",
+        headers=HEADERS,
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def api_post_file(
+    path: str,
+    *,
+    filename: str,
+    content: bytes,
+    content_type: str | None = None,
+):
+    response = httpx.post(
+        f"{API_URL}{path}",
+        headers=HEADERS,
+        files={
+            "file": (
+                filename,
+                content,
+                content_type or "application/octet-stream",
+            )
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 page = st.sidebar.radio(
     "Page",
     [
@@ -270,6 +304,7 @@ page = st.sidebar.radio(
         "Trading Efficiency",
         "System Health",
         "Alerts",
+        "Jira",
         "Settings",
         "Logs",
     ],
@@ -4232,6 +4267,174 @@ elif page == "Alerts":
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
+
+elif page == "Jira":
+    st.header("Jira")
+
+    st.caption(
+        "Jira issues are loaded only when Refresh Jira is pressed."
+    )
+
+    if "jira_issues" not in st.session_state:
+        st.session_state["jira_issues"] = None
+
+    if st.button("Refresh Jira", key="jira_refresh"):
+        try:
+            st.session_state["jira_issues"] = api_get(
+                "/api/v1/jira/issues",
+                {"limit": 100},
+            )
+            st.success("Jira issues refreshed.")
+        except Exception as exc:
+            st.error(f"Unable to retrieve Jira issues: {exc}")
+
+    jira_issues = st.session_state.get("jira_issues")
+
+    if jira_issues is None:
+        st.info(
+            "Press Refresh Jira to load the current issues "
+            "from project HM."
+        )
+    else:
+        jira_df = pd.DataFrame(jira_issues)
+
+        jira_columns = [
+            "Key",
+            "Summary",
+            "Status",
+            "IssueType",
+            "Created",
+            "Updated",
+        ]
+
+        for column in jira_columns:
+            if column not in jira_df.columns:
+                jira_df[column] = ""
+
+        jira_df = jira_df[jira_columns]
+
+        for column in ("Created", "Updated"):
+            jira_times = pd.to_datetime(
+                jira_df[column],
+                utc=True,
+                errors="coerce",
+            )
+            jira_df[column] = jira_times.dt.tz_convert(
+                LOCAL_TIMEZONE
+            ).dt.strftime("%d.%m %H:%M")
+            jira_df[column] = jira_df[column].fillna("—")
+
+        jira_df = jira_df.rename(
+            columns={"IssueType": "Issue Type"}
+        )
+
+        st.dataframe(
+            jira_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.subheader("Create Jira Issue")
+
+    with st.form(
+        "jira_create_issue_form",
+        clear_on_submit=True,
+    ):
+        jira_summary = st.text_input(
+            "Summary",
+            max_chars=255,
+        )
+
+        jira_description = st.text_area(
+            "Description",
+            height=180,
+        )
+
+        jira_attachment = st.file_uploader(
+            "Attachment (optional, max. 20 MB)",
+            key="jira_attachment",
+        )
+
+        jira_submit = st.form_submit_button(
+            "Create Issue",
+            type="primary",
+        )
+
+    if jira_submit:
+        summary = str(jira_summary or "").strip()
+        description = str(jira_description or "").strip()
+
+        if not summary:
+            st.error("Summary is required.")
+        else:
+            try:
+                created_issue = api_post_json(
+                    "/api/v1/jira/issues",
+                    {
+                        "summary": summary,
+                        "description": description,
+                    },
+                )
+
+                issue_key = str(
+                    created_issue.get("key") or ""
+                ).strip()
+
+                if not issue_key:
+                    raise RuntimeError(
+                        "Jira did not return an issue key."
+                    )
+
+                attachment_error = None
+
+                if (
+                    jira_attachment is not None
+                    and jira_attachment.size > 20 * 1024 * 1024
+                ):
+                    attachment_error = RuntimeError(
+                        "Attachment exceeds the 20 MB limit."
+                    )
+
+                if (
+                    jira_attachment is not None
+                    and attachment_error is None
+                ):
+                    try:
+                        api_post_file(
+                            (
+                                "/api/v1/jira/issues/"
+                                f"{issue_key}/attachment"
+                            ),
+                            filename=jira_attachment.name,
+                            content=jira_attachment.getvalue(),
+                            content_type=jira_attachment.type,
+                        )
+                    except Exception as exc:
+                        attachment_error = exc
+
+                try:
+                    st.session_state["jira_issues"] = api_get(
+                        "/api/v1/jira/issues",
+                        {"limit": 100},
+                    )
+                except Exception:
+                    pass
+
+                if attachment_error is None:
+                    st.success(
+                        f"Jira issue {issue_key} created successfully."
+                    )
+                else:
+                    st.warning(
+                        f"Jira issue {issue_key} was created, "
+                        "but the attachment could not be uploaded: "
+                        f"{attachment_error}"
+                    )
+
+            except Exception as exc:
+                st.error(
+                    f"Unable to create Jira issue: {exc}"
+                )
 
 elif page == "Settings":
     editable_config = load_trading_config()

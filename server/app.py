@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from sqlalchemy import delete, desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -20,6 +20,7 @@ from .telegram import send_alert
 from .instrument_discovery import discover_top_gainers, seed_manual_instruments
 from .ticker_news import collect_ticker_news
 from .ticker_dividends import collect_ticker_dividends
+from .jira_client import attach_file, create_issue, list_issues
 
 
 def get_db():
@@ -856,3 +857,114 @@ async def run_ticker_news_collection(
     db: Session = Depends(get_db),
 ) -> dict:
     return await collect_ticker_news(db)
+
+
+@app.get(
+    "/api/v1/jira/issues",
+    dependencies=[Depends(require_api_key)],
+)
+async def jira_issues(
+    limit: int = Query(default=100, ge=1, le=100),
+) -> list[dict]:
+    """Return HM Jira issues ordered by most recently updated."""
+
+    try:
+        return await list_issues(max_results=limit)
+    except Exception as exc:
+        print(
+            "Jira issue listing failed: "
+            f"{type(exc).__name__}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to retrieve Jira issues.",
+        ) from exc
+
+
+@app.post(
+    "/api/v1/jira/issues",
+    dependencies=[Depends(require_api_key)],
+)
+async def jira_create_issue(
+    payload: dict = Body(...),
+) -> dict:
+    """Create a Bug in the Home Monitor Jira project."""
+
+    summary = str(
+        payload.get("summary") or ""
+    ).strip()
+    description = str(
+        payload.get("description") or ""
+    ).strip()
+
+    if not summary:
+        raise HTTPException(
+            status_code=422,
+            detail="Issue summary is required.",
+        )
+
+    try:
+        return await create_issue(
+            summary=summary,
+            description=description,
+        )
+    except Exception as exc:
+        print(
+            "Jira issue creation failed: "
+            f"{type(exc).__name__}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to create Jira issue.",
+        ) from exc
+
+
+@app.post(
+    "/api/v1/jira/issues/{issue_key}/attachment",
+    dependencies=[Depends(require_api_key)],
+)
+async def jira_attach_file(
+    issue_key: str,
+    file: UploadFile = File(...),
+) -> dict:
+    """Attach one uploaded file to an existing Jira issue."""
+
+    filename = str(file.filename or "").strip()
+
+    if not filename:
+        raise HTTPException(
+            status_code=422,
+            detail="Attachment filename is required.",
+        )
+
+    try:
+        content = await file.read()
+
+        if not content:
+            raise HTTPException(
+                status_code=422,
+                detail="Attachment is empty.",
+            )
+
+        return await attach_file(
+            issue_key,
+            filename=filename,
+            content=content,
+            content_type=file.content_type,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(
+            "Jira attachment upload failed: "
+            f"{type(exc).__name__}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to attach file to Jira issue.",
+        ) from exc
+
+    finally:
+        await file.close()
