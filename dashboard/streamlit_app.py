@@ -1079,12 +1079,238 @@ def _hhmm_to_minutes(value: str) -> int:
     return int(hour_text) * 60 + int(minute_text)
 
 
+def historical_trading_window_start(
+    latest_time,
+    trading_duration: pd.Timedelta,
+    market_region: str | None,
+):
+    """Return the UTC start after counting only configured trading-session time.
+
+    This is used for the short Historical Data ranges (2h/6h/12h). Time
+    between ``post_end`` and the next ``pre_start`` is skipped, as are
+    configured weekends and closed dates. A session whose ``post_end`` is
+    earlier than/equal to ``pre_start`` is treated as crossing midnight.
+    """
+    latest = pd.to_datetime(latest_time, utc=True, errors="coerce")
+    if pd.isna(latest):
+        return pd.NaT
+
+    remaining = pd.Timedelta(trading_duration)
+    if remaining <= pd.Timedelta(0):
+        return latest
+
+    market_config = TRADING_WINDOWS.get(market_region) or {}
+    phase_config = dict(DEFAULT_TRADING_PHASES.get(market_region) or {})
+    phase_config.update(TRADING_PHASES.get(market_region) or {})
+
+    if not phase_config:
+        return latest - remaining
+
+    tz_name = str(
+        phase_config.get("timezone")
+        or market_config.get("timezone")
+        or "UTC"
+    )
+    market_tz = ZoneInfo(tz_name)
+    pre_start_minute = _hhmm_to_minutes(phase_config.get("pre_start", "00:00"))
+    post_end_minute = _hhmm_to_minutes(phase_config.get("post_end", "23:59"))
+
+    raw_weekdays = market_config.get("open_weekdays")
+    allowed_weekdays = (
+        {"mon", "tue", "wed", "thu", "fri"}
+        if raw_weekdays is None
+        else {str(value).strip().lower()[:3] for value in raw_weekdays}
+    )
+    closed_dates = {
+        str(value)
+        for value in (market_config.get("closed_dates") or [])
+    }
+
+    cursor = latest
+    session_date = cursor.tz_convert(market_tz).date()
+
+    # A 12-hour window normally needs at most a few sessions. Keep a generous
+    # bound so unusual holiday configurations cannot create an endless loop.
+    for _ in range(370):
+        day_start = pd.Timestamp(session_date, tz=market_tz)
+        weekday = day_start.strftime("%a").lower()[:3]
+        date_key = day_start.strftime("%Y-%m-%d")
+
+        if weekday in allowed_weekdays and date_key not in closed_dates:
+            session_start_local = day_start + pd.Timedelta(minutes=pre_start_minute)
+            session_end_local = day_start + pd.Timedelta(minutes=post_end_minute)
+            if post_end_minute <= pre_start_minute:
+                session_end_local += pd.Timedelta(days=1)
+
+            session_start = session_start_local.tz_convert("UTC")
+            session_end = session_end_local.tz_convert("UTC")
+            usable_end = min(cursor, session_end)
+
+            if usable_end > session_start:
+                usable = usable_end - session_start
+                if remaining <= usable:
+                    return usable_end - remaining
+                remaining -= usable
+
+            cursor = min(cursor, session_start)
+
+        session_date -= pd.Timedelta(days=1)
+
+    # Defensive fallback for a pathological configuration with no open days.
+    return latest - trading_duration
+
+
 def _format_hhmm_duration(delta: pd.Timedelta | None) -> str:
     if delta is None or pd.isna(delta) or delta < pd.Timedelta(0):
         return "-"
     total_minutes = int(delta.total_seconds() // 60)
     hours, minutes = divmod(total_minutes, 60)
     return f"{hours:02d}:{minutes:02d}"
+
+
+def effective_trading_duration(
+    start_time,
+    end_time,
+    market_region: str | None,
+) -> pd.Timedelta:
+    """Elapsed market-open time between two UTC timestamps.
+
+    Closed overnight intervals, weekends, and configured closed dates do not
+    contribute. This is the duration basis used by Last Data's DropDur2% and
+    ChangeDur2% values. Crypto stays continuous.
+    """
+    start = pd.to_datetime(start_time, utc=True, errors="coerce")
+    end = pd.to_datetime(end_time, utc=True, errors="coerce")
+    if pd.isna(start) or pd.isna(end) or end <= start:
+        return pd.Timedelta(0)
+
+    if market_region == "CRYPTO":
+        return end - start
+
+    market_config = TRADING_WINDOWS.get(market_region) or {}
+    phase_config = dict(DEFAULT_TRADING_PHASES.get(market_region) or {})
+    phase_config.update(TRADING_PHASES.get(market_region) or {})
+    if not phase_config:
+        return end - start
+
+    tz_name = str(
+        phase_config.get("timezone")
+        or market_config.get("timezone")
+        or "UTC"
+    )
+    market_tz = ZoneInfo(tz_name)
+    pre_start_minute = _hhmm_to_minutes(phase_config.get("pre_start", "00:00"))
+    post_end_minute = _hhmm_to_minutes(phase_config.get("post_end", "23:59"))
+
+    first_date = start.tz_convert(market_tz).date() - pd.Timedelta(days=1)
+    last_date = end.tz_convert(market_tz).date()
+    total = pd.Timedelta(0)
+
+    session_date = first_date
+    while session_date <= last_date:
+        if hasattr(session_date, "date"):
+            session_date = session_date.date()
+
+        if _allowed_market_date(session_date, market_config):
+            day_start = pd.Timestamp(session_date, tz=market_tz)
+            session_start_local = day_start + pd.Timedelta(minutes=pre_start_minute)
+            session_end_local = day_start + pd.Timedelta(minutes=post_end_minute)
+            if post_end_minute <= pre_start_minute:
+                session_end_local += pd.Timedelta(days=1)
+
+            session_start = session_start_local.tz_convert("UTC")
+            session_end = session_end_local.tz_convert("UTC")
+            overlap_start = max(start, session_start)
+            overlap_end = min(end, session_end)
+            if overlap_end > overlap_start:
+                total += overlap_end - overlap_start
+
+        session_date = session_date + pd.Timedelta(days=1)
+
+    return total
+
+
+def historical_market_rangebreaks(
+    start_time,
+    end_time,
+    market_region: str | None,
+) -> list[dict]:
+    """Plotly range breaks for every closed market interval in a chart span."""
+    start = pd.to_datetime(start_time, utc=True, errors="coerce")
+    end = pd.to_datetime(end_time, utc=True, errors="coerce")
+    if (
+        pd.isna(start)
+        or pd.isna(end)
+        or end <= start
+        or market_region == "CRYPTO"
+    ):
+        return []
+
+    market_config = TRADING_WINDOWS.get(market_region) or {}
+    phase_config = dict(DEFAULT_TRADING_PHASES.get(market_region) or {})
+    phase_config.update(TRADING_PHASES.get(market_region) or {})
+    if not phase_config:
+        return []
+
+    tz_name = str(
+        phase_config.get("timezone")
+        or market_config.get("timezone")
+        or "UTC"
+    )
+    market_tz = ZoneInfo(tz_name)
+    pre_start_minute = _hhmm_to_minutes(phase_config.get("pre_start", "00:00"))
+    post_end_minute = _hhmm_to_minutes(phase_config.get("post_end", "23:59"))
+
+    sessions = []
+    session_date = start.tz_convert(market_tz).date() - pd.Timedelta(days=1)
+    final_date = end.tz_convert(market_tz).date() + pd.Timedelta(days=1)
+
+    while session_date <= final_date:
+        if hasattr(session_date, "date"):
+            session_date = session_date.date()
+
+        if _allowed_market_date(session_date, market_config):
+            day_start = pd.Timestamp(session_date, tz=market_tz)
+            session_start_local = day_start + pd.Timedelta(minutes=pre_start_minute)
+            session_end_local = day_start + pd.Timedelta(minutes=post_end_minute)
+            if post_end_minute <= pre_start_minute:
+                session_end_local += pd.Timedelta(days=1)
+
+            session_start = session_start_local.tz_convert("UTC")
+            session_end = session_end_local.tz_convert("UTC")
+            if session_end > start and session_start < end:
+                sessions.append((max(start, session_start), min(end, session_end)))
+
+        session_date = session_date + pd.Timedelta(days=1)
+
+    sessions.sort(key=lambda item: item[0])
+    breaks = []
+    cursor = start
+    for session_start, session_end in sessions:
+        if session_start > cursor:
+            gap_start = cursor
+            gap_end = min(session_start, end)
+            if gap_end > gap_start:
+                breaks.append((gap_start, gap_end))
+        cursor = max(cursor, session_end)
+        if cursor >= end:
+            break
+
+    if cursor < end:
+        breaks.append((cursor, end))
+
+    result = []
+    for gap_start, gap_end in breaks:
+        gap_ms = int((gap_end - gap_start).total_seconds() * 1000)
+        if gap_ms <= 0:
+            continue
+        result.append(
+            {
+                "values": [gap_start.tz_convert(LOCAL_TIMEZONE).to_pydatetime()],
+                "dvalue": gap_ms,
+            }
+        )
+    return result
 
 
 def _allowed_market_date(local_date, market_config: dict | None) -> bool:
@@ -1162,8 +1388,9 @@ def movement_durations(
     latest_time,
     current_price,
     movement_percent: float,
+    market_region: str | None,
 ) -> tuple[str, str]:
-    """Durations measured backwards from LastCollect using the current price band."""
+    """Trading-time durations backwards from LastCollect using the current price band."""
     if pd.isna(current_price) or float(current_price) <= 0:
         return "-", "-"
 
@@ -1185,7 +1412,13 @@ def movement_durations(
     above = history[history["_close_num"] > upper]
     drop_duration = "-"
     if not above.empty:
-        drop_duration = _format_hhmm_duration(last_ts - above.iloc[-1]["timestamp"])
+        drop_duration = _format_hhmm_duration(
+            effective_trading_duration(
+                above.iloc[-1]["timestamp"],
+                last_ts,
+                market_region,
+            )
+        )
 
     # StaticDuration = time since the most recent sample outside the symmetric
     # +/- movement_percent band around LastPrice. From the following sample
@@ -1193,7 +1426,13 @@ def movement_durations(
     outside = history[(history["_close_num"] < lower) | (history["_close_num"] > upper)]
     static_duration = "-"
     if not outside.empty:
-        static_duration = _format_hhmm_duration(last_ts - outside.iloc[-1]["timestamp"])
+        static_duration = _format_hhmm_duration(
+            effective_trading_duration(
+                outside.iloc[-1]["timestamp"],
+                last_ts,
+                market_region,
+            )
+        )
 
     return drop_duration, static_duration
 
@@ -3744,6 +3983,7 @@ elif page == "Last Data":
                         latest_source["timestamp"],
                         latest_source.get("close"),
                         movement_percent,
+                        region,
                     )
 
                 relevant["Phase"] = relevant["Ticker"].astype(str).map(
@@ -6313,8 +6553,8 @@ elif page == "Historical Data":
                         "2h",
                         "6h",
                         "12h",
-                        "24h",
-                        "48h",
+                        "1d",
+                        "2d",
                         "7d",
                         "All",
                     ],
@@ -6331,8 +6571,8 @@ elif page == "Historical Data":
                     "2h": pd.Timedelta(hours=2),
                     "6h": pd.Timedelta(hours=6),
                     "12h": pd.Timedelta(hours=12),
-                    "24h": pd.Timedelta(hours=24),
-                    "48h": pd.Timedelta(hours=48, unit="h"),
+                    "1d": pd.Timedelta(days=1),
+                    "2d": pd.Timedelta(days=2),
                     "7d": pd.Timedelta(days=7),
                 }
 
@@ -6374,15 +6614,41 @@ elif page == "Historical Data":
                         "timestamp"
                     ].max()
 
-                    if range_label != "All":
-                        start_time = (
-                            latest_time
-                            - range_map[range_label]
+                    # Resolve the market calendar once for both trading-time
+                    # range selection and closed-time compression on the x-axis.
+                    if asset_mode == "Single" and selected_assets:
+                        selected_ticker = str(selected_assets[0]).strip().upper()
+                        ticker_rows = asset_df[
+                            asset_df["ticker"].astype(str).str.upper().eq(selected_ticker)
+                        ]
+                        asset_type = (
+                            str(ticker_rows["asset_type"].iloc[-1])
+                            if not ticker_rows.empty and "asset_type" in ticker_rows.columns
+                            else "stock"
                         )
+                        historical_market_region = market_region_for_ticker(
+                            selected_ticker,
+                            asset_type,
+                        )
+                    else:
+                        # Historical Data phase bands currently use the US/Polygon
+                        # calendar for multi-asset stock charts.
+                        historical_market_region = "US"
 
+                    selected_range_start = None
+                    if range_label != "All":
+                        if range_label in {"2h", "6h", "12h"}:
+                            start_time = historical_trading_window_start(
+                                latest_time,
+                                range_map[range_label],
+                                historical_market_region,
+                            )
+                        else:
+                            start_time = latest_time - range_map[range_label]
+
+                        selected_range_start = start_time
                         chart_df = chart_df[
-                            chart_df["timestamp"]
-                            >= start_time
+                            chart_df["timestamp"] >= start_time
                         ].copy()
 
                     if chart_df.empty:
@@ -6860,8 +7126,15 @@ elif page == "Historical Data":
                                         )
                                     )
 
+                    # The date axis hides closed market intervals, but each ticker
+                    # remains a continuous line across the compressed session break.
+                    # This makes multi-ticker charts easy to follow from the final
+                    # post-trading point to the next pre-trading point while still
+                    # removing the irrelevant overnight/weekend space from the axis.
+                    plot_df = chart_df.copy()
+
                     figure = px.line(
-                        chart_df,
+                        plot_df,
                         x="Local Time",
                         y=y_column,
                         color="ticker",
@@ -7208,49 +7481,22 @@ elif page == "Historical Data":
                             )
 
                     # Keep market-phase rectangles from expanding the visible
-                    # x-axis too far beyond the selected Historical Data range.
-                    #
-                    # Add a small amount of context after the latest plotted point:
-                    #   2h  -> LastTime - 2.5h ... LastTime + 0.5h
-                    #   6h  -> LastTime - 7h   ... LastTime + 1h
-                    #   12h -> LastTime - 14h  ... LastTime + 2h
-                    #   24h -> LastTime - 28h  ... LastTime + 4h
-                    #   48h -> LastTime - 56h  ... LastTime + 8h
-                    #   7d  -> LastTime - 8d4h ... LastTime + 1d4h
-                    historical_axis_windows = {
-                        "2h": (
-                            pd.Timedelta(hours=2.5),
-                            pd.Timedelta(hours=0.5),
-                        ),
-                        "6h": (
-                            pd.Timedelta(hours=7),
-                            pd.Timedelta(hours=1),
-                        ),
-                        "12h": (
-                            pd.Timedelta(hours=14),
-                            pd.Timedelta(hours=2),
-                        ),
-                        "24h": (
-                            pd.Timedelta(hours=28),
-                            pd.Timedelta(hours=4),
-                        ),
-                        "48h": (
-                            pd.Timedelta(hours=56),
-                            pd.Timedelta(hours=8),
-                        ),
-                        "7d": (
-                            pd.Timedelta(days=8, hours=4),
-                            pd.Timedelta(days=1, hours=4),
-                        ),
+                    # x-axis beyond the selected Historical Data range. For 2h/6h/12h
+                    # the start can be much earlier in wall-clock time because the
+                    # overnight non-trading gap is intentionally skipped.
+                    historical_axis_after = {
+                        "2h": pd.Timedelta(hours=0.5),
+                        "6h": pd.Timedelta(hours=1),
+                        "12h": pd.Timedelta(hours=2),
+                        "1d": pd.Timedelta(hours=4),
+                        "2d": pd.Timedelta(hours=8),
+                        "7d": pd.Timedelta(days=1, hours=4),
                     }
 
                     if (
-                        range_label in historical_axis_windows
+                        range_label in historical_axis_after
                         and not chart_df.empty
                     ):
-                        before_window, after_window = (
-                            historical_axis_windows[range_label]
-                        )
                         visible_last = pd.to_datetime(
                             chart_df["timestamp"].max(),
                             utc=True,
@@ -7258,11 +7504,19 @@ elif page == "Historical Data":
                         )
 
                         if pd.notna(visible_last):
-                            xaxis_start = (
-                                visible_last - before_window
-                            ).tz_convert(LOCAL_TIMEZONE)
+                            if selected_range_start is not None and pd.notna(selected_range_start):
+                                xaxis_start = pd.to_datetime(
+                                    selected_range_start,
+                                    utc=True,
+                                ).tz_convert(LOCAL_TIMEZONE)
+                            else:
+                                xaxis_start = pd.to_datetime(
+                                    chart_df["timestamp"].min(),
+                                    utc=True,
+                                ).tz_convert(LOCAL_TIMEZONE)
+
                             xaxis_end = (
-                                visible_last + after_window
+                                visible_last + historical_axis_after[range_label]
                             ).tz_convert(LOCAL_TIMEZONE)
 
                             figure.update_xaxes(
@@ -7272,8 +7526,32 @@ elif page == "Historical Data":
                                 ]
                             )
 
+                    # Remove closed periods from the visual x-axis entirely.
+                    # Friday's final post-trading node and Monday's first pre-trading
+                    # node therefore appear next to each other and remain connected
+                    # by that ticker's line. The line represents continuity between
+                    # observed market points, not elapsed closed-market time.
+                    if not chart_df.empty:
+                        break_start = (
+                            pd.to_datetime(selected_range_start, utc=True, errors="coerce")
+                            if selected_range_start is not None
+                            else pd.to_datetime(chart_df["timestamp"].min(), utc=True, errors="coerce")
+                        )
+                        break_end = pd.to_datetime(
+                            chart_df["timestamp"].max(),
+                            utc=True,
+                            errors="coerce",
+                        )
+                        market_rangebreaks = historical_market_rangebreaks(
+                            break_start,
+                            break_end,
+                            historical_market_region,
+                        )
+                        if market_rangebreaks:
+                            figure.update_xaxes(rangebreaks=market_rangebreaks)
+
                     figure.update_layout(
-                        xaxis_title="Local time",
+                        xaxis_title="Trading time (closed periods hidden)",
                         yaxis_title=y_label,
                         # Use point-specific hover. With ``x unified`` Plotly also
                         # shows the nearest point from sparse overlay traces. That
@@ -7294,10 +7572,13 @@ elif page == "Historical Data":
                         "configuration as Resources. Opening is light blue; Pre-Trading "
                         "and Post-Trading share the orange background. Weekdays, closed "
                         "dates, phase times, and timezone come from the current settings. "
-                        "The visible time axis leaves a small amount of context after the latest "
-                        "point (for example, 2h = -2.5h/+0.5h, 6h = -7h/+1h, "
-                        "12h = -14h/+2h), while preventing phase bands from expanding the "
-                        "diagram too far."
+                        "For the 2h, 6h, and 12h ranges, only effective trading time is counted; "
+                        "overnight closures, weekends, and configured closed dates are skipped. "
+                        "Closed intervals are also compressed out of the x-axis, and the price line "
+                        "is broken at each session boundary so separate sessions are not connected. "
+                        "The x-axis therefore starts "
+                        "at the calculated trading-time boundary and keeps a small amount of "
+                        "context after the latest point."
                     )
 
                     st.caption(

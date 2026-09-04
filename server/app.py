@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -251,7 +252,8 @@ async def lifespan(_: FastAPI):
             f"{last_discovery_date!r}, "
             f"today={today}"
         )
-        await discovery_job()
+        #await discovery_job()
+        asyncio.create_task(discovery_job())
 
     try:
         yield
