@@ -1526,6 +1526,16 @@ def evaluate_sell(
             logger.warning("SELL %s skipped: invalid BuyTime=%r", ticker, trade.get("BuyTime"))
             continue
 
+        # C5 is measured in market-open hours, so resolve the ticker's market
+        # schedule before evaluating the shared C4/C5 decision.
+        market_region = market_region_for_row(
+            ticker,
+            latest_row,
+            market_regions,
+        )
+        market_config = trading_windows.get(market_region) if market_region else None
+        phase_config = (config.get("trading_phases") or {}).get(market_region) or {}
+
         decision = evaluate_sell_history(
             ticker_df=ticker_df,
             latest_time=latest_time,
@@ -1533,17 +1543,14 @@ def evaluate_sell(
             movement_percent=float(rule.get("movement_percent", 1.1)),
             c5_hours=float(rule.get("c5_hours", 24.0)),
             init_time=buy_time,
+            market_region=market_region,
+            market_config=market_config,
+            phase_config=phase_config,
         )
 
         # Resolve market actionability before the SELL gate because C6 is an
         # end-of-day rule: it is only allowed to trigger while trading is open
         # and the configured SELL window is close to ending.
-        market_region = market_region_for_row(
-            ticker,
-            latest_row,
-            market_regions,
-        )
-        market_config = trading_windows.get(market_region) if market_region else None
         if not market_config:
             logger.warning(
                 "SELL %s: market region/config unavailable (region=%r)",

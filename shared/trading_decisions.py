@@ -154,6 +154,139 @@ def trading_window_info(
     )
 
 
+DEFAULT_TRADING_PHASES = {
+    "US": {
+        "timezone": "America/New_York",
+        "pre_start": "04:00",
+        "post_end": "20:00",
+    },
+    "DE": {
+        "timezone": "Europe/Berlin",
+        "pre_start": "08:00",
+        "post_end": "22:00",
+    },
+    "CRYPTO": {
+        "timezone": "UTC",
+        "pre_start": "00:00",
+        "post_end": "23:59",
+    },
+}
+
+
+def _hhmm_minutes(value: str) -> int:
+    parsed = _parse_hhmm(str(value))
+    return parsed.hour * 60 + parsed.minute
+
+
+def _market_date_allowed(local_date, market_config: dict | None) -> bool:
+    if not market_config or not bool(market_config.get("enabled", True)):
+        return False
+
+    weekday_names = {
+        "mon": 0, "monday": 0,
+        "tue": 1, "tues": 1, "tuesday": 1,
+        "wed": 2, "wednesday": 2,
+        "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
+        "fri": 4, "friday": 4,
+        "sat": 5, "saturday": 5,
+        "sun": 6, "sunday": 6,
+    }
+    raw_weekdays = market_config.get("open_weekdays")
+    if raw_weekdays is None:
+        allowed_weekdays = set(range(7))
+    else:
+        allowed_weekdays = set()
+        for value in raw_weekdays:
+            if isinstance(value, int):
+                allowed_weekdays.add(value)
+            else:
+                key = str(value).strip().lower()
+                if key not in weekday_names:
+                    raise ValueError(f"Invalid open_weekdays value: {value!r}")
+                allowed_weekdays.add(weekday_names[key])
+
+    closed_dates = {
+        str(value).strip() for value in (market_config.get("closed_dates") or [])
+    }
+    return (
+        local_date.weekday() in allowed_weekdays
+        and local_date.isoformat() not in closed_dates
+    )
+
+
+def trading_time_window_start(
+    latest_time,
+    trading_hours: float,
+    market_region: str | None = None,
+    market_config: dict | None = None,
+    phase_config: dict | None = None,
+):
+    """Return the UTC start after counting backwards only market-open time.
+
+    ``trading_hours`` therefore excludes the interval between post-trading and
+    the next pre-trading session, weekends, and configured closed dates.
+    Crypto and calls without a market schedule remain continuous.
+    """
+    latest = pd.to_datetime(latest_time, utc=True, errors="coerce")
+    if pd.isna(latest):
+        return pd.NaT
+
+    duration = pd.Timedelta(hours=float(trading_hours))
+    if duration <= pd.Timedelta(0):
+        return latest
+
+    if market_region == "CRYPTO":
+        return latest - duration
+
+    merged_phase = dict(DEFAULT_TRADING_PHASES.get(market_region) or {})
+    merged_phase.update(phase_config or {})
+    if not market_config or not merged_phase:
+        return latest - duration
+
+    tz_name = str(
+        merged_phase.get("timezone")
+        or market_config.get("timezone")
+        or "UTC"
+    )
+    market_tz = ZoneInfo(tz_name)
+    pre_start_minute = _hhmm_minutes(merged_phase.get("pre_start", "00:00"))
+    post_end_minute = _hhmm_minutes(merged_phase.get("post_end", "23:59"))
+
+    remaining = duration
+    cursor = latest
+    session_date = cursor.tz_convert(market_tz).date()
+
+    # 720 configured hours can span many weekends/holidays; two years gives
+    # ample room while still guarding against invalid calendars.
+    for _ in range(740):
+        if _market_date_allowed(session_date, market_config):
+            day_start = pd.Timestamp(session_date, tz=market_tz)
+            session_start = (
+                day_start + pd.Timedelta(minutes=pre_start_minute)
+            ).tz_convert("UTC")
+            session_end_local = day_start + pd.Timedelta(minutes=post_end_minute)
+            if post_end_minute <= pre_start_minute:
+                session_end_local += pd.Timedelta(days=1)
+            session_end = session_end_local.tz_convert("UTC")
+
+            usable_end = min(cursor, session_end)
+            if usable_end > session_start:
+                available = usable_end - session_start
+                if available >= remaining:
+                    return usable_end - remaining
+                remaining -= available
+
+        session_date = session_date - timedelta(days=1)
+        previous_day = pd.Timestamp(session_date, tz=market_tz)
+        previous_end = previous_day + pd.Timedelta(minutes=post_end_minute)
+        if post_end_minute <= pre_start_minute:
+            previous_end += pd.Timedelta(days=1)
+        cursor = previous_end.tz_convert("UTC")
+
+    # Defensive fallback for pathological configurations.
+    return latest - duration
+
+
 def format_duration(value: timedelta | None) -> str:
     if value is None:
         return "—"
@@ -172,6 +305,9 @@ def evaluate_sell_history(
     movement_percent: float = 1.1,
     c5_hours: float = 24.0,
     init_time=None,
+    market_region: str | None = None,
+    market_config: dict | None = None,
+    phase_config: dict | None = None,
 ) -> SellDecision:
     """Evaluate proposal conditions C4 and C5 using available ticker history.
 
@@ -180,9 +316,10 @@ def evaluate_sell_history(
     init_time is supplied, measurements before it are excluded. MaxTime is the
     latest sampled timestamp at which that maximum occurred.
 
-    C5: after a full trailing c5_hours has elapsed since InitTime, every
-    collected close in that window lies within +/- movement_percent of the
-    current price. C5 requires historical coverage
+    C5: after a full trailing c5_hours of *trading time* has elapsed since
+    InitTime, every collected close in that window lies within
+    +/- movement_percent of the current price. Closed overnight periods,
+    weekends, and configured closed dates do not count. C5 requires historical coverage
     reaching the beginning of that window. LastOneProcTime is the latest
     measurement at or before latest_time whose price is outside that band, so
     it remains useful as a BoughtBefore cutoff even when C5 is satisfied.
@@ -215,7 +352,13 @@ def evaluate_sell_history(
     # "More than the configured percentage" is strict: an exact threshold match does not satisfy C4.
     c4_satisfied = float(current_price) < max_price * (1.0 - movement_percent / 100.0)
 
-    period_start = latest - pd.Timedelta(hours=c5_hours)
+    period_start = trading_time_window_start(
+        latest,
+        c5_hours,
+        market_region=market_region,
+        market_config=market_config,
+        phase_config=phase_config,
+    )
     trailing = work[work["timestamp"] >= period_start].copy()
     has_full_window = bool(work["timestamp"].min() <= period_start)
 

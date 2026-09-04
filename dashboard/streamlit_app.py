@@ -23,6 +23,7 @@ import yaml
 from shared.trading_decisions import (
     evaluate_sell_history,
     format_duration,
+    trading_time_window_start,
     trading_window_info,
 )
 
@@ -889,6 +890,12 @@ DEFAULT_TRADING_PHASES = {
     },
 }
 TRADING_PHASES = TRADING_CONFIG.get("trading_phases") or {}
+
+
+def c5_phase_config(market_region: str | None) -> dict:
+    phase_config = dict(DEFAULT_TRADING_PHASES.get(market_region) or {})
+    phase_config.update(TRADING_PHASES.get(market_region) or {})
+    return phase_config
 
 
 def dashboard_status_summary(measurements_df: pd.DataFrame, alerts_table: pd.DataFrame) -> dict:
@@ -1892,6 +1899,9 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
                 current_price=float(price),
                 movement_percent=float(SELL_CONFIG.get("movement_percent", 1.1)),
                 c5_hours=float(SELL_CONFIG.get("c5_hours", 24.0)),
+                market_region=row["MarketRegion"],
+                market_config=market_config,
+                phase_config=c5_phase_config(row["MarketRegion"]),
             )
             row["ShouldSell"] = decision.should_sell
             row["C4"] = bool(decision.c4_satisfied)
@@ -1922,7 +1932,13 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
                     f"threshold > {movement_percent:.2f}%"
                 )
 
-            c5_start = latest_time - pd.Timedelta(hours=c5_hours)
+            c5_start = trading_time_window_start(
+                latest_time,
+                c5_hours,
+                market_region=row["MarketRegion"],
+                market_config=market_config,
+                phase_config=c5_phase_config(row["MarketRegion"]),
+            )
             if decision.last_one_proc_time is not None:
                 c5_last_outside = format_local_timestamp(
                     decision.last_one_proc_time
@@ -1982,7 +1998,13 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
                     pass
 
             c5_hours = float(SELL_CONFIG.get("c5_hours", 24.0))
-            static_start = latest_time - pd.Timedelta(hours=c5_hours)
+            static_start = trading_time_window_start(
+                latest_time,
+                c5_hours,
+                market_region=row["MarketRegion"],
+                market_config=market_config,
+                phase_config=c5_phase_config(row["MarketRegion"]),
+            )
             static_history = history_for_sell[
                 history_for_sell["timestamp"] >= static_start
             ]
@@ -2423,6 +2445,12 @@ if page == "Zero-Trading":
                 ):
                     continue
 
+                market_region = row.get("MarketRegion")
+                market_config = (
+                    TRADING_WINDOWS.get(market_region)
+                    if market_region
+                    else None
+                )
                 decision = evaluate_sell_history(
                     ticker_df=ticker_history,
                     latest_time=latest_time,
@@ -2430,6 +2458,9 @@ if page == "Zero-Trading":
                     movement_percent=movement_threshold,
                     c5_hours=c5_hours,
                     init_time=init_time_latest,
+                    market_region=market_region,
+                    market_config=market_config,
+                    phase_config=c5_phase_config(market_region),
                 )
 
                 c6_reference_price = None
@@ -2459,12 +2490,6 @@ if page == "Zero-Trading":
                         float(current_price) / c6_reference_price - 1.0
                     ) * 100.0
 
-                market_region = row.get("MarketRegion")
-                market_config = (
-                    TRADING_WINDOWS.get(market_region)
-                    if market_region
-                    else None
-                )
                 window = None
                 if market_config:
                     action_time = pd.Timestamp.now(tz="UTC")
@@ -2583,7 +2608,13 @@ if page == "Zero-Trading":
 
                 c5_start = max(
                     init_time_latest,
-                    latest_time - pd.Timedelta(hours=c5_hours),
+                    trading_time_window_start(
+                        latest_time,
+                        c5_hours,
+                        market_region=market_region,
+                        market_config=market_config,
+                        phase_config=c5_phase_config(market_region),
+                    ),
                 )
                 last_outside = (
                     format_local_timestamp(decision.last_one_proc_time)
@@ -2962,6 +2993,9 @@ if page == "Zero-Trading":
                                     movement_percent=movement_threshold,
                                     c5_hours=c5_hours,
                                     init_time=init_time,
+                                    market_region=region,
+                                    market_config=market_config,
+                                    phase_config=c5_phase_config(region),
                                 )
                                 c4 = bool(decision.c4_satisfied)
                                 c5 = bool(decision.c5_satisfied)
@@ -3266,6 +3300,11 @@ if page == "Zero-Trading":
                     )
                     if pd.isna(current_price) or float(current_price) <= 0:
                         return result
+                    latest_market = history.iloc[-1]
+                    region = market_region_for_ticker(
+                        ticker, latest_market.get("asset_type")
+                    )
+                    market_config = TRADING_WINDOWS.get(region) if region else None
                     decision = evaluate_sell_history(
                         ticker_df=history,
                         latest_time=action_time,
@@ -3273,6 +3312,9 @@ if page == "Zero-Trading":
                         movement_percent=movement_threshold,
                         c5_hours=c5_hours,
                         init_time=init_time,
+                        market_region=region,
+                        market_config=market_config,
+                        phase_config=c5_phase_config(region),
                     )
                     result["C4"] = bool(decision.c4_satisfied)
                     result["C5"] = bool(decision.c5_satisfied)
@@ -3288,11 +3330,6 @@ if page == "Zero-Trading":
                     if pd.notna(reference_price):
                         gain = (float(current_price) / float(reference_price) - 1.0) * 100.0
 
-                    latest_market = history.iloc[-1]
-                    region = market_region_for_ticker(
-                        ticker, latest_market.get("asset_type")
-                    )
-                    market_config = TRADING_WINDOWS.get(region) if region else None
                     remaining_minutes = None
                     sell_open = False
                     if market_config:
@@ -3615,7 +3652,7 @@ if page == "Zero-Trading":
             f"C2 result and requires at least {BUY_MIN_CLOSEB_COUNT} qualifying tickers. SellC4 is "
             f"the drop-from-peak condition using the {float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% "
             f"movement threshold. SellC5 is the static-price condition over "
-            f"{float(SELL_CONFIG.get('c5_hours', 24.0)):g} hours. SellC6 is the near-close weak-position "
+            f"{float(SELL_CONFIG.get('c5_hours', 24.0)):g} trading hours. SellC6 is the near-close weak-position "
             f"exit within {float(SELL_CONFIG.get('c6_close_minutes', 30.0)):g} minutes of regular close "
             f"when gain is below {float(SELL_CONFIG.get('c6_min_gain_percent', 2.0)):.2f}%. SellC7 uses "
             f"the same close window and is true when gain is above "
@@ -4085,11 +4122,38 @@ elif page == "Last Data":
                 relevant["WaitToOpening"] = relevant["_WaitToOpeningRaw"].map(
                     _last_data_duration_text
                 )
+                def _trading_duration_minutes(value):
+                    if value is None:
+                        return float("nan")
+                    raw = str(value).strip()
+                    if not raw or raw in {"-", "—", "None", "nan", "NaT"}:
+                        return float("nan")
+                    parts = raw.split(":")
+                    if (
+                        len(parts) == 2
+                        and parts[0].isdigit()
+                        and parts[1].isdigit()
+                    ):
+                        minute_part = int(parts[1])
+                        if 0 <= minute_part < 60:
+                            return float(int(parts[0]) * 60 + minute_part)
+                    return float("nan")
+
+                def _format_trading_minutes(value):
+                    if value is None or pd.isna(value):
+                        return "—"
+                    total_minutes = max(0, int(round(float(value))))
+                    hours, minutes = divmod(total_minutes, 60)
+                    return f"{hours:02d}:{minutes:02d}"
+
+                # Keep the underlying values numeric (minutes) so Streamlit
+                # sorts these columns numerically while the Styler displays
+                # total trading hours as HH:MM, e.g. 34:30.
                 relevant["DropDuration"] = relevant["_DropDurRaw"].map(
-                    _last_data_duration_text
+                    _trading_duration_minutes
                 )
                 relevant["StaticDuration"] = relevant["_ChangeDurRaw"].map(
-                    _last_data_duration_text
+                    _trading_duration_minutes
                 )
 
                 relevant["LastCollect"] = relevant["Ticker"].astype(str).map(
@@ -4348,6 +4412,13 @@ elif page == "Last Data":
                             }
                         ]
                     )
+                    .format(
+                        {
+                            "DropDur2%": _format_trading_minutes,
+                            "ChangeDur2%": _format_trading_minutes,
+                        },
+                        na_rep="—",
+                    )
                     .apply(_last_data_row_style, axis=1)
                 )
 
@@ -4355,6 +4426,7 @@ elif page == "Last Data":
                     display,
                     use_container_width=True,
                     hide_index=True,
+                    height=563,  # header + approximately 15 ticker rows
                 )
 
         st.caption(
@@ -4394,9 +4466,9 @@ elif page == "Last Data":
         st.caption(
             "LastSelling is the estimated time needed to sell a EUR 10,000 position using "
             "recent one-second market turnover and the configured participation assumption. "
-            "DropDur2% is the shortest elapsed period ending at LastCollect during which price "
+            "DropDur2% is the shortest trading-time period ending at LastCollect during which price "
             "did not exceed LastPrice by more than the configured C4/C5 movement threshold. "
-            "ChangeDur2% is the shortest elapsed period ending at LastCollect during which price "
+            "ChangeDur2% is the shortest trading-time period ending at LastCollect during which price "
             "stayed inside the configured +/- movement-threshold band around LastPrice. "
             "WaitToTrade and WaitToOpening are calculated from Newest data and show the remaining time to the relevant trading phase."
         )
@@ -4405,7 +4477,7 @@ elif page == "Last Data":
             f"C2 is true when at least {BUY_MIN_CLOSEB_COUNT} active tickers have CloseB >= "
             f"{BUY_MIN_CLOSEB_PERCENT:g}%. C4 is true after a drop of more than "
             f"{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% from the sampled peak. "
-            f"C5 is true after a full {float(SELL_CONFIG.get('c5_hours', 24.0)):g} hours when "
+            f"C5 is true after a full {float(SELL_CONFIG.get('c5_hours', 24.0)):g} trading hours when "
             f"every sampled price stays within +/-{float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% "
             "of the current price. ShouldSell = C4 or C5."
         )
@@ -4719,7 +4791,7 @@ elif page == "Settings":
         "from the sampled peak. C5 becomes true only after the price has remained inside the "
         "configured +/- movement threshold around the current price for the entire configured "
         "static-price window. The setting stored internally as c5_hours is simply the length of "
-        "that continuous C5 window, in hours. This dashboard version has no C3 calculation. "
+        "that C5 window, in trading hours. Closed overnight periods, weekends, and configured market holidays do not count. This dashboard version has no C3 calculation. "
         "SELL windows control when a sell can be executed (CanSellNow/SellTiming); they do not "
         "change the C4 or C5 calculations themselves."
     )
@@ -4781,7 +4853,7 @@ elif page == "Settings":
                     "Internally this setting is named c5_hours. It is the minimum continuous "
                     "time period for which all sampled prices must remain within +/- the "
                     "configured C4/C5 movement threshold around the current price before C5 "
-                    "becomes true. Example: with 24 hours and a 1.1% threshold, C5 is true only "
+                    "becomes true. Example: with 24 trading hours and a 1.1% threshold, C5 is true only "
                     "after a full 24 hours in which every sampled price stayed within +/-1.1% "
                     "of the current price."
                 ),
@@ -8169,6 +8241,15 @@ elif page == "Sim-Trading":
                 ):
                     continue
 
+                market_region = market_region_for_ticker(
+                    ticker_value,
+                    latest_row.get("asset_type"),
+                )
+                market_config = (
+                    TRADING_WINDOWS.get(market_region)
+                    if market_region
+                    else None
+                )
                 decision = evaluate_sell_history(
                     ticker_df=ticker_history,
                     latest_time=latest_time,
@@ -8176,6 +8257,9 @@ elif page == "Sim-Trading":
                     movement_percent=sim_movement_threshold,
                     c5_hours=sim_c5_hours,
                     init_time=init_time_latest,
+                    market_region=market_region,
+                    market_config=market_config,
+                    phase_config=c5_phase_config(market_region),
                 )
                 shown.at[idx, "_SimBoughtBefore"] = decision.bought_before
                 shown.at[idx, "_SimCoreShouldSell"] = bool(decision.should_sell)
@@ -8203,15 +8287,6 @@ elif page == "Sim-Trading":
                         float(current_price) / float(c6_reference_price) - 1.0
                     ) * 100.0
 
-                market_region = market_region_for_ticker(
-                    ticker_value,
-                    latest_row.get("asset_type"),
-                )
-                market_config = (
-                    TRADING_WINDOWS.get(market_region)
-                    if market_region
-                    else None
-                )
                 sell_window = None
                 c6_remaining_minutes = None
                 if market_config:

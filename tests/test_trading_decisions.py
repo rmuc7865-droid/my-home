@@ -3,6 +3,7 @@ import pandas as pd
 from shared.trading_decisions import (
     evaluate_sell_history,
     sell_applies_to_holding,
+    trading_time_window_start,
     trading_window_info,
 )
 
@@ -265,3 +266,78 @@ def test_trading_window_enabled_false_uses_configured_next_time():
     assert info.is_open is False
     assert info.remaining_time is None
     assert info.first_next_time.isoformat() == "2026-08-18T07:05:00+00:00"
+
+
+def test_trading_time_window_start_skips_overnight_and_weekend():
+    market = {
+        "enabled": True,
+        "timezone": "America/New_York",
+        "open_weekdays": ["mon", "tue", "wed", "thu", "fri"],
+        "closed_dates": [],
+    }
+    start = trading_time_window_start(
+        "2026-08-03T15:00:00Z",  # Monday 11:00 New York
+        6.0,
+        market_region="US",
+        market_config=market,
+    )
+    # Monday 04:00-11:00 contains 7 trading hours, so 6h starts 05:00 Monday.
+    assert start.isoformat() == "2026-08-03T09:00:00+00:00"
+
+
+def test_c5_uses_trading_hours_across_weekend():
+    market = {
+        "enabled": True,
+        "timezone": "America/New_York",
+        "open_weekdays": ["mon", "tue", "wed", "thu", "fri"],
+        "closed_dates": [],
+    }
+    # Friday 19:00-20:00 plus Monday 04:00-09:00 = six trading hours.
+    times = pd.to_datetime(
+        [
+            "2026-07-31T23:00:00Z",
+            "2026-08-01T00:00:00Z",
+            "2026-08-03T08:00:00Z",
+            "2026-08-03T09:00:00Z",
+            "2026-08-03T10:00:00Z",
+            "2026-08-03T11:00:00Z",
+            "2026-08-03T12:00:00Z",
+            "2026-08-03T13:00:00Z",
+        ],
+        utc=True,
+    )
+    df = pd.DataFrame({"timestamp": times, "close": [100.0] * len(times)})
+    decision = evaluate_sell_history(
+        df,
+        times[-1],
+        100.0,
+        c5_hours=6.0,
+        market_region="US",
+        market_config=market,
+    )
+    assert decision.c5_satisfied is True
+
+
+def test_c5_weekend_closed_time_does_not_satisfy_hours():
+    market = {
+        "enabled": True,
+        "timezone": "America/New_York",
+        "open_weekdays": ["mon", "tue", "wed", "thu", "fri"],
+        "closed_dates": [],
+    }
+    # Only one Friday trading hour and one Monday trading hour are covered; the
+    # long weekend must not make a 6-hour C5 window complete.
+    times = pd.to_datetime(
+        ["2026-08-01T00:00:00Z", "2026-08-03T13:00:00Z"],
+        utc=True,
+    )
+    df = pd.DataFrame({"timestamp": times, "close": [100.0, 100.0]})
+    decision = evaluate_sell_history(
+        df,
+        times[-1],
+        100.0,
+        c5_hours=6.0,
+        market_region="US",
+        market_config=market,
+    )
+    assert decision.c5_satisfied is False
