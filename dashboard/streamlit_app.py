@@ -2757,6 +2757,23 @@ if page == "Zero-Trading":
                         return trade.get(key)
                 return None
 
+            def _zero_raw_buy_price(trade):
+                """Return the simulator buy price in the ticker's market currency.
+
+                Zero-Trading compares this value with the raw market ``close``.
+                BuyPriceEUR must never be used here because that mixes EUR with
+                USD/other market-currency prices and can create false double-digit
+                ProfitInitTimeLatest / C6 / C7 percentages.
+                """
+                if trade is None:
+                    return None
+                for key in ["BuyPrice", "InitPrice"]:
+                    if key in trade.index:
+                        candidate = pd.to_numeric(trade.get(key), errors="coerce")
+                        if pd.notna(candidate) and float(candidate) > 0:
+                            return float(candidate)
+                return None
+
             # Normalize simulator trades once so state-at-time and the latest
             # action in the accounting day can be derived deterministically.
             zero_sim_df = pd.DataFrame(zero_sim_rows)
@@ -2872,6 +2889,7 @@ if page == "Zero-Trading":
                 current_sell_window_open = {}
                 current_buy_window_open = {}
                 current_profit_init = {}
+                current_sim_action_time = {}
                 current_buy_ts = {}
                 current_buy_c2 = {}
                 current_c2_snapshot_cache = {}
@@ -2961,6 +2979,19 @@ if page == "Zero-Trading":
                         else pd.NaT
                     )
                     current_init[idx] = init_time
+                    sim_action_time = pd.NaT
+                    if trade is not None:
+                        buy_time_value = pd.to_datetime(
+                            trade.get("BuyTime"), utc=True, errors="coerce"
+                        )
+                        sell_time_value = pd.to_datetime(
+                            trade.get("SellTime"), utc=True, errors="coerce"
+                        )
+                        if pd.notna(sell_time_value) and sell_time_value <= last_time:
+                            sim_action_time = sell_time_value
+                        elif pd.notna(buy_time_value) and buy_time_value <= last_time:
+                            sim_action_time = buy_time_value
+                    current_sim_action_time[idx] = sim_action_time
 
                     c4 = False
                     c5 = False
@@ -3000,19 +3031,10 @@ if page == "Zero-Trading":
                                 c4 = bool(decision.c4_satisfied)
                                 c5 = bool(decision.c5_satisfied)
 
-                                reference_price = pd.NA
-                                if trade is not None:
-                                    for key in ["BuyPriceEUR", "BuyPrice", "InitPrice"]:
-                                        if key in trade.index:
-                                            candidate = pd.to_numeric(
-                                                trade.get(key), errors="coerce"
-                                            )
-                                            if pd.notna(candidate) and float(candidate) > 0:
-                                                reference_price = float(candidate)
-                                                break
-                                if pd.notna(reference_price):
+                                reference_price = _zero_raw_buy_price(trade)
+                                if reference_price is not None:
                                     profit_init = (
-                                        float(current_price) / float(reference_price) - 1.0
+                                        float(current_price) / reference_price - 1.0
                                     ) * 100.0
 
                                 remaining_minutes = None
@@ -3082,6 +3104,11 @@ if page == "Zero-Trading":
                 advisor["_ProfitInitTimeLatestRaw"] = pd.to_numeric(
                     pd.Series(current_profit_init).reindex(advisor.index), errors="coerce"
                 )
+                advisor["_SimActionTimeRaw"] = pd.to_datetime(
+                    pd.Series(current_sim_action_time).reindex(advisor.index),
+                    utc=True,
+                    errors="coerce",
+                )
 
                 # C2 at each ticker's own LastTime. BuyTs is the number of
                 # tickers with Close2h >= the configured threshold at that time.
@@ -3098,7 +3125,6 @@ if page == "Zero-Trading":
                 advisor["SellC5"] = advisor["C5"]
                 advisor["SellC6"] = advisor["C6"]
                 advisor["SellC7"] = advisor["C7"]
-                advisor["Trading"] = advisor["_WaitToOpeningRaw"].map(_zero_wait_is_zero)
 
                 sell_signal = (
                     advisor["SellC4"]
@@ -3141,9 +3167,13 @@ if page == "Zero-Trading":
                         ).head(buy_limit).index
                         advisor.loc[allowed, "ToBuy"] = True
 
-                # Current display metrics.
+                # Current display metrics. DropInitTimeLast is the signed
+                # price change from the simulator's raw buy price to LastPrice.
+                # DropMaxLast is the signed drawdown from the highest close since
+                # SimInitTime to LastPrice.
                 drop24 = {}
-                drop_init = {}
+                drop_init_last = {}
+                drop_max_last = {}
                 change24 = {}
                 change_init = {}
                 for idx, row in advisor.iterrows():
@@ -3158,17 +3188,42 @@ if page == "Zero-Trading":
                         )
                     else:
                         d24, c24 = (None, None)
+
+                    init_change = None
+                    max_drop = None
+                    ci = None
                     if pd.notna(last_time) and pd.notna(init_time) and init_time <= last_time:
-                        di, ci = _zero_interval_metrics(ticker, last_time, init_time)
-                    else:
-                        di, ci = (None, None)
+                        max_drop_magnitude, ci = _zero_interval_metrics(
+                            ticker, last_time, init_time
+                        )
+                        if max_drop_magnitude is not None:
+                            max_drop = -float(max_drop_magnitude)
+                        market_row = _zero_market_row_at(ticker, last_time)
+                        last_price = (
+                            pd.to_numeric(market_row.get("close"), errors="coerce")
+                            if market_row is not None
+                            else pd.NA
+                        )
+                        trade = _zero_latest_trade_at(ticker, last_time)
+                        init_price = _zero_raw_buy_price(trade)
+                        if (
+                            pd.notna(last_price)
+                            and float(last_price) > 0
+                            and init_price is not None
+                        ):
+                            init_change = (
+                                float(last_price) / init_price - 1.0
+                            ) * 100.0
+
                     drop24[idx] = d24
-                    drop_init[idx] = di
+                    drop_init_last[idx] = init_change
+                    drop_max_last[idx] = max_drop
                     change24[idx] = c24
                     change_init[idx] = ci
 
                 advisor["_Drop24hRaw"] = pd.Series(drop24).reindex(advisor.index)
-                advisor["_DropInitTimeLatestRaw"] = pd.Series(drop_init).reindex(advisor.index)
+                advisor["_DropInitTimeLastRaw"] = pd.Series(drop_init_last).reindex(advisor.index)
+                advisor["_DropMaxLastRaw"] = pd.Series(drop_max_last).reindex(advisor.index)
                 advisor["_Change24hRaw"] = pd.Series(change24).reindex(advisor.index)
                 advisor["_ChangeInitTimeLatestRaw"] = pd.Series(change_init).reindex(advisor.index)
 
@@ -3182,6 +3237,8 @@ if page == "Zero-Trading":
                     lambda value: str(int(round(float(value)))) if pd.notna(value) else "-"
                 )
                 advisor["LastTime"] = advisor["_LastCollectRaw"].map(_zero_local_timestamp)
+                advisor["SimInitTime"] = advisor["_InitTimeLatestRaw"].map(_zero_local_timestamp)
+                advisor["SimActionTime"] = advisor["_SimActionTimeRaw"].map(_zero_local_timestamp)
                 advisor["LastSelling"] = advisor["_LastSellingRaw"].map(
                     lambda value: f"{int(round(float(value)))}s" if pd.notna(value) else "—"
                 )
@@ -3193,14 +3250,18 @@ if page == "Zero-Trading":
                 def _zero_percent(value):
                     return f"{float(value):.2f}%" if pd.notna(value) else "—"
 
+                def _zero_signed_percent(value):
+                    return f"{float(value):.2f}%" if pd.notna(value) else "—"
+
                 advisor["Drop24h"] = advisor["_Drop24hRaw"].map(_zero_percent)
-                advisor["DropInitTimeLatest"] = advisor["_DropInitTimeLatestRaw"].map(_zero_percent)
+                advisor["DropInitTimeLast"] = advisor["_DropInitTimeLastRaw"].map(_zero_signed_percent)
+                advisor["DropMaxLast"] = advisor["_DropMaxLastRaw"].map(_zero_signed_percent)
                 advisor["Change24h"] = advisor["_Change24hRaw"].map(_zero_percent)
                 advisor["ChangeInitTimeLatest"] = advisor["_ChangeInitTimeLatestRaw"].map(_zero_percent)
                 advisor["WeakInitTimeLatest"] = advisor["_ProfitInitTimeLatestRaw"].map(
                     lambda value: f"{float(value):+.2f}%" if pd.notna(value) else "—"
                 )
-                advisor["ProfitInitTimeLatest"] = advisor["_ProfitInitTimeLatestRaw"].map(
+                advisor["BuyPriceDiff"] = advisor["_ProfitInitTimeLatestRaw"].map(
                     lambda value: f"{float(value):+.2f}%" if pd.notna(value) else "—"
                 )
 
@@ -3319,16 +3380,10 @@ if page == "Zero-Trading":
                     result["C4"] = bool(decision.c4_satisfied)
                     result["C5"] = bool(decision.c5_satisfied)
 
-                    reference_price = pd.NA
-                    for key in ["BuyPriceEUR", "BuyPrice", "InitPrice"]:
-                        if key in trade.index:
-                            candidate = pd.to_numeric(trade.get(key), errors="coerce")
-                            if pd.notna(candidate) and float(candidate) > 0:
-                                reference_price = float(candidate)
-                                break
+                    reference_price = _zero_raw_buy_price(trade)
                     gain = None
-                    if pd.notna(reference_price):
-                        gain = (float(current_price) / float(reference_price) - 1.0) * 100.0
+                    if reference_price is not None:
+                        gain = (float(current_price) / reference_price - 1.0) * 100.0
 
                     remaining_minutes = None
                     sell_open = False
@@ -3453,6 +3508,54 @@ if page == "Zero-Trading":
                     advisor.at[idx, "SimSellC7"] = bool(sell_conditions["C7"])
                     advisor.at[idx, "SimWaitToOpening"] = _zero_wait_is_zero(wait_opening)
 
+                # WaitOn follows the latest simulator action, rather than the
+                # current OPEN/CLOSED state alone. For a latest Sell it explains
+                # what still prevents ToSell; for a latest Buy it explains what
+                # still prevents ToBuy. Actionable rows always show "-".
+                wait_on = {}
+                available_slots_now = max(
+                    0,
+                    int(BUY_MAX_OPEN_TICKERS) - _zero_open_count_at(newest_market_data),
+                )
+                for idx, row in advisor.iterrows():
+                    if bool(row.get("ToSell", False)) or bool(row.get("ToBuy", False)):
+                        wait_on[idx] = "-"
+                        continue
+
+                    sim_action = str(row.get("SimLastAction") or "").strip().lower()
+                    missing = []
+                    if sim_action == "sell":
+                        # ToSell requires a currently OPEN simulator position, an
+                        # open sell window and at least one active sell rule.
+                        if not bool(row.get("_IsOpenAtLastTime", False)):
+                            missing.append("Open")
+                        if not bool(row.get("_SellWindowOpen", False)):
+                            missing.append("Trade")
+                        if not any(
+                            bool(row.get(column, False))
+                            for column in ("SellC4", "SellC5", "SellC6", "SellC7")
+                        ):
+                            missing.append("C4/C5/C6/C7")
+                    elif sim_action == "buy":
+                        # ToBuy requires a currently CLOSED simulator position, C2,
+                        # an open buy window and selection by ranking/capacity.
+                        if bool(row.get("_IsOpenAtLastTime", False)):
+                            missing.append("Closed")
+                        if not bool(row.get("BuyC2", False)):
+                            missing.append("C2")
+                        if not bool(row.get("_BuyWindowOpen", False)):
+                            missing.append("Trade")
+                        if not missing:
+                            if available_slots_now <= 0:
+                                missing.append("Slot")
+                            else:
+                                missing.append("Rank/Slot")
+                    else:
+                        missing.append("SimAction")
+
+                    wait_on[idx] = ", ".join(missing) if missing else "-"
+                advisor["WaitOn"] = pd.Series(wait_on).reindex(advisor.index).fillna("-")
+
                 # Informational context only. This column is deliberately
                 # added after all trading-condition calculations so news cannot
                 # influence ToBuy, ToSell, C2, C4, C5, C6, or C7.
@@ -3511,25 +3614,30 @@ if page == "Zero-Trading":
                         "LastTime",
                         "ToSell",
                         "ToBuy",
+                        "WaitOn",
                         "Ticker",
                         "TickerName",
                         "ISIN",
                         "News",
+                        "WaitToTrade",
+                        "WaitToOpening",
+                        "LastSelling",
                         "BuyTs",
+                        "LastClose2h",
+                        "DropInitTimeLast",
+                        "DropMaxLast",
+                        "ChangeInitTimeLatest",
+                        "BuyPriceDiff",
+                        # Simulator state/condition columns are grouped after
+                        # BuyPriceDiff for easier action review.
+                        "SimInitTime",
+                        "Qty",
+                        "SimActionTime",
                         "BuyC2",
                         "SellC4",
                         "SellC5",
                         "SellC6",
                         "SellC7",
-                        "Trading",
-                        "WaitToTrade",
-                        "WaitToOpening",
-                        "Qty",
-                        "LastSelling",
-                        "LastClose2h",
-                        "DropInitTimeLatest",
-                        "ChangeInitTimeLatest",
-                        "ProfitInitTimeLatest",
                     ]
                     if zero_details:
                         requested_columns.extend([
@@ -3543,7 +3651,6 @@ if page == "Zero-Trading":
                             "SimSellC5",
                             "SimSellC6",
                             "SimSellC7",
-                            "SimWaitToOpening",
                         ])
 
                     for column in requested_columns:
@@ -3557,10 +3664,12 @@ if page == "Zero-Trading":
                         "_LastSellingRaw",
                         "_LastClose2hRaw",
                         "_Drop24hRaw",
-                        "_DropInitTimeLatestRaw",
+                        "_DropInitTimeLastRaw",
+                        "_DropMaxLastRaw",
                         "_Change24hRaw",
                         "_ChangeInitTimeLatestRaw",
                         "_ProfitInitTimeLatestRaw",
+                        "BuyTs",
                         "SellC6",
                         "SellC7",
                     ]].loc[display.index].copy()
@@ -3582,18 +3691,27 @@ if page == "Zero-Trading":
                         )
                         if pd.notna(last_selling) and float(last_selling) < 120.0:
                             bold("LastSelling")
+                        buy_ts_value = pd.to_numeric(raw.get("BuyTs"), errors="coerce")
+                        if (
+                            pd.notna(buy_ts_value)
+                            and int(buy_ts_value) >= int(BUY_MIN_CLOSEB_COUNT)
+                        ):
+                            bold("BuyTs")
                         last_close = pd.to_numeric(
                             raw.get("_LastClose2hRaw"), errors="coerce"
                         )
                         if pd.notna(last_close) and float(last_close) > 2.0:
                             bold("LastClose2h")
-                        for display_column, raw_column in [
-                            ("Drop24h", "_Drop24hRaw"),
-                            ("DropInitTimeLatest", "_DropInitTimeLatestRaw"),
-                        ]:
-                            numeric = pd.to_numeric(raw.get(raw_column), errors="coerce")
-                            if pd.notna(numeric) and float(numeric) > movement_threshold:
-                                bold(display_column)
+                        drop_init = pd.to_numeric(
+                            raw.get("_DropInitTimeLastRaw"), errors="coerce"
+                        )
+                        if pd.notna(drop_init) and float(drop_init) < -movement_threshold:
+                            bold("DropInitTimeLast")
+                        drop_max = pd.to_numeric(
+                            raw.get("_DropMaxLastRaw"), errors="coerce"
+                        )
+                        if pd.notna(drop_max) and abs(float(drop_max)) > movement_threshold:
+                            bold("DropMaxLast")
                         for display_column, raw_column in [
                             ("Change24h", "_Change24hRaw"),
                             ("ChangeInitTimeLatest", "_ChangeInitTimeLatestRaw"),
@@ -3602,7 +3720,7 @@ if page == "Zero-Trading":
                             if pd.notna(numeric) and float(numeric) < movement_threshold:
                                 bold(display_column)
                         if bool(raw.get("SellC6", False)) or bool(raw.get("SellC7", False)):
-                            bold("ProfitInitTimeLatest")
+                            bold("BuyPriceDiff")
                         return styles
 
                     styled_display = display.style.apply(_zero_row_style, axis=1)
@@ -3634,8 +3752,14 @@ if page == "Zero-Trading":
         st.caption(
             "Zero-Trading shows at most one row per ticker. LastTime is the ticker's latest "
             "market-data time. ToSell and ToBuy show whether the simulator can execute that "
-            "action at LastTime. Rows are sorted by ToSell, then ToBuy, then LastClose2h, all "
-            "with actionable/high values first. Trading is true exactly when WaitToOpening is 00:00."
+            "action at LastTime. WaitOn follows SimLastAction: after a Sell it lists what still "
+            "prevents ToSell, and after a Buy it lists what still prevents ToBuy. Open means a "
+            "SELL needs an open simulator position; Closed means a BUY needs a closed simulator "
+            "position. C2, Trade, C4/C5/C6/C7, Slot and Rank/Slot identify the other missing gates. "
+            "If ToSell or ToBuy is already True, WaitOn is '-'. Rows are sorted by ToSell, then "
+            "ToBuy, then LastClose2h, all "
+            "with actionable/high values first. WaitToTrade is 00:00 throughout Pre-Trading, "
+            "Opening and Post-Trading; WaitToOpening is 00:00 only during the Opening period."
         )
 
         st.caption(
@@ -3647,7 +3771,10 @@ if page == "Zero-Trading":
         )
 
         st.caption(
-            "Parameters: BuyTs is the number of tickers whose Close2h is greater than or equal to "
+            "Parameters: SimInitTime is the current OPEN simulator position's BuyTime. "
+            "SimActionTime has the same meaning as on Sim-Trading: the latest simulator transition "
+            "for the ticker (BuyTime while OPEN, SellTime when the latest trade is CLOSED). "
+            "BuyTs is the number of tickers whose Close2h is greater than or equal to "
             f"the configured C2 threshold ({BUY_MIN_CLOSEB_PERCENT:g}%) at LastTime; BuyC2 is the "
             f"C2 result and requires at least {BUY_MIN_CLOSEB_COUNT} qualifying tickers. SellC4 is "
             f"the drop-from-peak condition using the {float(SELL_CONFIG.get('movement_percent', 1.1)):.2f}% "
@@ -3661,18 +3788,23 @@ if page == "Zero-Trading":
 
         st.caption(
             "LastSelling is the estimated liquidity time to sell; LastClose2h is the approximately "
-            "two-hour CloseB. Drop24h and Change24h use LastTime-24h through LastTime. "
-            "DropInitTimeLatest and ChangeInitTimeLatest use the latest OPEN simulator InitTime through "
-            "LastTime. ProfitInitTimeLatest is the percentage gain from that OPEN position's init/buy "
-            "price to LastPrice. WaitToTrade and WaitToOpening are evaluated at each ticker's LastTime."
+            "two-hour CloseB. DropInitTimeLast is the signed percentage change from the OPEN simulator "
+            "buy price to LastPrice. DropMaxLast is the signed drawdown from the maximum price after "
+            "SimInitTime to LastPrice and is bold when its magnitude exceeds the configured C4/C5 "
+            "movement threshold. ChangeInitTimeLatest uses SimInitTime through LastTime. "
+            "BuyPriceDiff is the percentage difference between the simulator buy price and LastPrice: "
+            "(LastPrice - BuyPrice) / BuyPrice × 100. Positive values are gains and negative values "
+            "are losses. Both prices use the ticker's raw market currency, so EUR conversion cannot "
+            "distort the percentage. WaitToTrade and WaitToOpening are "
+            "evaluated at each ticker's LastTime."
         )
 
         if bool(SELL_CONFIG.get("details", True)):
             st.caption(
                 "Details is enabled: SimLastActionTime and SimLastAction show the latest actual simulator "
                 "CLOSED->OPEN Buy or OPEN->CLOSED Sell transition in the active 03:00-03:00 accounting day. "
-                "SimLastInit and SimReason describe that action. SimBuyTs, SimBuyC2, SimSellC4-C7 and "
-                "SimWaitToOpening are reconstructed at SimLastActionTime. SimBuyTs intentionally counts "
+                "SimLastInit and SimReason describe that action. SimBuyTs, SimBuyC2 and SimSellC4-C7 "
+                "are reconstructed at SimLastActionTime. SimBuyTs intentionally counts "
                 "Close2h values strictly greater than the C2 threshold, as defined for the simulator details."
             )
 
@@ -3680,7 +3812,7 @@ if page == "Zero-Trading":
         st.markdown(
             "1. Check **ToBuy == True**.\n"
             "2. Review **BuyTs**, **BuyC2** and **LastClose2h**.\n"
-            "3. Confirm **Trading == True** and **LastSelling** is acceptable.\n"
+            "3. Confirm **WaitToTrade == 00:00** and **LastSelling** is acceptable.\n"
             "4. Buy **Qty** in the ZERO app if you want to follow the simulator signal."
         )
 
@@ -3688,7 +3820,7 @@ if page == "Zero-Trading":
         st.markdown(
             "1. Check **ToSell == True**.\n"
             "2. Review **SellC4**, **SellC5**, **SellC6** and **SellC7**.\n"
-            "3. Confirm **Trading == True** and **LastSelling** is acceptable.\n"
+            "3. Confirm **WaitToTrade == 00:00** and **LastSelling** is acceptable.\n"
             "4. Sell the ticker in the ZERO app if you want to follow the simulator signal."
         )
 
