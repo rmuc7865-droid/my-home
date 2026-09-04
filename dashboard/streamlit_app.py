@@ -3508,53 +3508,112 @@ if page == "Zero-Trading":
                     advisor.at[idx, "SimSellC7"] = bool(sell_conditions["C7"])
                     advisor.at[idx, "SimWaitToOpening"] = _zero_wait_is_zero(wait_opening)
 
-                # WaitOn follows the latest simulator action, rather than the
-                # current OPEN/CLOSED state alone. For a latest Sell it explains
-                # what still prevents ToSell; for a latest Buy it explains what
-                # still prevents ToBuy. Actionable rows always show "-".
-                wait_on = {}
-                available_slots_now = max(
-                    0,
-                    int(BUY_MAX_OPEN_TICKERS) - _zero_open_count_at(newest_market_data),
-                )
+                # Zero-Trading is a fresh validation layer between the latest
+                # simulator signal and the user's delayed manual ZERO execution.
+                # Re-evaluate the action at each ticker's LastTime without requiring
+                # the simulator to still be in the pre-action OPEN/CLOSED state.
+                fresh_sell_conditions = {}
                 for idx, row in advisor.iterrows():
-                    if bool(row.get("ToSell", False)) or bool(row.get("ToBuy", False)):
-                        wait_on[idx] = "-"
+                    ticker = str(row.get("Ticker") or "").strip().upper()
+                    event = latest_event_by_ticker.get(ticker)
+                    if event is None or str(event.get("Action") or "").lower() != "sell":
                         continue
+                    trade = event.get("Trade")
+                    buy_time = (
+                        pd.to_datetime(trade.get("BuyTime"), utc=True, errors="coerce")
+                        if trade is not None
+                        else pd.NaT
+                    )
+                    last_time = pd.to_datetime(
+                        row.get("_LastCollectRaw"), utc=True, errors="coerce"
+                    )
+                    fresh_sell_conditions[idx] = _zero_sell_conditions_at(
+                        ticker, last_time, buy_time, trade
+                    )
 
-                    sim_action = str(row.get("SimLastAction") or "").strip().lower()
+                # Candidate BUY validations are based on the latest simulator BUY
+                # signal, current C2/current trading window, and the current top-6
+                # Close2h ranking. Simulator OPEN state is not a blocker because it
+                # is the natural consequence of the signal being validated.
+                buy_signal_indices = []
+                for idx, row in advisor.iterrows():
+                    ticker = str(row.get("Ticker") or "").strip().upper()
+                    event = latest_event_by_ticker.get(ticker)
+                    if event is not None and str(event.get("Action") or "").lower() == "buy":
+                        buy_signal_indices.append(idx)
+
+                buy_validation_pool = advisor.loc[buy_signal_indices].copy()
+                if not buy_validation_pool.empty:
+                    buy_validation_pool = buy_validation_pool[
+                        buy_validation_pool["BuyC2"]
+                        & buy_validation_pool["_BuyWindowOpen"]
+                    ].copy()
+                    buy_validation_pool["_BuyRankClose"] = pd.to_numeric(
+                        buy_validation_pool["_LastClose2hRaw"], errors="coerce"
+                    )
+                    buy_rank_allowed = set(
+                        buy_validation_pool.sort_values(
+                            ["_BuyRankClose", "Ticker"],
+                            ascending=[False, True],
+                            na_position="last",
+                        ).head(6).index
+                    )
+                else:
+                    buy_rank_allowed = set()
+
+                advisor["ToBuy"] = False
+                advisor["ToSell"] = False
+                missing_by_index = {}
+                open_count_now = _zero_open_count_at(newest_market_data)
+
+                for idx, row in advisor.iterrows():
+                    ticker = str(row.get("Ticker") or "").strip().upper()
+                    event = latest_event_by_ticker.get(ticker)
+                    sim_action = (
+                        str(event.get("Action") or "").strip().lower()
+                        if event is not None
+                        else ""
+                    )
                     missing = []
-                    if sim_action == "sell":
-                        # ToSell requires a currently OPEN simulator position, an
-                        # open sell window and at least one active sell rule.
-                        if not bool(row.get("_IsOpenAtLastTime", False)):
-                            missing.append("Open")
-                        if not bool(row.get("_SellWindowOpen", False)):
-                            missing.append("Trade")
-                        if not any(
-                            bool(row.get(column, False))
-                            for column in ("SellC4", "SellC5", "SellC6", "SellC7")
-                        ):
-                            missing.append("C4/C5/C6/C7")
-                    elif sim_action == "buy":
-                        # ToBuy requires a currently CLOSED simulator position, C2,
-                        # an open buy window and selection by ranking/capacity.
-                        if bool(row.get("_IsOpenAtLastTime", False)):
-                            missing.append("Closed")
+
+                    if sim_action == "buy":
                         if not bool(row.get("BuyC2", False)):
                             missing.append("C2")
                         if not bool(row.get("_BuyWindowOpen", False)):
                             missing.append("Trade")
-                        if not missing:
-                            if available_slots_now <= 0:
+                        if bool(row.get("BuyC2", False)) and bool(row.get("_BuyWindowOpen", False)):
+                            if idx not in buy_rank_allowed:
+                                missing.append("Rank")
+
+                            # Exclude this ticker from the simulator open count: its
+                            # OPEN state is caused by the very BUY signal being
+                            # validated for delayed execution in ZERO.
+                            open_without_this_signal = open_count_now - (
+                                1 if bool(row.get("_IsOpenAtLastTime", False)) else 0
+                            )
+                            if open_without_this_signal >= int(BUY_MAX_OPEN_TICKERS):
                                 missing.append("Slot")
-                            else:
-                                missing.append("Rank/Slot")
+
+                        advisor.at[idx, "ToBuy"] = not missing
+
+                    elif sim_action == "sell":
+                        if not bool(row.get("_SellWindowOpen", False)):
+                            missing.append("Trade")
+                        conditions = fresh_sell_conditions.get(
+                            idx, {"C4": False, "C5": False, "C6": False, "C7": False}
+                        )
+                        if not any(bool(conditions.get(key, False)) for key in ("C4", "C5", "C6", "C7")):
+                            missing.append("C4/C5/C6/C7")
+                        advisor.at[idx, "ToSell"] = not missing
+
                     else:
                         missing.append("SimAction")
 
-                    wait_on[idx] = ", ".join(missing) if missing else "-"
-                advisor["WaitOn"] = pd.Series(wait_on).reindex(advisor.index).fillna("-")
+                    missing_by_index[idx] = ", ".join(missing) if missing else "-"
+
+                advisor["Missing"] = (
+                    pd.Series(missing_by_index).reindex(advisor.index).fillna("-")
+                )
 
                 # Informational context only. This column is deliberately
                 # added after all trading-condition calculations so news cannot
@@ -3614,7 +3673,7 @@ if page == "Zero-Trading":
                         "LastTime",
                         "ToSell",
                         "ToBuy",
-                        "WaitOn",
+                        "Missing",
                         "Ticker",
                         "TickerName",
                         "ISIN",
@@ -3750,16 +3809,18 @@ if page == "Zero-Trading":
                 render_zero_summary(buy_asset_count, sell_asset_count)
 
         st.caption(
-            "Zero-Trading shows at most one row per ticker. LastTime is the ticker's latest "
-            "market-data time. ToSell and ToBuy show whether the simulator can execute that "
-            "action at LastTime. WaitOn follows SimLastAction: after a Sell it lists what still "
-            "prevents ToSell, and after a Buy it lists what still prevents ToBuy. Open means a "
-            "SELL needs an open simulator position; Closed means a BUY needs a closed simulator "
-            "position. C2, Trade, C4/C5/C6/C7, Slot and Rank/Slot identify the other missing gates. "
-            "If ToSell or ToBuy is already True, WaitOn is '-'. Rows are sorted by ToSell, then "
-            "ToBuy, then LastClose2h, all "
-            "with actionable/high values first. WaitToTrade is 00:00 throughout Pre-Trading, "
-            "Opening and Post-Trading; WaitToOpening is 00:00 only during the Opening period."
+            "Zero-Trading is a fresh validation layer between the simulator signal and the user's "
+            "manual ZERO execution. Because the user may execute the simulator action 5–60 minutes "
+            "later, the relevant conditions are re-evaluated at each ticker's LastTime. For the "
+            "latest simulator Buy, ToBuy=True means the BUY signal is still valid now; Missing shows "
+            "what changed or is currently missing (C2, Trade, Rank and/or Slot). For the latest "
+            "simulator Sell, ToSell=True means the SELL signal is still valid now; Missing shows "
+            "Trade and/or C4/C5/C6/C7 when the SELL is no longer validated. '-' means the latest "
+            "simulator action is still valid for manual ZERO execution. Simulator OPEN/CLOSED state "
+            "itself is not treated as a missing condition, because it is the consequence of the "
+            "simulator action being re-validated. Rows are sorted by ToSell, then ToBuy, then "
+            "LastClose2h, with actionable/high values first. WaitToTrade is 00:00 throughout "
+            "Pre-Trading, Opening and Post-Trading; WaitToOpening is 00:00 only during the Opening period."
         )
 
         st.caption(
