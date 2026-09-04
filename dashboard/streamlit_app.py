@@ -8476,30 +8476,62 @@ elif page == "Sim-Trading":
                 - 1.0
             ) * 100.0
 
-            def format_elapsed(delta):
-                if pd.isna(delta):
-                    return "—"
-                total_minutes = int(delta.total_seconds() // 60)
-                if total_minutes < 0:
-                    return "—"
-                days, remainder = divmod(total_minutes, 24 * 60)
-                hours, minutes = divmod(remainder, 60)
-                return f"{days} days {hours:02d}:{minutes:02d}"
+            def _sim_market_region(ticker):
+                ticker_key = str(ticker or "").strip().upper()
+                ticker_rows = active_market_df[
+                    active_market_df["ticker"]
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                    == ticker_key
+                ]
+                if ticker_rows.empty:
+                    return None
+                latest_market_row = (
+                    ticker_rows
+                    .sort_values(["timestamp", "id"])
+                    .iloc[-1]
+                )
+                return market_region_for_ticker(
+                    ticker_key,
+                    latest_market_row.get("asset_type"),
+                )
 
-            shown["DiffSellTime"] = (
-                shown["SellTime"] - shown["BuyTime"]
-            ).map(format_elapsed)
+            def _sim_trading_duration(row, end_column):
+                start_time = pd.to_datetime(
+                    row.get("BuyTime"), utc=True, errors="coerce"
+                )
+                end_time = pd.to_datetime(
+                    row.get(end_column), utc=True, errors="coerce"
+                )
+                if pd.isna(start_time) or pd.isna(end_time):
+                    return pd.NaT
+                return effective_trading_duration(
+                    start_time,
+                    end_time,
+                    _sim_market_region(row.get("Ticker")),
+                )
+
+            # Trading-time durations: overnight market closures, weekends and
+            # configured market holidays do not count. This makes the simulator
+            # efficiency columns directly comparable with C5/Last Data durations.
+            shown["DiffSellTimeRaw"] = shown.apply(
+                lambda row: _sim_trading_duration(row, "SellTime"), axis=1
+            )
+            shown["DiffSellTime"] = shown["DiffSellTimeRaw"].map(
+                _format_hhmm_duration
+            )
 
             shown["LastTimeRaw"] = pd.to_datetime(
                 shown["LastTimeRaw"],
                 utc=True,
                 errors="coerce",
             )
-            shown["DiffLastTimeRaw"] = (
-                shown["LastTimeRaw"] - shown["BuyTime"]
+            shown["DiffLastTimeRaw"] = shown.apply(
+                lambda row: _sim_trading_duration(row, "LastTimeRaw"), axis=1
             )
             shown["DiffLastTime"] = shown["DiffLastTimeRaw"].map(
-                format_elapsed
+                _format_hhmm_duration
             )
 
             def format_local_time(value):
@@ -8551,8 +8583,33 @@ elif page == "Sim-Trading":
             shown["InitPrice"] = shown["BuyPriceEUR"].map(format_eur)
             shown["SellPrice"] = shown["SellPriceEUR"].map(format_eur)
             shown["LastPrice"] = shown["LastPriceRaw"].map(format_eur)
-            shown["DiffSellPrice"] = shown["DiffSellPriceRaw"].map(
+            shown["DiffSellPrice%"] = shown["DiffSellPriceRaw"].map(
                 format_percent
+            )
+
+            # Match the ZERO Advisor / Logs position sizing: Qty is the
+            # smallest whole number of shares covering EUR 10,000. The new
+            # DiffSellPrice column answers "what would the position gain/loss
+            # be if sold at the latest price?" and therefore deliberately uses
+            # LastPrice rather than the historical SellPrice.
+            shown["_SimQty"] = shown["BuyPriceEUR"].map(
+                lambda price: (
+                    math.ceil(10000.0 / float(price))
+                    if pd.notna(price) and float(price) > 0
+                    else float("nan")
+                )
+            )
+            shown["DiffSellPriceEURRaw"] = (
+                (shown["LastPriceRaw"] - shown["BuyPriceEUR"])
+                * shown["_SimQty"]
+            )
+            shown["DiffSellPrice"] = shown.apply(
+                lambda row: (
+                    format_eur(row.get("DiffSellPriceEURRaw"))
+                    if str(row.get("SimStatus") or "").strip().upper() == "CLOSED"
+                    else "—"
+                ),
+                axis=1,
             )
             shown["DiffLastPrice"] = shown["DiffLastPriceRaw"].map(
                 format_percent
@@ -8598,6 +8655,7 @@ elif page == "Sim-Trading":
                 "SellTimeDisplay",
                 "SellPrice",
                 "DiffSellTime",
+                "DiffSellPrice%",
                 "DiffSellPrice",
                 "LastPrice",
                 "DiffLastTime",
@@ -8675,6 +8733,7 @@ elif page == "Sim-Trading":
                 styled_display,
                 use_container_width=True,
                 hide_index=True,
+                height=563,  # header + approximately 15 ticker rows
             )
 
             st.caption(
@@ -8707,11 +8766,14 @@ elif page == "Sim-Trading":
             )
 
             st.caption(
-                "DiffSellTime = SellTime - InitTime. DiffSellPrice = percentage "
-                "change from InitPrice to SellPrice. LastTime and LastPrice are the "
-                "latest collected market-data time and EUR price. DiffLastTime = "
-                "LastTime - InitTime. DiffLastPrice = percentage change from "
-                "InitPrice to LastPrice. Elapsed times use D days HH:MM. Rows are "
+                "DiffSellTime = SellTime - InitTime. DiffSellPrice% is the percentage "
+                "change from InitPrice to SellPrice. DiffSellPrice is the current EUR "
+                "position gain/loss at LastPrice, calculated as (LastPrice - InitPrice) "
+                "x Qty, where Qty is the smallest whole-share position covering EUR "
+                "10,000. LastTime and LastPrice are the latest collected market-data "
+                "time and EUR price. DiffLastTime = LastTime - InitTime. DiffLastPrice "
+                "is the percentage change from InitPrice to LastPrice. Elapsed times "
+                "use total hours HH:MM. Rows are "
                 "sorted first by SimStatus and then by SimActionTime, newest "
                 "simulator action first within each status."
             )
