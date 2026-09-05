@@ -30,6 +30,38 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("telegram_notifier")
 
 
+DEFAULT_TRADING_PHASES = {
+    "US": {
+        "timezone": "America/New_York",
+        "pre_start": "04:00",
+        "opening_start": "09:30",
+        "opening_end": "16:00",
+        "post_end": "20:00",
+    },
+    "DE": {
+        "timezone": "Europe/Berlin",
+        "pre_start": "08:00",
+        "opening_start": "09:00",
+        "opening_end": "17:30",
+        "post_end": "22:00",
+    },
+    "CRYPTO": {
+        "timezone": "UTC",
+        "pre_start": "00:00",
+        "opening_start": "00:00",
+        "opening_end": "23:59",
+        "post_end": "23:59",
+    },
+}
+
+CX_LABELS = {
+    "C4": "Drop",
+    "C5": "Idle",
+    "C6": "Loss",
+    "C7": "Profit",
+}
+
+
 API_URL = os.getenv(
     "MONITOR_API_URL",
     "http://api:8000",
@@ -223,6 +255,101 @@ def load_ticker_market_regions() -> dict[str, str]:
             result[ticker] = region
 
     return result
+
+def load_instrument_notification_metadata(
+    client: httpx.Client,
+) -> dict[str, dict]:
+    """Return ISIN and discovery metadata used only for Telegram text."""
+    try:
+        rows = api_get(client, "/api/v1/instruments") or []
+    except Exception:
+        logger.exception("Cannot load instrument metadata for Telegram messages")
+        return {}
+
+    return {
+        str(row.get("Ticker") or "").strip().upper(): row
+        for row in rows
+        if str(row.get("Ticker") or "").strip()
+    }
+
+
+def _market_date_allowed(local_date, market_config: dict) -> bool:
+    if not market_config or not bool(market_config.get("enabled", True)):
+        return False
+    weekdays = market_config.get("open_weekdays")
+    if weekdays:
+        allowed = {str(value).strip().lower()[:3] for value in weekdays}
+        if local_date.strftime("%a").lower()[:3] not in allowed:
+            return False
+    closed = {str(value) for value in (market_config.get("closed_dates") or [])}
+    return local_date.isoformat() not in closed
+
+
+def trading_phase_and_until_end(
+    timestamp,
+    market_region: str | None,
+    market_config: dict | None,
+    configured_phases: dict | None = None,
+) -> tuple[str, str]:
+    """Return display phase and duration until that phase changes."""
+    if not market_region or not market_config:
+        return "No Trading", "—"
+
+    phase_config = dict(DEFAULT_TRADING_PHASES.get(market_region) or {})
+    phase_config.update(configured_phases or {})
+    if not phase_config:
+        return "No Trading", "—"
+
+    tz_name = str(phase_config.get("timezone") or market_config.get("timezone") or "UTC")
+    ts = pd.Timestamp(timestamp)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    local_ts = ts.tz_convert(tz_name)
+
+    def at(local_date, key: str) -> pd.Timestamp:
+        value = parse_hhmm(str(phase_config[key]))
+        return pd.Timestamp(datetime.combine(local_date, value), tz=ZoneInfo(tz_name))
+
+    if _market_date_allowed(local_ts.date(), market_config):
+        pre_start = at(local_ts.date(), "pre_start")
+        opening_start = at(local_ts.date(), "opening_start")
+        opening_end = at(local_ts.date(), "opening_end")
+        post_end = at(local_ts.date(), "post_end")
+        if pre_start <= local_ts < opening_start:
+            return "Pre-Trading", notification_duration_text(opening_start - local_ts)
+        if opening_start <= local_ts < opening_end:
+            return "Opening", notification_duration_text(opening_end - local_ts)
+        if opening_end <= local_ts < post_end:
+            return "Post-Trading", notification_duration_text(post_end - local_ts)
+
+    # No Trading ends when the next market day's Pre-Trading phase begins.
+    for day_offset in range(0, 15):
+        candidate_date = (local_ts + pd.Timedelta(days=day_offset)).date()
+        if not _market_date_allowed(candidate_date, market_config):
+            continue
+        candidate = at(candidate_date, "pre_start")
+        if candidate > local_ts:
+            return "No Trading", notification_duration_text(candidate - local_ts)
+    return "No Trading", "—"
+
+
+def notification_duration_text(value) -> str:
+    if value is None:
+        return "—"
+    seconds = max(0, int(pd.Timedelta(value).total_seconds()))
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
+    return f"+{hours}:{minutes:02d} hours"
+
+
+def sell_reason_text(reasons: list[str]) -> str:
+    return " + ".join(
+        f"{CX_LABELS.get(reason, reason)} {reason}"
+        for reason in reasons
+    )
+
 
 def market_region_for_row(
     ticker: str,
@@ -641,6 +768,16 @@ def calculate_latest_highb(
     return results
 
 
+def notification_time_text(value) -> str:
+    if value is None:
+        return "—"
+    return (
+        pd.to_datetime(value, utc=True)
+        .tz_convert("Europe/Berlin")
+        .strftime("%d.%m %H:%M")
+    )
+
+
 def newest_local_timestamp(
     timestamps,
 ) -> str:
@@ -957,10 +1094,14 @@ def evaluate_buy(
             continue
 
         row = dict(row)
-        row["remaining_time"] = buy_window.remaining_time
-        row["remaining_time_text"] = format_duration(
-            buy_window.remaining_time
+        phase, until_end = trading_phase_and_until_end(
+            row["latest_time"],
+            market_region,
+            market_config,
+            (config.get("trading_phases") or {}).get(market_region) or {},
         )
+        row["phase"] = phase
+        row["until_end"] = until_end
 
         max_sell_time = market_config.get(
             "max_buy_sell_time_seconds"
@@ -1032,12 +1173,7 @@ def evaluate_buy(
     if not selected:
         return
 
-    newest_date = newest_local_timestamp(
-        [
-            row["latest_time"]
-            for row in selected
-        ]
-    )
+    instrument_metadata = load_instrument_notification_metadata(client)
 
     recipients = config.get("recipients") or []
 
@@ -1049,27 +1185,27 @@ def evaluate_buy(
     for recipient in recipients:
         recipient_rows = selected
 
-        tickers_text = "\n".join(
-            (
-                f"{row['ticker']} "
-                f"{ticker_names.get(row['ticker'], row['ticker'])} "
-                f"{row['closeb']:+.2f}% "
-                f"RemainingTime={row.get('remaining_time_text', '—')}"
+        message_rows = []
+        for row in recipient_rows:
+            ticker = str(row["ticker"]).upper()
+            metadata = instrument_metadata.get(ticker) or {}
+            ticker_name = ticker_names.get(ticker, ticker)
+            isin = str(metadata.get("ISIN") or "").strip()
+            is_gainer = str(metadata.get("Source") or "").upper() == "AUTO_GAINER"
+            isin_text = f" {isin}" if is_gainer and isin else ""
+            close2h_text = (
+                f"{row['closeb']:+.2f}%"
+                if row.get("closeb") is not None
+                else "—"
             )
-            if row.get("closeb") is not None
-            else (
-                f"{row['ticker']} "
-                f"{ticker_names.get(row['ticker'], row['ticker'])} "
-                f"—"
+            action_time = notification_time_text(row["latest_time"])
+            message_rows.append(
+                f"BUY {action_time} {ticker}{isin_text} {ticker_name} "
+                f"Close2h={close2h_text} Trading {row.get('phase', 'No Trading')} "
+                f"{row.get('until_end', '—')} {str(config['dashboard_url']).rstrip('/')}"
             )
-            for row in recipient_rows
-        )
 
-        message = (
-            f"{newest_date} BUY:\n"
-            f"{tickers_text}\n"
-            f"{config['dashboard_url']}"
-        )
+        message = "\n".join(message_rows)
 
         token_env = recipient["bot_token_env"]
         bot_token = os.getenv(token_env)
@@ -1709,7 +1845,7 @@ def evaluate_sell(
             return (
                 pd.to_datetime(value, utc=True)
                 .tz_convert("Europe/Berlin")
-                .strftime("%Y-%m-%d %H:%M %Z")
+                .strftime("%d.%m %H:%M")
             )
 
         bought_before_text = local_text(decision.bought_before)
@@ -1730,6 +1866,18 @@ def evaluate_sell(
             if relative_difference is not None
             else "—"
         )
+        phase, until_end = trading_phase_and_until_end(
+            latest_time,
+            market_region,
+            market_config,
+            phase_config,
+        )
+        cx_text = sell_reason_text(reasons)
+        message = (
+            f"SELL {market_data_text} {ticker} {ticker_name} "
+            f"DiffSellPrice={rel_text} {cx_text} "
+            f"Trading {phase} {until_end} {str(config['dashboard_url']).rstrip('/')}"
+        )
 
         if not window.is_open:
             next_text = local_text(window.first_next_time)
@@ -1747,12 +1895,6 @@ def evaluate_sell(
                 )
                 continue
 
-            message = (
-                f"{market_data_text} SELL ASAP {ticker} {ticker_name} {rel_text} {sell_reason}\n"
-                f"Trading is currently closed. FirstNextSellTime={next_text}\n"
-                f"BoughtBefore={bought_before_text}\n"
-                f"{config['dashboard_url']}"
-            )
             sent_count = send_to_all_recipients(
                 client,
                 config,
@@ -1762,13 +1904,6 @@ def evaluate_sell(
                 advisories[ticker] = advisory_key
             continue
 
-        remaining_text = format_duration(window.remaining_time)
-        message = (
-            f"{market_data_text} SELL ASAP {ticker} {ticker_name} {rel_text} {sell_reason}\n"
-            f"RemainingTime={remaining_text}\n"
-            f"BoughtBefore={bought_before_text}\n"
-            f"{config['dashboard_url']}"
-        )
         sent_count = send_to_all_recipients(
             client,
             config,
