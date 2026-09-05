@@ -9441,12 +9441,26 @@ elif page == "Capital Usage":
         summary_cols[6].metric("Capital Utilization", "—")
         st.info("No simulator trades are available for the Capital Usage chart.")
     else:
-        for column in ["BuyTime", "SellTime"]:
+        for column in [
+            "BuyTime",
+            "SellTime",
+            "BuyActionTime",
+            "SellActionTime",
+        ]:
             if column not in capital_df.columns:
                 capital_df[column] = pd.NaT
             capital_df[column] = pd.to_datetime(
                 capital_df[column], utc=True, errors="coerce"
             )
+
+        # Signal times belong to the market prices. Action times represent
+        # when the simulator actually occupied or released capital.
+        capital_df["EffectiveBuyActionTime"] = (
+            capital_df["BuyActionTime"].fillna(capital_df["BuyTime"])
+        )
+        capital_df["EffectiveSellActionTime"] = (
+            capital_df["SellActionTime"].fillna(capital_df["SellTime"])
+        )
         if "Ticker" not in capital_df.columns:
             capital_df["Ticker"] = ""
         if "SellReason" not in capital_df.columns:
@@ -9462,9 +9476,12 @@ elif page == "Capital Usage":
         else:
             capital_df["DiffSellPrice"] = pd.NA
 
-        capital_df = capital_df[capital_df["BuyTime"].notna()].copy()
+        capital_df = capital_df[
+            capital_df["EffectiveBuyActionTime"].notna()
+        ].copy()
         capital_df = capital_df.sort_values(
-            ["BuyTime", "SellTime", "Ticker"], na_position="last"
+            ["EffectiveBuyActionTime", "EffectiveSellActionTime", "Ticker"],
+            na_position="last",
         ).reset_index(drop=True)
 
         # Allocate each trade to the first free capital slot before clipping the
@@ -9473,10 +9490,10 @@ elif page == "Capital Usage":
         row_free_at = [pd.Timestamp.min.tz_localize("UTC")] * max_trade_rows
         assigned_rows = []
         for _, trade_row in capital_df.iterrows():
-            trade_start = trade_row["BuyTime"]
+            trade_start = trade_row["EffectiveBuyActionTime"]
             effective_end = (
-                trade_row["SellTime"]
-                if pd.notna(trade_row["SellTime"])
+                trade_row["EffectiveSellActionTime"]
+                if pd.notna(trade_row["EffectiveSellActionTime"])
                 else capital_last_time
             )
             chosen = None
@@ -9492,7 +9509,9 @@ elif page == "Capital Usage":
         capital_df["TradeRowNumber"] = assigned_rows
 
         last_local = capital_last_time.tz_convert(LOCAL_TIMEZONE)
-        available_start = capital_df["BuyTime"].min().tz_convert(LOCAL_TIMEZONE)
+        available_start = capital_df[
+            "EffectiveBuyActionTime"
+        ].min().tz_convert(LOCAL_TIMEZONE)
 
         control_cols = st.columns(2)
         window_days = control_cols[0].selectbox(
@@ -9518,10 +9537,10 @@ elif page == "Capital Usage":
         window_end = window_end_local.tz_convert("UTC")
 
         overlap_mask = (
-            (capital_df["BuyTime"] < window_end)
+            (capital_df["EffectiveBuyActionTime"] < window_end)
             & (
-                capital_df["SellTime"].isna()
-                | (capital_df["SellTime"] > window_start)
+                capital_df["EffectiveSellActionTime"].isna()
+                | (capital_df["EffectiveSellActionTime"] > window_start)
             )
         )
         overflow_visible = capital_df[
@@ -9535,8 +9554,12 @@ elif page == "Capital Usage":
         visible["TradeRow"] = visible["TradeRowNumber"].map(
             lambda value: f"TradeRow{value}"
         )
-        visible["ChartStart"] = visible["BuyTime"].clip(lower=window_start)
-        visible["EffectiveEnd"] = visible["SellTime"].fillna(capital_last_time)
+        visible["ChartStart"] = visible[
+            "EffectiveBuyActionTime"
+        ].clip(lower=window_start)
+        visible["EffectiveEnd"] = visible[
+            "EffectiveSellActionTime"
+        ].fillna(capital_last_time)
         visible["ChartEnd"] = visible["EffectiveEnd"].clip(upper=window_end)
         visible["IsOpen"] = visible["SellTime"].isna()
 
@@ -9564,9 +9587,24 @@ elif page == "Capital Usage":
         # in Europe/Berlin time instead of being shifted to UTC by the browser.
         visible["ChartStartLocal"] = visible["ChartStart"].dt.tz_convert(LOCAL_TIMEZONE).dt.tz_localize(None)
         visible["ChartEndLocal"] = visible["ChartEnd"].dt.tz_convert(LOCAL_TIMEZONE).dt.tz_localize(None)
-        visible["BuyTimeLocal"] = visible["BuyTime"].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%d.%m.%Y %H:%M")
-        visible["SellTimeLocal"] = visible["SellTime"].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%d.%m.%Y %H:%M")
+        visible["BuyTimeLocal"] = visible[
+            "BuyTime"
+        ].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%d.%m.%Y %H:%M")
+        visible["SellTimeLocal"] = visible[
+            "SellTime"
+        ].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%d.%m.%Y %H:%M")
+        visible["BuyActionTimeLocal"] = visible[
+            "EffectiveBuyActionTime"
+        ].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%d.%m.%Y %H:%M")
+        visible["SellActionTimeLocal"] = visible[
+            "EffectiveSellActionTime"
+        ].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%d.%m.%Y %H:%M")
+
         visible.loc[visible["SellTime"].isna(), "SellTimeLocal"] = "OPEN"
+        visible.loc[
+            visible["EffectiveSellActionTime"].isna(),
+            "SellActionTimeLocal",
+        ] = "OPEN"
 
         window_seconds = max(0.0, (window_end - window_start).total_seconds())
         used_seconds = (
@@ -9620,7 +9658,9 @@ elif page == "Capital Usage":
                     "BuyTime": False,
                     "SellTime": False,
                     "BuyTimeLocal": True,
+                    "BuyActionTimeLocal": True,
                     "SellTimeLocal": True,
+                    "SellActionTimeLocal": True,
                     "DiffSellPrice": ":.2f",
                     "SellReason": True,
                     "TradeRow": False,

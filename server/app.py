@@ -701,6 +701,12 @@ def simulation(
             "RelativeDifference": row.relative_difference,
             "AbsoluteDifference": row.absolute_difference,
             "SellReason": row.sell_reason,
+            "BuyActionTime": row.created_at,
+            "SellActionTime": (
+                row.updated_at
+                if row.sell_time is not None
+                else None
+            ),
             "Status": (
                 "CLOSED"
                 if row.sell_time is not None
