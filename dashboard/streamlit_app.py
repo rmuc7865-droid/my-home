@@ -303,6 +303,7 @@ page = st.sidebar.radio(
         "Historical Data",
         "Sim-Trading",
         "Trading Efficiency",
+        "Capital Usage",
         "System Health",
         "Alerts",
         "Jira",
@@ -9410,6 +9411,370 @@ elif page == "Trading Efficiency":
                     "Close2h >= 2%? If yes, decrease the **CloseB threshold** in the "
                     "Settings page."
                 )
+
+
+elif page == "Capital Usage":
+    st.header("Capital Usage")
+    capital_market_df = df[df["asset_type"].isin(["stock", "crypto"])].copy()
+    capital_last_time = pd.to_datetime(
+        capital_market_df.get("timestamp"), utc=True, errors="coerce"
+    ).max() if not capital_market_df.empty else pd.NaT
+
+    try:
+        capital_rows = load_simulation_cached()
+    except Exception as exc:
+        st.error(f"Cannot load simulation data: {exc}")
+        capital_rows = []
+
+    capital_df = pd.DataFrame(capital_rows)
+    max_trade_rows = int(BUY_MAX_OPEN_TICKERS)
+    capital_per_trade = 10000
+
+    if capital_df.empty or pd.isna(capital_last_time):
+        summary_cols = st.columns(7)
+        summary_cols[0].metric("LastTime (local)", "—")
+        summary_cols[1].metric("Trade Rows", max_trade_rows)
+        summary_cols[2].metric("Trades (in window)", 0)
+        summary_cols[3].metric("Capital / Trade", f"€{capital_per_trade:,.0f}")
+        summary_cols[4].metric("Max Capital", f"€{max_trade_rows * capital_per_trade:,.0f}")
+        summary_cols[5].metric("Avg. Capital Used", "—")
+        summary_cols[6].metric("Capital Utilization", "—")
+        st.info("No simulator trades are available for the Capital Usage chart.")
+    else:
+        for column in ["BuyTime", "SellTime"]:
+            if column not in capital_df.columns:
+                capital_df[column] = pd.NaT
+            capital_df[column] = pd.to_datetime(
+                capital_df[column], utc=True, errors="coerce"
+            )
+        if "Ticker" not in capital_df.columns:
+            capital_df["Ticker"] = ""
+        if "SellReason" not in capital_df.columns:
+            capital_df["SellReason"] = ""
+        if "RelativeDifference" in capital_df.columns:
+            capital_df["DiffSellPrice"] = pd.to_numeric(
+                capital_df["RelativeDifference"], errors="coerce"
+            )
+        elif "DiffSellPrice" in capital_df.columns:
+            capital_df["DiffSellPrice"] = pd.to_numeric(
+                capital_df["DiffSellPrice"], errors="coerce"
+            )
+        else:
+            capital_df["DiffSellPrice"] = pd.NA
+
+        capital_df = capital_df[capital_df["BuyTime"].notna()].copy()
+        capital_df = capital_df.sort_values(
+            ["BuyTime", "SellTime", "Ticker"], na_position="last"
+        ).reset_index(drop=True)
+
+        # Allocate each trade to the first free capital slot before clipping the
+        # selected display window. This preserves the capital slot of a trade
+        # that started on an earlier day and remains open in the selected range.
+        row_free_at = [pd.Timestamp.min.tz_localize("UTC")] * max_trade_rows
+        assigned_rows = []
+        for _, trade_row in capital_df.iterrows():
+            trade_start = trade_row["BuyTime"]
+            effective_end = (
+                trade_row["SellTime"]
+                if pd.notna(trade_row["SellTime"])
+                else capital_last_time
+            )
+            chosen = None
+            for row_index, free_at in enumerate(row_free_at):
+                if free_at <= trade_start:
+                    chosen = row_index
+                    break
+            if chosen is None:
+                assigned_rows.append(pd.NA)
+            else:
+                assigned_rows.append(chosen + 1)
+                row_free_at[chosen] = max(effective_end, trade_start)
+        capital_df["TradeRowNumber"] = assigned_rows
+
+        last_local = capital_last_time.tz_convert(LOCAL_TIMEZONE)
+        available_start = capital_df["BuyTime"].min().tz_convert(LOCAL_TIMEZONE)
+
+        control_cols = st.columns(2)
+        window_days = control_cols[0].selectbox(
+            "Time window",
+            [1, 2, 3, 7, 14, 30],
+            index=0,
+            format_func=lambda value: f"{value} day" if value == 1 else f"{value} days",
+            key="capital_usage_window_days",
+        )
+        selected_end_date = control_cols[1].date_input(
+            "End day",
+            value=last_local.date(),
+            min_value=available_start.date(),
+            max_value=last_local.date(),
+            key="capital_usage_end_day",
+        )
+
+        # The requested range always covers complete Europe/Berlin calendar days:
+        # 00:00 on (EndDay - TimeWindow + 1) through 24:00 on EndDay.
+        window_end_local = pd.Timestamp(selected_end_date, tz=LOCAL_TIMEZONE) + pd.Timedelta(days=1)
+        window_start_local = window_end_local - pd.Timedelta(days=int(window_days))
+        window_start = window_start_local.tz_convert("UTC")
+        window_end = window_end_local.tz_convert("UTC")
+
+        overlap_mask = (
+            (capital_df["BuyTime"] < window_end)
+            & (
+                capital_df["SellTime"].isna()
+                | (capital_df["SellTime"] > window_start)
+            )
+        )
+        overflow_visible = capital_df[
+            overlap_mask & capital_df["TradeRowNumber"].isna()
+        ].copy()
+
+        visible = capital_df[
+            overlap_mask & capital_df["TradeRowNumber"].notna()
+        ].copy()
+        visible["TradeRowNumber"] = visible["TradeRowNumber"].astype(int)
+        visible["TradeRow"] = visible["TradeRowNumber"].map(
+            lambda value: f"TradeRow{value}"
+        )
+        visible["ChartStart"] = visible["BuyTime"].clip(lower=window_start)
+        visible["EffectiveEnd"] = visible["SellTime"].fillna(capital_last_time)
+        visible["ChartEnd"] = visible["EffectiveEnd"].clip(upper=window_end)
+        visible["IsOpen"] = visible["SellTime"].isna()
+
+        def capital_trade_state(row):
+            if bool(row["IsOpen"]):
+                return "Open / 0%"
+            diff = row.get("DiffSellPrice")
+            if pd.isna(diff) or float(diff) == 0:
+                return "Open / 0%"
+            return "Profit (> 0%)" if float(diff) > 0 else "Loss (< 0%)"
+
+        def capital_trade_label(row):
+            ticker = str(row.get("Ticker") or "").strip().upper()
+            reason = str(row.get("SellReason") or "").strip().upper()
+            cx = "+".join(
+                part for part in reason.split("+")
+                if part in {"C4", "C5", "C6", "C7"}
+            )
+            return f"{ticker} {cx}".strip()
+
+        visible["TradeState"] = visible.apply(capital_trade_state, axis=1)
+        visible["TradeLabel"] = visible.apply(capital_trade_label, axis=1)
+
+        # Use local wall-clock values for Plotly so the axis is explicitly shown
+        # in Europe/Berlin time instead of being shifted to UTC by the browser.
+        visible["ChartStartLocal"] = visible["ChartStart"].dt.tz_convert(LOCAL_TIMEZONE).dt.tz_localize(None)
+        visible["ChartEndLocal"] = visible["ChartEnd"].dt.tz_convert(LOCAL_TIMEZONE).dt.tz_localize(None)
+        visible["BuyTimeLocal"] = visible["BuyTime"].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%d.%m.%Y %H:%M")
+        visible["SellTimeLocal"] = visible["SellTime"].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%d.%m.%Y %H:%M")
+        visible.loc[visible["SellTime"].isna(), "SellTimeLocal"] = "OPEN"
+
+        window_seconds = max(0.0, (window_end - window_start).total_seconds())
+        used_seconds = (
+            (visible["ChartEnd"] - visible["ChartStart"])
+            .dt.total_seconds()
+            .clip(lower=0)
+            .sum()
+        )
+        utilization = (
+            used_seconds / (window_seconds * max_trade_rows) * 100.0
+            if window_seconds > 0 and max_trade_rows > 0
+            else 0.0
+        )
+        average_capital_used = max_trade_rows * capital_per_trade * utilization / 100.0
+
+        summary_cols = st.columns(7)
+        summary_cols[0].metric(
+            "LastTime (local)",
+            last_local.strftime("%d.%m %H:%M"),
+        )
+        summary_cols[1].metric("Trade Rows", max_trade_rows)
+        summary_cols[2].metric("Trades (in window)", len(visible))
+        summary_cols[3].metric("Capital / Trade", f"€{capital_per_trade:,.0f}")
+        summary_cols[4].metric("Max Capital", f"€{max_trade_rows * capital_per_trade:,.0f}")
+        summary_cols[5].metric("Avg. Capital Used", f"€{average_capital_used:,.0f}")
+        summary_cols[6].metric("Capital Utilization", f"{utilization:.1f}%")
+
+        st.info(
+            f"Note: The chart shows up to {max_trade_rows} trade rows "
+            "(Portfolio: maximum OPEN tickers)."
+        )
+        if not overflow_visible.empty:
+            st.warning(
+                f"{len(overflow_visible)} trade(s) in the selected window cannot be "
+                f"displayed because more than {max_trade_rows} trades were open "
+                "simultaneously. Select a smaller time window to inspect the period."
+            )
+
+        if visible.empty:
+            st.info("No simulator trades overlap the selected time window.")
+        else:
+            figure = px.timeline(
+                visible,
+                x_start="ChartStartLocal",
+                x_end="ChartEndLocal",
+                y="TradeRow",
+                color="TradeState",
+                text="TradeLabel",
+                hover_data={
+                    "Ticker": True,
+                    "BuyTime": False,
+                    "SellTime": False,
+                    "BuyTimeLocal": True,
+                    "SellTimeLocal": True,
+                    "DiffSellPrice": ":.2f",
+                    "SellReason": True,
+                    "TradeRow": False,
+                    "TradeState": False,
+                    "ChartStartLocal": False,
+                    "ChartEndLocal": False,
+                },
+                color_discrete_map={
+                    "Profit (> 0%)": "green",
+                    "Loss (< 0%)": "red",
+                    "Open / 0%": "grey",
+                },
+            )
+
+            # Background bands use the same configured US trading phases as the
+            # rest of the dashboard. Pre- and Post-Trading intentionally share
+            # one background color; Opening and No Trading use separate colors.
+            phase_config = dict(DEFAULT_TRADING_PHASES.get("US") or {})
+            phase_config.update(TRADING_PHASES.get("US") or {})
+            polygon_config = TRADING_WINDOWS.get("US") or {}
+            polygon_timezone = str(
+                phase_config.get("timezone")
+                or polygon_config.get("timezone", "America/New_York")
+            )
+            polygon_tz = ZoneInfo(polygon_timezone)
+
+            def _capital_minutes(value, default):
+                raw = str(value or default)
+                hour_text, minute_text = raw.split(":", 1)
+                return int(hour_text) * 60 + int(minute_text)
+
+            pre_minute = _capital_minutes(phase_config.get("pre_start"), "04:00")
+            open_minute = _capital_minutes(phase_config.get("opening_start"), "09:30")
+            close_minute = _capital_minutes(phase_config.get("opening_end"), "16:00")
+            post_minute = _capital_minutes(phase_config.get("post_end"), "20:00")
+            raw_weekdays = polygon_config.get("open_weekdays")
+            allowed_weekdays = (
+                {"mon", "tue", "wed", "thu", "fri"}
+                if raw_weekdays is None
+                else {str(value).strip().lower()[:3] for value in raw_weekdays}
+            )
+            closed_dates = {
+                str(value) for value in (polygon_config.get("closed_dates") or [])
+            }
+
+            # Match Historical Data exactly: No Trading uses the normal white
+            # chart background, Pre/Post-Trading uses the orange phase band,
+            # and Opening uses the light-blue phase band.
+            band_colors = {
+                "No Trading": "rgba(255, 255, 255, 1)",
+                "Pre/Post-Trading": "#f4a261",
+                "Opening": "#c6dbef",
+            }
+            band_opacity = {
+                "No Trading": 1.0,
+                "Pre/Post-Trading": 0.16,
+                "Opening": 0.28,
+            }
+
+            for berlin_day in pd.date_range(
+                start=window_start_local.normalize(),
+                end=(window_end_local - pd.Timedelta(seconds=1)).normalize(),
+                freq="D",
+            ):
+                day_start = berlin_day
+                day_end = berlin_day + pd.Timedelta(days=1)
+                # Derive US phase boundaries for the US calendar day(s) touching
+                # this Berlin day, then paint No Trading first and overwrite the
+                # active phase intervals on top.
+                figure.add_vrect(
+                    x0=day_start.tz_localize(None),
+                    x1=day_end.tz_localize(None),
+                    fillcolor=band_colors["No Trading"],
+                    opacity=band_opacity["No Trading"],
+                    layer="below",
+                    line_width=0,
+                )
+
+            us_start = window_start.tz_convert(polygon_tz).normalize() - pd.Timedelta(days=1)
+            us_end = window_end.tz_convert(polygon_tz).normalize() + pd.Timedelta(days=1)
+            for us_day in pd.date_range(start=us_start, end=us_end, freq="D"):
+                weekday_key = us_day.strftime("%a").lower()[:3]
+                date_key = us_day.strftime("%Y-%m-%d")
+                if weekday_key not in allowed_weekdays or date_key in closed_dates:
+                    continue
+                boundaries = [
+                    (pre_minute, open_minute, "Pre-Trading"),
+                    (open_minute, close_minute, "Opening"),
+                    (close_minute, post_minute, "Post-Trading"),
+                ]
+                for start_minute, end_minute, phase_name in boundaries:
+                    phase_start = (us_day + pd.Timedelta(minutes=start_minute)).tz_convert(LOCAL_TIMEZONE)
+                    phase_end = (us_day + pd.Timedelta(minutes=end_minute)).tz_convert(LOCAL_TIMEZONE)
+                    clipped_start = max(phase_start, window_start_local)
+                    clipped_end = min(phase_end, window_end_local)
+                    if clipped_start >= clipped_end:
+                        continue
+                    figure.add_vrect(
+                        x0=clipped_start.tz_localize(None),
+                        x1=clipped_end.tz_localize(None),
+                        fillcolor=(
+                            band_colors["Pre/Post-Trading"]
+                            if phase_name in {"Pre-Trading", "Post-Trading"}
+                            else band_colors[phase_name]
+                        ),
+                        opacity=(
+                            band_opacity["Pre/Post-Trading"]
+                            if phase_name in {"Pre-Trading", "Post-Trading"}
+                            else band_opacity[phase_name]
+                        ),
+                        layer="below",
+                        line_width=0,
+                    )
+                    midpoint = clipped_start + (clipped_end - clipped_start) / 2
+                    figure.add_annotation(
+                        x=midpoint.tz_localize(None),
+                        y=1.045,
+                        yref="paper",
+                        text=phase_name,
+                        showarrow=False,
+                        font={"size": 11, "color": "#303030"},
+                    )
+
+            tick_hours = 2 if int(window_days) <= 1 else 6 if int(window_days) <= 3 else 12 if int(window_days) <= 7 else 24
+            figure.update_yaxes(
+                categoryorder="array",
+                categoryarray=[
+                    f"TradeRow{row_number}"
+                    for row_number in range(1, max_trade_rows + 1)
+                ][::-1],
+                title=None,
+            )
+            figure.update_xaxes(
+                range=[window_start_local.tz_localize(None), window_end_local.tz_localize(None)],
+                dtick=tick_hours * 60 * 60 * 1000,
+                tickformat="%d.%m %H:%M",
+                tickangle=0,
+                title="Time (local)",
+            )
+            figure.update_traces(textposition="inside")
+            figure.update_layout(
+                height=max(420, 52 * max_trade_rows + 150),
+                legend_title_text="Trade result",
+                margin=dict(l=20, r=20, t=42, b=20),
+            )
+            st.plotly_chart(figure, use_container_width=True)
+
+        st.caption(
+            "Time window covers complete local calendar days: 00:00 on "
+            "(End day - Time window + 1) through 24:00 on End day. Each TradeRow "
+            "is one portfolio slot (approximately €10,000). Green = positive "
+            "DiffSellPrice, red = negative, grey = zero or still OPEN. Background "
+            "bands show No Trading, Pre/Post-Trading, and Opening periods."
+        )
 
 elif page == "System Health":
     st.header("System Health")
