@@ -38,7 +38,7 @@ trading_windows:
     closed_dates: []
     timezone: America/New_York
     regular_close: '16:00'
-    buy_start: 09:45
+    buy_start: '10:00'
     buy_end: '15:50'
     sell_start: 09:35
     sell_end: '15:55'
