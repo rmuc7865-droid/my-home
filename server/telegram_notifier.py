@@ -1698,6 +1698,25 @@ def evaluate_sell(
         action_time = pd.Timestamp.now(tz="UTC")
         window = trading_window_info(action_time, market_config, "sell")
 
+        # C4 is a protective price-drop exit and may execute as soon as the
+        # market's Pre-Trading phase starts. C5/C6/C7 continue to use the
+        # normal configured SELL window.
+        #
+        # Reuse trading_window_info so C4 still respects enabled,
+        # open_weekdays, closed_dates, timezone and sell_end.
+        c4_market_config = dict(market_config)
+        c4_phase_config = dict(DEFAULT_TRADING_PHASES.get(market_region) or {})
+        c4_phase_config.update(phase_config)
+        c4_pre_start = c4_phase_config.get("pre_start")
+        if c4_pre_start:
+            c4_market_config["sell_start"] = str(c4_pre_start)
+
+        c4_window = trading_window_info(
+            action_time,
+            c4_market_config,
+            "sell",
+        )
+
         # C6: end-of-day weak-position exit.
         #
         # Trigger only when C4 and C5 are both false, trading is currently open,
@@ -1879,8 +1898,20 @@ def evaluate_sell(
             f"Trading {phase} {until_end} {str(config['dashboard_url']).rstrip('/')}"
         )
 
-        if not window.is_open:
-            next_text = local_text(window.first_next_time)
+        c4_execution_allowed = bool(
+            c45_applies
+            and decision.c4_satisfied
+            and c4_window.is_open
+        )
+        execution_allowed = bool(
+            window.is_open or c4_execution_allowed
+        )
+        if not execution_allowed:
+            next_text = local_text(
+                c4_window.first_next_time
+                if c45_applies and decision.c4_satisfied
+                else window.first_next_time
+            )
 
             # Suppress repeated closed-market SELL advisories for the whole
             # closed session. The SELL reason (C4/C5) and market measurements
