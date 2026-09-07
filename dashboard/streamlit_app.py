@@ -2175,14 +2175,41 @@ st.sidebar.caption(
     f"{local_now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
 )
 
-def format_newest_data(frame: pd.DataFrame, column: str = "timestamp") -> str:
-    """Format the newest timestamp for page summary rows in local time."""
+def format_newest_data(
+    frame: pd.DataFrame,
+    column: str = "timestamp",
+    asset_type: str | None = None,
+) -> str:
+    """Format the newest market timestamp in local time."""
     if frame is None or frame.empty or column not in frame.columns:
         return "—"
-    newest = pd.to_datetime(frame[column], utc=True, errors="coerce").max()
+
+    work = frame
+
+    if asset_type is not None:
+        if "asset_type" not in work.columns:
+            return "—"
+        asset_types = work["asset_type"].astype(str).str.lower()
+        work = work[asset_types == asset_type.lower()]
+
+    if work.empty:
+        return "—"
+
+    newest = pd.to_datetime(
+        work[column],
+        utc=True,
+        errors="coerce",
+    ).max()
+
     if pd.isna(newest):
         return "—"
-    return newest.tz_convert(LOCAL_TIMEZONE).strftime("%H:%M")
+
+    local = newest.tz_convert(LOCAL_TIMEZONE)
+
+    if asset_type is None:
+        return local.strftime("%H:%M")
+
+    return local.strftime("%d %b %H:%M")
 
 def count_market_assets(frame: pd.DataFrame) -> int:
     if frame is None or frame.empty or "ticker" not in frame.columns:
@@ -2212,11 +2239,18 @@ if page == "Zero-Trading":
 
     def render_zero_summary(buy_assets: int = 0, sell_assets: int = 0) -> None:
         with zero_summary_placeholder.container():
-            counter_cols = st.columns(4)
-            counter_cols[0].metric("Newest Data", format_newest_data(market_df))
-            counter_cols[1].metric("Max Assets", BUY_MAX_OPEN_TICKERS)
-            counter_cols[2].metric("Buy Assets", int(buy_assets))
-            counter_cols[3].metric("Sell Assets", int(sell_assets))
+            counter_cols = st.columns(5)
+            counter_cols[0].metric(
+                "Stocks Data",
+                format_newest_data(market_df, asset_type="stock"),
+            )
+            counter_cols[1].metric(
+                "Crypto Data",
+                format_newest_data(market_df, asset_type="crypto"),
+            )
+            counter_cols[2].metric("Max Assets", BUY_MAX_OPEN_TICKERS)
+            counter_cols[3].metric("Buy Assets", int(buy_assets))
+            counter_cols[4].metric("Sell Assets", int(sell_assets))
 
     render_zero_summary()
 
@@ -3904,11 +3938,18 @@ elif page == "Last Data":
 
     last_data_summary_placeholder = st.empty()
     with last_data_summary_placeholder.container():
-        summary_cols = st.columns(4)
-        summary_cols[0].metric("Newest Data", format_newest_data(market_df))
-        summary_cols[1].metric("Assets with records", 0)
-        summary_cols[2].metric("Assets", count_market_assets(market_df))
-        summary_cols[3].metric("Alerts", count_open_alerts(alerts_df))
+        summary_cols = st.columns(5)
+        summary_cols[0].metric(
+            "Stocks Data",
+            format_newest_data(market_df, asset_type="stock"),
+        )
+        summary_cols[1].metric(
+            "Crypto Data",
+            format_newest_data(market_df, asset_type="crypto"),
+        )
+        summary_cols[2].metric("Assets with records", 0)
+        summary_cols[3].metric("Assets", count_market_assets(market_df))
+        summary_cols[4].metric("Alerts", count_open_alerts(alerts_df))
 
     if df.empty:
         st.info("No measurements received yet.")
@@ -4027,11 +4068,18 @@ elif page == "Last Data":
         )
 
         with last_data_summary_placeholder.container():
-            cols = st.columns(4)
-            cols[0].metric("Newest Data", format_newest_data(active_df))
-            cols[1].metric("Assets with records", assets_with_records)
-            cols[2].metric("Assets", assets)
-            cols[3].metric("Alerts", open_alerts)
+            cols = st.columns(5)
+            cols[0].metric(
+                "Stocks Data",
+                format_newest_data(active_df, asset_type="stock"),
+            )
+            cols[1].metric(
+                "Crypto Data",
+                format_newest_data(active_df, asset_type="crypto"),
+            )
+            cols[2].metric("Assets with records", assets_with_records)
+            cols[3].metric("Assets", assets)
+            cols[4].metric("Alerts", open_alerts)
 
         if live.empty:
             st.info("No active assets available.")
@@ -4712,11 +4760,18 @@ elif page == "Alerts":
         .astype(bool)
     )
 
-    alert_summary_cols = st.columns(4)
-    alert_summary_cols[0].metric("Newest Data", format_newest_data(df))
-    alert_summary_cols[1].metric("Alerts", len(alerts_work))
-    alert_summary_cols[2].metric("Unacknowledged", int((~alerts_work["acknowledged"]).sum()))
-    alert_summary_cols[3].metric("Acknowledged", int(alerts_work["acknowledged"].sum()))
+    alert_summary_cols = st.columns(5)
+    alert_summary_cols[0].metric(
+        "Stocks Data",
+        format_newest_data(df, asset_type="stock"),
+    )
+    alert_summary_cols[1].metric(
+        "Crypto Data",
+        format_newest_data(df, asset_type="crypto"),
+    )
+    alert_summary_cols[2].metric("Alerts", len(alerts_work))
+    alert_summary_cols[3].metric("Unacknowledged", int((~alerts_work["acknowledged"]).sum()))
+    alert_summary_cols[4].metric("Acknowledged", int(alerts_work["acknowledged"].sum()))
 
     show_open = st.toggle(
         "Only unacknowledged",
@@ -4964,10 +5019,17 @@ elif page == "Settings":
             )
 
     st.header("Settings")
-    settings_summary_cols = st.columns([1, 1, 3])
-    settings_summary_cols[0].metric("Newest Data", format_newest_data(df))
-    settings_summary_cols[1].metric("Assets", count_market_assets(df))
-    settings_summary_cols[2].metric("Last changes", last_changes_display)
+    settings_summary_cols = st.columns([1, 1, 1, 3])
+    settings_summary_cols[0].metric(
+        "Stocks Data",
+        format_newest_data(df, asset_type="stock"),
+    )
+    settings_summary_cols[1].metric(
+        "Crypto Data",
+        format_newest_data(df, asset_type="crypto"),
+    )
+    settings_summary_cols[2].metric("Assets", count_market_assets(df))
+    settings_summary_cols[3].metric("Last changes", last_changes_display)
 
     config_path = trading_config_path()
     st.caption(f"Active configuration file: {config_path}")
@@ -6273,19 +6335,23 @@ elif page == "Logs":
         else "—"
     )
     with logs_summary_placeholder.container():
-        logs_summary_cols = st.columns(6)
+        logs_summary_cols = st.columns(7)
         logs_summary_cols[0].metric(
-            "Newest Data",
-            format_newest_data(logs_market_df),
+            "Stocks Data",
+            format_newest_data(logs_market_df, asset_type="stock"),
         )
-        logs_summary_cols[1].metric("CurrDayProfit", curr_day_profit)
-        logs_summary_cols[2].metric("CurrWeekProfit", curr_week_profit)
-        logs_summary_cols[3].metric(
+        logs_summary_cols[1].metric(
+            "Crypto Data",
+            format_newest_data(logs_market_df, asset_type="crypto"),
+        )
+        logs_summary_cols[2].metric("CurrDayProfit", curr_day_profit)
+        logs_summary_cols[3].metric("CurrWeekProfit", curr_week_profit)
+        logs_summary_cols[4].metric(
             "Assets",
             count_market_assets(logs_market_df),
         )
-        logs_summary_cols[4].metric("Measurements", len(logs_market_df))
-        logs_summary_cols[5].metric(
+        logs_summary_cols[5].metric("Measurements", len(logs_market_df))
+        logs_summary_cols[6].metric(
             "Alerts",
             count_open_alerts(alerts_df),
         )
@@ -7916,16 +7982,20 @@ elif page == "Sim-Trading":
     ) -> None:
         available_slots = max(0, BUY_MAX_OPEN_TICKERS - int(open_count))
         with sim_summary_placeholder.container():
-            portfolio_cols = st.columns(3)
+            portfolio_cols = st.columns(4)
             portfolio_cols[0].metric(
-                "Newest Data",
-                format_newest_data(sim_market_for_summary),
+                "Stocks Data",
+                format_newest_data(sim_market_for_summary, asset_type="stock"),
             )
             portfolio_cols[1].metric(
+                "Crypto Data",
+                format_newest_data(sim_market_for_summary, asset_type="crypto"),
+            )
+            portfolio_cols[2].metric(
                 "LastOPENTickers / DayMaxOPENTickers",
                 f"{int(open_count)}/{int(day_max_open_count)}",
             )
-            portfolio_cols[2].metric(
+            portfolio_cols[3].metric(
                 "AvailableBUYTickers",
                 available_slots,
             )
@@ -8975,12 +9045,19 @@ elif page == "Sim-Trading":
 elif page == "Trading Efficiency":
     st.header("Trading Efficiency")
     efficiency_market_df = df[df["asset_type"].isin(["stock", "crypto"])].copy()
-    efficiency_summary_cols = st.columns(5)
-    efficiency_summary_cols[0].metric("Newest Data", format_newest_data(efficiency_market_df))
-    efficiency_summary_cols[1].metric("Assets", count_market_assets(efficiency_market_df))
-    last_open_profit_metric = efficiency_summary_cols[2].empty()
-    last_open_loss_metric = efficiency_summary_cols[3].empty()
-    last_close2h_metric = efficiency_summary_cols[4].empty()
+    efficiency_summary_cols = st.columns(6)
+    efficiency_summary_cols[0].metric(
+        "Stocks Data",
+        format_newest_data(efficiency_market_df, asset_type="stock"),
+    )
+    efficiency_summary_cols[1].metric(
+        "Crypto Data",
+        format_newest_data(efficiency_market_df, asset_type="crypto"),
+    )
+    efficiency_summary_cols[2].metric("Assets", count_market_assets(efficiency_market_df))
+    last_open_profit_metric = efficiency_summary_cols[3].empty()
+    last_open_loss_metric = efficiency_summary_cols[4].empty()
+    last_close2h_metric = efficiency_summary_cols[5].empty()
     last_open_profit_metric.metric("LastOPENProfit / LastOPEN", "—")
     last_open_loss_metric.metric("LastOPENLoss / LastSell", "—")
     last_close2h_metric.metric("LastClose2h / CLOSED", "—")
@@ -9822,11 +9899,18 @@ elif page == "System Health":
 
     def render_system_summary(systems: int = 0, collectors_ok: int = 0, markets_ok: int = 0) -> None:
         with system_summary_placeholder.container():
-            summary_cols = st.columns(4)
-            summary_cols[0].metric("Newest Data", format_newest_data(df))
-            summary_cols[1].metric("Systems", int(systems))
-            summary_cols[2].metric("Collectors OK", int(collectors_ok))
-            summary_cols[3].metric("Markets OK", int(markets_ok))
+            summary_cols = st.columns(5)
+            summary_cols[0].metric(
+                "Stocks Data",
+                format_newest_data(df, asset_type="stock"),
+            )
+            summary_cols[1].metric(
+                "Crypto Data",
+                format_newest_data(df, asset_type="crypto"),
+            )
+            summary_cols[2].metric("Systems", int(systems))
+            summary_cols[3].metric("Collectors OK", int(collectors_ok))
+            summary_cols[4].metric("Markets OK", int(markets_ok))
 
     render_system_summary(
         df["system"].dropna().astype(str).nunique() if not df.empty and "system" in df.columns else 0
