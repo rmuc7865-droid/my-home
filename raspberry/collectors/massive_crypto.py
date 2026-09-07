@@ -30,6 +30,11 @@ class MassiveCryptoCollector(Collector):
             "https://api.polygon.io",
         ).rstrip("/")
 
+        self.coinbase_base_url = config.get(
+            "coinbase_base_url",
+            "https://api.exchange.coinbase.com",
+        ).rstrip("/")
+
         api_key_env = config.get("api_key_env", "POLYGON_API_KEY")
         self.api_key = os.environ.get(api_key_env)
 
@@ -111,8 +116,53 @@ class MassiveCryptoCollector(Collector):
         # cannot create duplicate entries even within a single collection cycle.
         records_by_id: dict[str, MeasurementRecord] = {}
 
+        today_utc = datetime.now(timezone.utc).date()
+
         for query_date in query_dates:
             date_text = query_date.isoformat()
+
+            # Massive historical aggregates are retained for completed UTC
+            # days. The current UTC day is sourced from Coinbase because the
+            # configured Massive plan does not permit same-day crypto data.
+            if query_date == today_utc:
+                try:
+                    bars = await self._fetch_coinbase_current_day(
+                        client,
+                        ticker,
+                        query_date,
+                    )
+                except httpx.HTTPStatusError as exc:
+                    logger.warning(
+                        "Coinbase crypto %s %s: request failed; skipping day: "
+                        "HTTP %s %s",
+                        ticker,
+                        date_text,
+                        exc.response.status_code,
+                        exc.response.reason_phrase,
+                    )
+                    continue
+                except httpx.RequestError as exc:
+                    logger.warning(
+                        "Coinbase crypto %s %s: request failed; skipping day: %s",
+                        ticker,
+                        date_text,
+                        type(exc).__name__,
+                    )
+                    continue
+
+                logger.info(
+                    "Coinbase crypto %s %s: returned %d completed bar(s)",
+                    ticker,
+                    date_text,
+                    len(bars),
+                )
+
+                for bar in bars:
+                    record = self._record_from_coinbase_bar(ticker, bar)
+                    records_by_id[str(record.record_id)] = record
+
+                continue
+
             try:
                 bars = await self._fetch_bars_for_day(client, ticker, date_text)
             except httpx.HTTPStatusError as exc:
@@ -127,8 +177,6 @@ class MassiveCryptoCollector(Collector):
                 )
                 continue
             except httpx.RequestError as exc:
-                # Request errors can also contain the request URL. Log only the
-                # exception type so credentials in query parameters stay private.
                 logger.warning(
                     "Massive crypto %s %s: request failed; skipping day: %s",
                     ticker,
@@ -184,6 +232,104 @@ class MassiveCryptoCollector(Collector):
             )
 
         return results
+
+    async def _fetch_coinbase_current_day(
+        self,
+        client: httpx.AsyncClient,
+        ticker: str,
+        query_date: date,
+    ) -> list[list]:
+        if ticker != "X:BTCUSD":
+            raise ValueError(
+                f"Coinbase fallback mapping is not configured for {ticker}"
+            )
+
+        product_id = "BTC-USD"
+        granularity_seconds = self.multiplier * 60
+
+        url = (
+            f"{self.coinbase_base_url}/products/"
+            f"{product_id}/candles"
+        )
+
+        response = await client.get(
+            url,
+            params={"granularity": granularity_seconds},
+            headers={"User-Agent": "home-monitor/1.0"},
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise RuntimeError("Coinbase returned an unexpected candle payload")
+
+        now = datetime.now(timezone.utc)
+        current_bucket_start = now.replace(
+            minute=(now.minute // self.multiplier) * self.multiplier,
+            second=0,
+            microsecond=0,
+        )
+
+        bars = []
+        for bar in payload:
+            if not isinstance(bar, list) or len(bar) < 6:
+                continue
+
+            timestamp = datetime.fromtimestamp(
+                bar[0],
+                tz=timezone.utc,
+            )
+
+            # Keep only today's UTC candles and never persist the currently
+            # forming candle.
+            if (
+                timestamp.date() == query_date
+                and timestamp < current_bucket_start
+            ):
+                bars.append(bar)
+
+        return sorted(bars, key=lambda bar: bar[0])
+
+    def _record_from_coinbase_bar(
+        self,
+        ticker: str,
+        bar: list,
+    ) -> MeasurementRecord:
+        # Coinbase candle schema:
+        # [time, low, high, open, close, volume]
+        timestamp = datetime.fromtimestamp(
+            bar[0],
+            tz=timezone.utc,
+        )
+
+        return MeasurementRecord(
+            record_id=market_bar_record_id(
+                provider="coinbase",
+                system=self.system,
+                ticker=ticker,
+                multiplier=self.multiplier,
+                timespan=self.timespan,
+                timestamp=timestamp,
+            ),
+            system=self.system,
+            timestamp=timestamp,
+            measurements={
+                "open": bar[3],
+                "high": bar[2],
+                "low": bar[1],
+                "close": bar[4],
+                "volume": bar[5],
+            },
+            metadata={
+                "ticker": ticker,
+                "asset": ticker.removeprefix("X:").removesuffix("USD"),
+                "quote_currency": "USD",
+                "provider": "coinbase",
+                "asset_type": "crypto",
+                "multiplier": self.multiplier,
+                "timespan": self.timespan,
+            },
+        )
 
     def _record_from_bar(self, ticker: str, bar: dict) -> MeasurementRecord:
         timestamp = datetime.fromtimestamp(
