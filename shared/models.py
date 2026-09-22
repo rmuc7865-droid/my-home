@@ -36,6 +36,46 @@ class UploadResult(BaseModel):
     duplicates: int
     alerts_created: int
 
+class C2XObservationRecord(BaseModel):
+    """Point-in-time C2/C2X diagnostic observation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: str = Field(min_length=1, max_length=32)
+    observation_time: datetime
+    price: float = Field(gt=0)
+    closeb: float
+
+    raw_closeb_count: int = Field(ge=0)
+    effective_closeb_count: int = Field(ge=0)
+    minimum_closeb_count: int = Field(ge=0)
+    raw_c2_breadth_satisfied: bool
+    effective_c2_breadth_satisfied: bool
+
+    lowrise30: float
+    acceleration_ratio: float | None = None
+    c2x_excluded: bool
+    c2x_trigger: str | None = Field(
+        default=None,
+        max_length=64,
+    )
+
+    @field_validator("observation_time")
+    @classmethod
+    def observation_time_must_be_aware(
+        cls,
+        value: datetime,
+    ) -> datetime:
+        if (
+            value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise ValueError(
+                "observation_time must include a timezone"
+            )
+        return value.astimezone(timezone.utc)
+
+
 class TradeSignal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

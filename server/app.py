@@ -13,8 +13,8 @@ from sqlalchemy import delete, desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from shared.models import TradeSignal, UploadBatch, UploadResult
-from .database import Alert, Instrument, Measurement, SimulationTrade, TickerDividend, TickerNews, SessionLocal, init_db
+from shared.models import C2XObservationRecord, TradeSignal, UploadBatch, UploadResult
+from .database import Alert, C2XObservation, Instrument, Measurement, SimulationTrade, TickerDividend, TickerNews, SessionLocal, init_db
 from .rules import evaluate_rule, load_rules
 from .settings import settings
 from .telegram import send_alert
@@ -432,6 +432,114 @@ def acknowledge(alert_id: int, db: Session = Depends(get_db)) -> dict[str, bool]
     alert.acknowledged = True
     db.commit()
     return {"acknowledged": True}
+
+
+@app.post(
+    "/api/v1/c2x/observations",
+    dependencies=[Depends(require_api_key)],
+)
+def record_c2x_observation(
+    observation: C2XObservationRecord = Body(...),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Persist one immutable point-in-time C2/C2X observation."""
+
+    ticker = observation.ticker.upper().strip()
+
+    observation_time = observation.observation_time
+    if observation_time.tzinfo is not None:
+        observation_time = (
+            observation_time
+            .astimezone(timezone.utc)
+            .replace(tzinfo=None)
+        )
+
+    existing = db.scalar(
+        select(C2XObservation)
+        .where(
+            C2XObservation.ticker == ticker,
+            C2XObservation.observation_time
+            == observation_time,
+        )
+        .order_by(C2XObservation.id.asc())
+        .limit(1)
+    )
+
+    if existing:
+        return {
+            "recorded": False,
+            "reason": "duplicate_observation",
+            "observation_id": existing.id,
+            "ticker": ticker,
+        }
+
+    row = C2XObservation(
+        ticker=ticker,
+        observation_time=observation.observation_time,
+        price=observation.price,
+        closeb=observation.closeb,
+        raw_closeb_count=(
+            observation.raw_closeb_count
+        ),
+        effective_closeb_count=(
+            observation.effective_closeb_count
+        ),
+        minimum_closeb_count=(
+            observation.minimum_closeb_count
+        ),
+        raw_c2_breadth_satisfied=(
+            observation.raw_c2_breadth_satisfied
+        ),
+        effective_c2_breadth_satisfied=(
+            observation.effective_c2_breadth_satisfied
+        ),
+        lowrise30=observation.lowrise30,
+        acceleration_ratio=(
+            observation.acceleration_ratio
+        ),
+        c2x_excluded=observation.c2x_excluded,
+        c2x_trigger=observation.c2x_trigger,
+        created_at=datetime.now(timezone.utc),
+    )
+
+    db.add(row)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent/repeated notifier request may race
+        # between the duplicate check and INSERT.
+        db.rollback()
+
+        existing = db.scalar(
+            select(C2XObservation)
+            .where(
+                C2XObservation.ticker == ticker,
+                C2XObservation.observation_time
+                == observation_time,
+            )
+            .order_by(C2XObservation.id.asc())
+            .limit(1)
+        )
+
+        if existing:
+            return {
+                "recorded": False,
+                "reason": "duplicate_observation",
+                "observation_id": existing.id,
+                "ticker": ticker,
+            }
+
+        raise
+
+    db.refresh(row)
+
+    return {
+        "recorded": True,
+        "observation_id": row.id,
+        "ticker": ticker,
+    }
+
 
 @app.post("/api/v1/simulation/signals", dependencies=[Depends(require_api_key)])
 def record_simulation_signal(

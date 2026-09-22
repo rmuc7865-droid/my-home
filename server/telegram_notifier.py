@@ -909,6 +909,168 @@ def evaluate_buy(
         )
     )
 
+    raw_closeb_count = sum(
+        1
+        for row in highb_rows
+        if (
+            row.get("closeb") is not None
+            and row["closeb"] >= minimum_closeb_percent
+        )
+    )
+
+    # Forward-validation logging:
+    # record every ticker satisfying the individual CloseB
+    # condition, independently of global breadth, C2X blocking,
+    # portfolio capacity, Telegram delivery, or eventual BUY.
+    #
+    # observation_time is the underlying market-data timestamp,
+    # so repeated 60-second notifier evaluations are deduplicated
+    # by the API/database.
+    raw_c2_breadth_satisfied = (
+        raw_closeb_count >= minimum_closeb_count
+    )
+    effective_c2_breadth_satisfied = (
+        closeb_gt2_count >= minimum_closeb_count
+    )
+
+    for row in highb_rows:
+        closeb = row.get("closeb")
+
+        if (
+            closeb is None
+            or closeb < minimum_closeb_percent
+        ):
+            continue
+
+        ticker = str(
+            row.get("ticker") or ""
+        ).upper().strip()
+
+        observation_time = pd.to_datetime(
+            row.get("latest_time"),
+            utc=True,
+            errors="coerce",
+        )
+
+        if not ticker or pd.isna(observation_time):
+            continue
+
+        ticker_rows = (
+            df[df["ticker"] == ticker]
+            .sort_values(
+                ["timestamp", "id"]
+            )
+        )
+
+        if ticker_rows.empty:
+            continue
+
+        observation_rows = ticker_rows[
+            pd.to_datetime(
+                ticker_rows["timestamp"],
+                utc=True,
+                errors="coerce",
+            )
+            == observation_time
+        ]
+
+        if observation_rows.empty:
+            logger.warning(
+                "Cannot record C2X observation for %s: "
+                "no measurement at %s",
+                ticker,
+                observation_time,
+            )
+            continue
+
+        observation_row = observation_rows.iloc[-1]
+
+        price = pd.to_numeric(
+            observation_row.get("close"),
+            errors="coerce",
+        )
+
+        lowrise30 = pd.to_numeric(
+            row.get("c2x_lowrise30_percent"),
+            errors="coerce",
+        )
+
+        acceleration_ratio = pd.to_numeric(
+            row.get("c2x_acceleration_ratio"),
+            errors="coerce",
+        )
+
+        if pd.isna(price) or pd.isna(lowrise30):
+            continue
+
+        if isinstance(
+            observation_time,
+            pd.Timestamp,
+        ):
+            observation_time = (
+                observation_time.to_pydatetime()
+            )
+
+        try:
+            result = api_post(
+                client,
+                "/api/v1/c2x/observations",
+                {
+                    "ticker": ticker,
+                    "observation_time": (
+                        observation_time.isoformat()
+                    ),
+                    "price": float(price),
+                    "closeb": float(closeb),
+                    "raw_closeb_count": (
+                        raw_closeb_count
+                    ),
+                    "effective_closeb_count": (
+                        closeb_gt2_count
+                    ),
+                    "minimum_closeb_count": (
+                        minimum_closeb_count
+                    ),
+                    "raw_c2_breadth_satisfied": (
+                        raw_c2_breadth_satisfied
+                    ),
+                    "effective_c2_breadth_satisfied": (
+                        effective_c2_breadth_satisfied
+                    ),
+                    "lowrise30": float(lowrise30),
+                    "acceleration_ratio": (
+                        float(acceleration_ratio)
+                        if pd.notna(acceleration_ratio)
+                        else None
+                    ),
+                    "c2x_excluded": bool(
+                        row.get(
+                            "c2x_excluded",
+                            False,
+                        )
+                    ),
+                    "c2x_trigger": (
+                        row.get("c2x_trigger")
+                        or None
+                    ),
+                },
+            )
+
+            if result.get("recorded"):
+                logger.info(
+                    "C2X observation %s: %s",
+                    ticker,
+                    result,
+                )
+
+        except Exception:
+            # Diagnostics must never interrupt BUY evaluation.
+            logger.exception(
+                "Cannot record C2X observation "
+                "for %s",
+                ticker,
+            )
+
     if closeb_gt2_count < minimum_closeb_count:
         logger.info(
             "BUY C2 not satisfied: CloseB>=%.2f%% count=%d required=%d",

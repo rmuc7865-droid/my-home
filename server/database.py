@@ -207,6 +207,73 @@ class TickerDividend(Base):
     )
 
 
+class C2XObservation(Base):
+    __tablename__ = "c2x_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker",
+            "observation_time",
+            name="uq_c2x_observation_ticker_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+    ticker: Mapped[str] = mapped_column(
+        String(32),
+        index=True,
+    )
+    observation_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    price: Mapped[float] = mapped_column(Float)
+    closeb: Mapped[float] = mapped_column(Float)
+
+    raw_closeb_count: Mapped[int] = mapped_column(
+        Integer
+    )
+    effective_closeb_count: Mapped[int] = mapped_column(
+        Integer
+    )
+    minimum_closeb_count: Mapped[int] = mapped_column(
+        Integer
+    )
+    raw_c2_breadth_satisfied: Mapped[bool] = mapped_column(
+        Boolean
+    )
+    effective_c2_breadth_satisfied: Mapped[
+        bool
+    ] = mapped_column(
+        Boolean
+    )
+
+    lowrise30: Mapped[float] = mapped_column(Float)
+    acceleration_ratio: Mapped[
+        float | None
+    ] = mapped_column(
+        Float,
+        nullable=True,
+    )
+    c2x_excluded: Mapped[bool] = mapped_column(
+        Boolean,
+        index=True,
+    )
+    c2x_trigger: Mapped[
+        str | None
+    ] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+
+
 class SimulationTrade(Base):
     __tablename__ = "simulation_trades"
 
