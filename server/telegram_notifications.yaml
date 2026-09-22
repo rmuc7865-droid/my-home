@@ -17,6 +17,12 @@ buy:
   baseline_hours: 2
   max_open_tickers: 10
   baseline_tolerance_minutes: 30
+  c2x_enabled: true
+  c2x_window_minutes: 30
+  c2x_soft_lowrise_percent: 6.0
+  c2x_hard_lowrise_percent: 8.0
+  c2x_acceleration_ratio_threshold: 4.0
+  c2x_baseline_days: 7
 sell:
   enabled: true
   movement_percent: 2.0

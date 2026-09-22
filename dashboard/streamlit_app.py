@@ -20,6 +20,8 @@ import streamlit as st
 import altair as alt
 import yaml
 
+from shared.buy_signals import c2x_hybrid_signal
+
 from shared.trading_decisions import (
     evaluate_sell_history,
     format_duration,
@@ -861,6 +863,18 @@ BUY_CONFIG = TRADING_CONFIG.get("buy") or {}
 BUY_MIN_CLOSEB_COUNT = int(BUY_CONFIG.get("minimum_closeb_count", BUY_CONFIG.get("minimum_closeb_ge2_count", 6)))
 BUY_MIN_CLOSEB_PERCENT = float(BUY_CONFIG.get("minimum_closeb_percent", 2.0))
 BUY_MAX_OPEN_TICKERS = max(1, int(BUY_CONFIG.get("max_open_tickers", 10)))
+BUY_C2X_ENABLED = bool(BUY_CONFIG.get("c2x_enabled", True))
+BUY_C2X_WINDOW_MINUTES = int(BUY_CONFIG.get("c2x_window_minutes", 30))
+BUY_C2X_SOFT_LOWRise_PERCENT = float(
+    BUY_CONFIG.get("c2x_soft_lowrise_percent", 6.0)
+)
+BUY_C2X_HARD_LOWRise_PERCENT = float(
+    BUY_CONFIG.get("c2x_hard_lowrise_percent", 8.0)
+)
+BUY_C2X_ACCEL_RATIO = float(
+    BUY_CONFIG.get("c2x_acceleration_ratio_threshold", 4.0)
+)
+BUY_C2X_BASELINE_DAYS = int(BUY_CONFIG.get("c2x_baseline_days", 7))
 SELL_CONFIG = TRADING_CONFIG.get("sell") or {}
 
 # Display-only market phases used by Last Data. They intentionally do not
@@ -1875,6 +1889,10 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
             "CanBuy": False,
             "C1": False,
             "C2": False,
+            "C2X": False,
+            "LowRise30": None,
+            "AccelRatio": None,
+            "C2XTrigger": None,
             "BuyInfo": "",
 
             "ShouldSell": False,
@@ -2110,6 +2128,22 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
                 price / baseline_close - 1
             ) * 100
 
+        c2x = c2x_hybrid_signal(
+            ticker_df,
+            latest_time,
+            lowrise_window_minutes=BUY_C2X_WINDOW_MINUTES,
+            soft_lowrise_percent=BUY_C2X_SOFT_LOWRise_PERCENT,
+            hard_lowrise_percent=BUY_C2X_HARD_LOWRise_PERCENT,
+            acceleration_ratio_threshold=BUY_C2X_ACCEL_RATIO,
+            baseline_days=BUY_C2X_BASELINE_DAYS,
+        )
+        row["LowRise30"] = c2x.low_rise_percent
+        row["AccelRatio"] = c2x.acceleration_ratio
+        row["C2XTrigger"] = c2x.trigger
+        row["C2X"] = bool(
+            BUY_C2X_ENABLED and c2x.excluded
+        )
+
         rows.append(row)
 
     result = pd.DataFrame(rows)
@@ -2128,6 +2162,7 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
                 c2_breadth_satisfied
                 and pd.notna(current_closeb)
                 and float(current_closeb) >= BUY_MIN_CLOSEB_PERCENT
+                and not bool(current.get("C2X", False))
             )
             market_region = current.get("MarketRegion")
             market_config = TRADING_WINDOWS.get(market_region) if market_region else None
@@ -2147,7 +2182,12 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
             result.at[index, "CanBuy"] = bool(c1_satisfied and c2_satisfied)
             result.at[index, "BuyInfo"] = (
                 f"C1={c1_satisfied} (RemainingTime={remaining_text}); "
-                f"C2={c2_satisfied} (CloseB>={BUY_MIN_CLOSEB_PERCENT:g}%: {closeb_ge2_count}/{BUY_MIN_CLOSEB_COUNT})"
+                f"C2={c2_satisfied} (CloseB>={BUY_MIN_CLOSEB_PERCENT:g}%: "
+                f"{closeb_ge2_count}/{BUY_MIN_CLOSEB_COUNT}; "
+                f"C2X={bool(current.get('C2X', False))}, "
+                f"LowRise30={current.get('LowRise30')}, "
+                f"AccelRatio={current.get('AccelRatio')}, "
+                f"Trigger={current.get('C2XTrigger')})"
             )
 
         result = result.sort_values(

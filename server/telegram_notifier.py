@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
+from shared.buy_signals import c2x_hybrid_signal
 import yaml
 
 from shared.trading_decisions import (
@@ -609,6 +610,11 @@ def calculate_latest_highb(
     df: pd.DataFrame,
     baseline_hours: float,
     tolerance_minutes: int,
+    c2x_window_minutes: int = 30,
+    c2x_soft_lowrise_percent: float = 6.0,
+    c2x_hard_lowrise_percent: float = 8.0,
+    c2x_acceleration_ratio_threshold: float = 4.0,
+    c2x_baseline_days: int = 7,
 ) -> list[dict]:
     if df.empty:
         return []
@@ -748,6 +754,20 @@ def calculate_latest_highb(
                     if closeb is not None
                     else None
                 ),
+                **(lambda sig: {
+                    "c2x_lowrise30_percent": sig.low_rise_percent,
+                    "c2x_acceleration_ratio": sig.acceleration_ratio,
+                    "c2x_trigger": sig.trigger,
+                    "c2x_excluded": sig.excluded,
+                })(c2x_hybrid_signal(
+                    ticker_df,
+                    latest_time,
+                    lowrise_window_minutes=c2x_window_minutes,
+                    soft_lowrise_percent=c2x_soft_lowrise_percent,
+                    hard_lowrise_percent=c2x_hard_lowrise_percent,
+                    acceleration_ratio_threshold=c2x_acceleration_ratio_threshold,
+                    baseline_days=c2x_baseline_days,
+                )),
                 "system": latest.get(
                     "system"
                 ),
@@ -838,6 +858,17 @@ def evaluate_buy(
                 30,
             )
         ),
+        c2x_window_minutes=int(rule.get("c2x_window_minutes", 30)),
+        c2x_soft_lowrise_percent=float(
+            rule.get("c2x_soft_lowrise_percent", 6.0)
+        ),
+        c2x_hard_lowrise_percent=float(
+            rule.get("c2x_hard_lowrise_percent", 8.0)
+        ),
+        c2x_acceleration_ratio_threshold=float(
+            rule.get("c2x_acceleration_ratio_threshold", 4.0)
+        ),
+        c2x_baseline_days=int(rule.get("c2x_baseline_days", 7)),
     )
 
     closeb_gt0_count = sum(
@@ -856,12 +887,18 @@ def evaluate_buy(
         )
     )
 
+    c2x_enabled = bool(rule.get("c2x_enabled", True))
+
     closeb_gt2_count = sum(
         1
         for row in highb_rows
         if (
             row.get("closeb") is not None
             and row["closeb"] >= minimum_closeb_percent
+            and not (
+                c2x_enabled
+                and bool(row.get("c2x_excluded", False))
+            )
         )
     )
 
