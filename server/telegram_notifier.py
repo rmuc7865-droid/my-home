@@ -1088,6 +1088,10 @@ def evaluate_buy(
         if (
             row.get("closeb") is not None
             and row["closeb"] >= minimum_closeb_percent
+            and not (
+                c2x_enabled
+                and bool(row.get("c2x_excluded", False))
+            )
         )
     ]
 
@@ -1291,6 +1295,62 @@ def evaluate_buy(
                 market_region,
             )
             continue
+
+        # Do not open a new position during the end-of-day C6/C7
+        # liquidation window. C6/C7 are intended to close existing
+        # holdings before regular market close, so opening a fresh
+        # position in the same period creates a BUY/SELL loop.
+        sell_rule = config.get("sell") or {}
+        c6_close_minutes = float(
+            sell_rule.get("c6_close_minutes", 30.0)
+        )
+
+        regular_close_value = market_config.get("regular_close")
+
+        if regular_close_value:
+            try:
+                market_timezone = str(
+                    market_config.get("timezone") or "UTC"
+                )
+                action_time = pd.to_datetime(
+                    row["latest_time"],
+                    utc=True,
+                )
+                action_local = action_time.tz_convert(
+                    market_timezone
+                )
+                regular_close_time = parse_hhmm(
+                    str(regular_close_value)
+                )
+                regular_close_local = pd.Timestamp(
+                    datetime.combine(
+                        action_local.date(),
+                        regular_close_time,
+                    ),
+                    tz=ZoneInfo(market_timezone),
+                )
+                remaining_minutes = (
+                    regular_close_local - action_local
+                ).total_seconds() / 60.0
+
+                if (
+                    0.0
+                    <= remaining_minutes
+                    <= c6_close_minutes
+                ):
+                    logger.info(
+                        "BUY skipped %s: end-of-day "
+                        "exit window active (%.1f min to close)",
+                        ticker,
+                        remaining_minutes,
+                    )
+                    continue
+            except Exception:
+                logger.exception(
+                    "BUY %s: cannot evaluate "
+                    "end-of-day BUY block",
+                    ticker,
+                )
 
         row = dict(row)
         phase, until_end = trading_phase_and_until_end(
