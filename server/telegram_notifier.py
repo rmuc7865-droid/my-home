@@ -595,6 +595,24 @@ def parse_hhmm(value: str) -> dt_time:
         str(value)
     )
 
+def c6_holding_preexists_window(
+    buy_time,
+    action_time,
+    remaining_minutes: float | None,
+    close_minutes: float,
+) -> bool:
+    """Return True only if the holding existed before the C6/C7 exit window."""
+    if remaining_minutes is None:
+        return False
+    buy_ts = pd.to_datetime(buy_time, utc=True, errors="coerce")
+    action_ts = pd.to_datetime(action_time, utc=True, errors="coerce")
+    if pd.isna(buy_ts) or pd.isna(action_ts):
+        return False
+    elapsed_in_window = max(0.0, float(close_minutes) - float(remaining_minutes))
+    window_start = action_ts - pd.Timedelta(minutes=elapsed_in_window)
+    return bool(buy_ts < window_start)
+
+
 def inside_trading_window(
     timestamp,
     market_config: dict,
@@ -615,6 +633,9 @@ def calculate_latest_highb(
     c2x_hard_lowrise_percent: float = 8.0,
     c2x_acceleration_ratio_threshold: float = 4.0,
     c2x_baseline_days: int = 7,
+    c2x_max_closeb_percent: float = 8.0,
+    c2x_max_peak_age_minutes: float = 30.0,
+    c2x_max_peak_drawdown_percent: float = 2.0,
 ) -> list[dict]:
     if df.empty:
         return []
@@ -744,6 +765,68 @@ def calculate_latest_highb(
             highest / baseline_close - 1
         ) * 100
 
+        sig = c2x_hybrid_signal(
+            ticker_df,
+            latest_time,
+            lowrise_window_minutes=c2x_window_minutes,
+            soft_lowrise_percent=c2x_soft_lowrise_percent,
+            hard_lowrise_percent=c2x_hard_lowrise_percent,
+            acceleration_ratio_threshold=c2x_acceleration_ratio_threshold,
+            baseline_days=c2x_baseline_days,
+        )
+
+        # C2X also protects the full CloseB window. A ticker that is already
+        # more than the configured percentage above its 2h baseline is too
+        # extended to enter, even when the last 30 minutes alone do not trip
+        # the short-term LowRise filter.
+        closeb_too_high = bool(
+            closeb is not None
+            and float(closeb) > float(c2x_max_closeb_percent)
+        )
+
+        # A positive CloseB can hide a reversal: the ticker may have peaked
+        # earlier in the 2h window and already be falling. Require the maximum
+        # CLOSE in the CloseB window to be near latest_time. Using close rather
+        # than intrabar high keeps this condition aligned with CloseB itself.
+        close_values = pd.to_numeric(window["close"], errors="coerce")
+        valid_close = window.loc[close_values.notna()].copy()
+        peak_time = None
+        peak_age_minutes = None
+        peak_drawdown_percent = None
+        if not valid_close.empty:
+            valid_close["_close_numeric"] = pd.to_numeric(
+                valid_close["close"], errors="coerce"
+            )
+            peak_idx = valid_close["_close_numeric"].idxmax()
+            peak_time = pd.to_datetime(
+                valid_close.loc[peak_idx, "timestamp"], utc=True
+            )
+            peak_age_minutes = max(
+                0.0,
+                (latest_time - peak_time).total_seconds() / 60.0,
+            )
+            peak_close = float(valid_close.loc[peak_idx, "_close_numeric"])
+            latest_close = float(latest["close"])
+            if peak_close > 0:
+                peak_drawdown_percent = max(
+                    0.0,
+                    (1.0 - latest_close / peak_close) * 100.0,
+                )
+
+        stale_peak = bool(
+            closeb is not None
+            and float(closeb) > 0.0
+            and peak_age_minutes is not None
+            and peak_age_minutes > float(c2x_max_peak_age_minutes)
+            and peak_drawdown_percent is not None
+            and peak_drawdown_percent > float(c2x_max_peak_drawdown_percent)
+        )
+
+        extra_trigger = (
+            "closeb_too_high" if closeb_too_high
+            else ("stale_2h_peak" if stale_peak else None)
+        )
+
         results.append(
             {
                 "ticker": ticker,
@@ -754,20 +837,15 @@ def calculate_latest_highb(
                     if closeb is not None
                     else None
                 ),
-                **(lambda sig: {
-                    "c2x_lowrise30_percent": sig.low_rise_percent,
-                    "c2x_acceleration_ratio": sig.acceleration_ratio,
-                    "c2x_trigger": sig.trigger,
-                    "c2x_excluded": sig.excluded,
-                })(c2x_hybrid_signal(
-                    ticker_df,
-                    latest_time,
-                    lowrise_window_minutes=c2x_window_minutes,
-                    soft_lowrise_percent=c2x_soft_lowrise_percent,
-                    hard_lowrise_percent=c2x_hard_lowrise_percent,
-                    acceleration_ratio_threshold=c2x_acceleration_ratio_threshold,
-                    baseline_days=c2x_baseline_days,
-                )),
+                "c2x_lowrise30_percent": sig.low_rise_percent,
+                "c2x_acceleration_ratio": sig.acceleration_ratio,
+                "c2x_peak_time120": peak_time,
+                "c2x_peak_age120_minutes": peak_age_minutes,
+                "c2x_peak_drawdown120_percent": peak_drawdown_percent,
+                "c2x_trigger": sig.trigger or extra_trigger,
+                "c2x_excluded": bool(
+                    sig.excluded or closeb_too_high or stale_peak
+                ),
                 "system": latest.get(
                     "system"
                 ),
@@ -869,6 +947,15 @@ def evaluate_buy(
             rule.get("c2x_acceleration_ratio_threshold", 4.0)
         ),
         c2x_baseline_days=int(rule.get("c2x_baseline_days", 7)),
+        c2x_max_closeb_percent=float(
+            rule.get("c2x_max_closeb_percent", 8.0)
+        ),
+        c2x_max_peak_age_minutes=float(
+            rule.get("c2x_max_peak_age_minutes", 30.0)
+        ),
+        c2x_max_peak_drawdown_percent=float(
+            rule.get("c2x_max_peak_drawdown_percent", 2.0)
+        ),
     )
 
     closeb_gt0_count = sum(
@@ -2042,6 +2129,17 @@ def evaluate_sell(
                     market_region,
                 )
 
+        # C6 may only liquidate a holding that already existed BEFORE the C6
+        # liquidation window started. This is a second line of defence behind
+        # the BUY-side end-of-day block and prevents a fresh BUY from being
+        # closed immediately (including BUY and SELL on the same timestamp).
+        c6_preexisting_holding = c6_holding_preexists_window(
+            buy_time,
+            action_time,
+            c6_remaining_minutes,
+            c6_close_minutes,
+        )
+
         c6_satisfied = bool(
             c6_enabled
             and not decision.c4_satisfied
@@ -2049,6 +2147,7 @@ def evaluate_sell(
             and window.is_open
             and c6_remaining_minutes is not None
             and 0.0 <= c6_remaining_minutes <= c6_close_minutes
+            and c6_preexisting_holding
             and c6_gain_percent is not None
             and c6_gain_percent < c6_min_gain_percent
         )
@@ -2059,6 +2158,7 @@ def evaluate_sell(
             and window.is_open
             and c6_remaining_minutes is not None
             and 0.0 <= c6_remaining_minutes <= c6_close_minutes
+            and c6_preexisting_holding
             and c6_gain_percent is not None
             and c6_gain_percent > c7_max_gain_percent
         )

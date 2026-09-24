@@ -23,6 +23,9 @@ buy:
   c2x_hard_lowrise_percent: 8.0
   c2x_acceleration_ratio_threshold: 4.0
   c2x_baseline_days: 7
+  c2x_max_closeb_percent: 8.0
+  c2x_max_peak_age_minutes: 30
+  c2x_max_peak_drawdown_percent: 2.0
 sell:
   enabled: true
   movement_percent: 2.0
