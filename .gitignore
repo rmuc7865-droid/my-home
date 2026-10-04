@@ -27,3 +27,8 @@ config/watchlist_membership.json
 .DS_Store
 ._*
 __MACOSX/
+
+# Generated analysis / replay outputs
+analysis_results/
+simulation_trades.xlsx
+weekly_optimizer_snapshot.db

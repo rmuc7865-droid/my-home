@@ -54,3 +54,56 @@ def test_c2x_allows_positive_closeb_when_peak_is_recent():
     assert row["c2x_peak_age120_minutes"] == 15.0
     assert row["closeb"] < 8.0
     assert row["c2x_excluded"] is False
+
+
+def test_c2x_blocks_spike_collapse_60m_in_production_path():
+    # Trailing 60m: 100 -> 130 -> 125 -> 115 -> 110.
+    # Rise60 = 30%; drawdown = 130/110 - 1 = 18.18%.
+    rows = calculate_latest_highb(
+        _frame([100, 100, 100, 100, 100, 130, 125, 115, 110]),
+        baseline_hours=2,
+        tolerance_minutes=1,
+        c2x_hard_lowrise_percent=999.0,
+        c2x_soft_lowrise_percent=999.0,
+        c2x_acceleration_ratio_threshold=999.0,
+        c2x_max_closeb_percent=999.0,
+        c2x_max_peak_age_minutes=999.0,
+        c2x_max_peak_drawdown_percent=999.0,
+        c2x_spike_collapse_enabled=True,
+        c2x_spike_collapse_window_minutes=60,
+        c2x_spike_collapse_min_rise_percent=25.0,
+        c2x_spike_collapse_min_drawdown_percent=15.0,
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["c2x_rise60_percent"] >= 25.0
+    assert row["c2x_drawdown60_percent"] >= 15.0
+    assert row["c2x_excluded"] is True
+    assert row["c2x_trigger"] == "spike_collapse_60m"
+
+
+def test_c2x_allows_large_rise_without_spike_collapse():
+    # Rise60 >25%, but the current price remains close to the peak.
+    rows = calculate_latest_highb(
+        _frame([100, 100, 100, 100, 100, 110, 120, 130, 128]),
+        baseline_hours=2,
+        tolerance_minutes=1,
+        c2x_hard_lowrise_percent=999.0,
+        c2x_soft_lowrise_percent=999.0,
+        c2x_acceleration_ratio_threshold=999.0,
+        c2x_max_closeb_percent=999.0,
+        c2x_max_peak_age_minutes=999.0,
+        c2x_max_peak_drawdown_percent=999.0,
+        c2x_spike_collapse_enabled=True,
+        c2x_spike_collapse_window_minutes=60,
+        c2x_spike_collapse_min_rise_percent=25.0,
+        c2x_spike_collapse_min_drawdown_percent=15.0,
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["c2x_rise60_percent"] >= 25.0
+    assert row["c2x_drawdown60_percent"] < 15.0
+    assert row["c2x_excluded"] is False
+    assert row["c2x_trigger"] is None

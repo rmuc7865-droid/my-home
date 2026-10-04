@@ -26,13 +26,17 @@ buy:
   c2x_max_closeb_percent: 8.0
   c2x_max_peak_age_minutes: 30
   c2x_max_peak_drawdown_percent: 2.5
+  c2x_spike_collapse_enabled: true
+  c2x_spike_collapse_window_minutes: 60
+  c2x_spike_collapse_min_rise_percent: 25.0
+  c2x_spike_collapse_min_drawdown_percent: 15.0
 sell:
   enabled: true
   movement_percent: 2.0
   c5_hours: 12.0
   rule1_tolerance_minutes: 30
   rule2_max_data_age_minutes: 30
-  c6_min_gain_percent: 2.0
+  c6_min_gain_percent: 4.7
   c7_max_gain_percent: 5.0
   details: true
 trading_windows:

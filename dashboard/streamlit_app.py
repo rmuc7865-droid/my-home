@@ -20,7 +20,7 @@ import streamlit as st
 import altair as alt
 import yaml
 
-from shared.buy_signals import c2x_hybrid_signal
+from shared.buy_signals import c2x_hybrid_signal, c2x_path_signal
 
 from shared.trading_decisions import (
     evaluate_sell_history,
@@ -875,6 +875,30 @@ BUY_C2X_ACCEL_RATIO = float(
     BUY_CONFIG.get("c2x_acceleration_ratio_threshold", 4.0)
 )
 BUY_C2X_BASELINE_DAYS = int(BUY_CONFIG.get("c2x_baseline_days", 7))
+
+# Keep dashboard C2X eligibility aligned with the production notifier.
+BUY_C2X_MAX_CLOSEB_PERCENT = float(
+    BUY_CONFIG.get("c2x_max_closeb_percent", 8.0)
+)
+BUY_C2X_MAX_PEAK_AGE_MINUTES = float(
+    BUY_CONFIG.get("c2x_max_peak_age_minutes", 30.0)
+)
+BUY_C2X_MAX_PEAK_DRAWDOWN_PERCENT = float(
+    BUY_CONFIG.get("c2x_max_peak_drawdown_percent", 2.0)
+)
+BUY_C2X_SPIKE_COLLAPSE_ENABLED = bool(
+    BUY_CONFIG.get("c2x_spike_collapse_enabled", True)
+)
+BUY_C2X_SPIKE_COLLAPSE_WINDOW_MINUTES = int(
+    BUY_CONFIG.get("c2x_spike_collapse_window_minutes", 60)
+)
+BUY_C2X_SPIKE_COLLAPSE_MIN_RISE_PERCENT = float(
+    BUY_CONFIG.get("c2x_spike_collapse_min_rise_percent", 25.0)
+)
+BUY_C2X_SPIKE_COLLAPSE_MIN_DRAWDOWN_PERCENT = float(
+    BUY_CONFIG.get("c2x_spike_collapse_min_drawdown_percent", 15.0)
+)
+
 SELL_CONFIG = TRADING_CONFIG.get("sell") or {}
 
 # Display-only market phases used by Last Data. They intentionally do not
@@ -1892,6 +1916,11 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
             "C2X": False,
             "LowRise30": None,
             "AccelRatio": None,
+            "Rise60": None,
+            "DD60": None,
+            "PeakAge60": None,
+            "PeakAge120": None,
+            "PeakDD120": None,
             "C2XTrigger": None,
             "BuyInfo": "",
 
@@ -2137,11 +2166,103 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
             acceleration_ratio_threshold=BUY_C2X_ACCEL_RATIO,
             baseline_days=BUY_C2X_BASELINE_DAYS,
         )
+
+        path_sig = c2x_path_signal(
+            ticker_df,
+            latest_time,
+            window_minutes=BUY_C2X_SPIKE_COLLAPSE_WINDOW_MINUTES,
+            min_rise_percent=BUY_C2X_SPIKE_COLLAPSE_MIN_RISE_PERCENT,
+            min_drawdown_percent=BUY_C2X_SPIKE_COLLAPSE_MIN_DRAWDOWN_PERCENT,
+        )
+        spike_collapse = bool(
+            BUY_C2X_SPIKE_COLLAPSE_ENABLED and path_sig.excluded
+        )
+
+        current_closeb = pd.to_numeric(
+            row.get("CloseB"),
+            errors="coerce",
+        )
+
+        closeb_too_high = bool(
+            pd.notna(current_closeb)
+            and float(current_closeb) > BUY_C2X_MAX_CLOSEB_PERCENT
+        )
+
+        close_values = pd.to_numeric(
+            window["close"],
+            errors="coerce",
+        )
+        valid_close = window.loc[close_values.notna()].copy()
+
+        peak_age120 = None
+        peak_dd120 = None
+
+        if not valid_close.empty and pd.notna(price):
+            valid_close["_close_numeric"] = pd.to_numeric(
+                valid_close["close"],
+                errors="coerce",
+            )
+
+            peak_idx = valid_close["_close_numeric"].idxmax()
+            peak_time120 = pd.to_datetime(
+                valid_close.loc[peak_idx, "timestamp"],
+                utc=True,
+            )
+
+            peak_age120 = max(
+                0.0,
+                (latest_time - peak_time120).total_seconds() / 60.0,
+            )
+
+            peak_close120 = float(
+                valid_close.loc[peak_idx, "_close_numeric"]
+            )
+
+            if peak_close120 > 0:
+                peak_dd120 = max(
+                    0.0,
+                    (1.0 - float(price) / peak_close120) * 100.0,
+                )
+
+        stale_peak = bool(
+            pd.notna(current_closeb)
+            and float(current_closeb) > 0.0
+            and peak_age120 is not None
+            and peak_age120 > BUY_C2X_MAX_PEAK_AGE_MINUTES
+            and peak_dd120 is not None
+            and peak_dd120 > BUY_C2X_MAX_PEAK_DRAWDOWN_PERCENT
+        )
+
+        extra_trigger = (
+            "closeb_too_high"
+            if closeb_too_high
+            else (
+                "stale_2h_peak"
+                if stale_peak
+                else (
+                    path_sig.trigger
+                    if spike_collapse
+                    else None
+                )
+            )
+        )
+
         row["LowRise30"] = c2x.low_rise_percent
         row["AccelRatio"] = c2x.acceleration_ratio
-        row["C2XTrigger"] = c2x.trigger
+        row["Rise60"] = path_sig.rise_percent
+        row["DD60"] = path_sig.drawdown_percent
+        row["PeakAge60"] = path_sig.peak_age_minutes
+        row["PeakAge120"] = peak_age120
+        row["PeakDD120"] = peak_dd120
+        row["C2XTrigger"] = c2x.trigger or extra_trigger
         row["C2X"] = bool(
-            BUY_C2X_ENABLED and c2x.excluded
+            BUY_C2X_ENABLED
+            and (
+                c2x.excluded
+                or closeb_too_high
+                or stale_peak
+                or spike_collapse
+            )
         )
 
         rows.append(row)
@@ -2149,10 +2270,37 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
     result = pd.DataFrame(rows)
 
     if not result.empty:
-        closeb_ge2_count = int(
-            (pd.to_numeric(result["CloseB"], errors="coerce") >= BUY_MIN_CLOSEB_PERCENT).sum()
+        closeb_numeric = pd.to_numeric(
+            result["CloseB"],
+            errors="coerce",
         )
-        c2_breadth_satisfied = closeb_ge2_count >= BUY_MIN_CLOSEB_COUNT
+
+        raw_closeb_count = int(
+            (closeb_numeric >= BUY_MIN_CLOSEB_PERCENT).sum()
+        )
+
+        if BUY_C2X_ENABLED:
+            c2x_excluded = (
+                result["C2X"]
+                .fillna(False)
+                .astype(bool)
+            )
+        else:
+            c2x_excluded = pd.Series(
+                False,
+                index=result.index,
+            )
+
+        closeb_ge2_count = int(
+            (
+                (closeb_numeric >= BUY_MIN_CLOSEB_PERCENT)
+                & ~c2x_excluded
+            ).sum()
+        )
+
+        c2_breadth_satisfied = (
+            closeb_ge2_count >= BUY_MIN_CLOSEB_COUNT
+        )
         for index, current in result.iterrows():
             current_closeb = pd.to_numeric(
                 current.get("CloseB"),
@@ -2187,6 +2335,8 @@ def build_live_overview(data: pd.DataFrame) -> pd.DataFrame:
                 f"C2X={bool(current.get('C2X', False))}, "
                 f"LowRise30={current.get('LowRise30')}, "
                 f"AccelRatio={current.get('AccelRatio')}, "
+                f"Rise60={current.get('Rise60')}, "
+                f"DD60={current.get('DD60')}, "
                 f"Trigger={current.get('C2XTrigger')})"
             )
 

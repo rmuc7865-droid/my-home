@@ -30,6 +30,107 @@ def _clean_history(ticker_df: pd.DataFrame, latest_time) -> pd.DataFrame:
     return frame[frame["timestamp"] <= when].sort_values("timestamp")
 
 
+
+@dataclass(frozen=True)
+class PathSignal:
+    rise_percent: float | None
+    drawdown_percent: float | None
+    peak_age_minutes: float | None
+    excluded: bool
+    trigger: str | None = None
+
+
+def c2x_path_signal(
+    ticker_df: pd.DataFrame,
+    latest_time,
+    *,
+    window_minutes: int = 60,
+    min_rise_percent: float = 25.0,
+    min_drawdown_percent: float = 15.0,
+) -> PathSignal:
+    """Past-only spike-collapse filter.
+
+    rise_percent is the maximum low-to-later-high rise occurring anywhere
+    inside the trailing window. drawdown_percent is measured from the maximum
+    close in that same window to the latest close.
+
+    This intentionally matches the path_features() definition used by the
+    validated sequential replay.
+    """
+    history = _clean_history(ticker_df, latest_time)
+    if history.empty:
+        return PathSignal(None, None, None, False)
+
+    when = pd.to_datetime(latest_time, utc=True, errors="coerce")
+    if pd.isna(when):
+        return PathSignal(None, None, None, False)
+
+    start = when - pd.Timedelta(minutes=int(window_minutes))
+    window = history[
+        (history["timestamp"] >= start)
+        & (history["timestamp"] <= when)
+    ].copy()
+
+    if window.empty:
+        return PathSignal(None, None, None, False)
+
+    closes = pd.to_numeric(window["close"], errors="coerce")
+    window = window.loc[closes.notna() & (closes > 0)].copy()
+    if window.empty:
+        return PathSignal(None, None, None, False)
+
+    values = pd.to_numeric(window["close"], errors="coerce").astype(float).tolist()
+
+    running_low = values[0]
+    best_rise = 0.0
+    for value in values:
+        if running_low > 0:
+            best_rise = max(
+                best_rise,
+                (value / running_low - 1.0) * 100.0,
+            )
+        running_low = min(running_low, value)
+
+    peak_close = max(values)
+
+    # Replay uses the last occurrence of the maximum.
+    peak_positions = [
+        i for i, value in enumerate(values)
+        if value == peak_close
+    ]
+    peak_position = peak_positions[-1]
+    peak_time = pd.to_datetime(
+        window.iloc[peak_position]["timestamp"],
+        utc=True,
+    )
+
+    current_close = values[-1]
+
+    drawdown = (
+        (peak_close / current_close - 1.0) * 100.0
+        if current_close > 0
+        else None
+    )
+
+    peak_age = (when - peak_time).total_seconds() / 60.0
+
+    # Round threshold comparisons to avoid binary floating-point noise at
+    # exact configured boundaries. This follows the same convention as the
+    # existing LowRise C2X comparisons above.
+    excluded = bool(
+        round(best_rise, 10) >= round(float(min_rise_percent), 10)
+        and drawdown is not None
+        and round(drawdown, 10) >= round(float(min_drawdown_percent), 10)
+    )
+
+    return PathSignal(
+        float(best_rise),
+        float(drawdown) if drawdown is not None else None,
+        float(peak_age),
+        excluded,
+        "spike_collapse_60m" if excluded else None,
+    )
+
 def c2x_hybrid_signal(
     ticker_df: pd.DataFrame,
     latest_time,

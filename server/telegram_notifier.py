@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
-from shared.buy_signals import c2x_hybrid_signal
+from shared.buy_signals import c2x_hybrid_signal, c2x_path_signal
 import yaml
 
 from shared.trading_decisions import (
@@ -636,6 +636,10 @@ def calculate_latest_highb(
     c2x_max_closeb_percent: float = 8.0,
     c2x_max_peak_age_minutes: float = 30.0,
     c2x_max_peak_drawdown_percent: float = 2.0,
+    c2x_spike_collapse_enabled: bool = True,
+    c2x_spike_collapse_window_minutes: int = 60,
+    c2x_spike_collapse_min_rise_percent: float = 25.0,
+    c2x_spike_collapse_min_drawdown_percent: float = 15.0,
 ) -> list[dict]:
     if df.empty:
         return []
@@ -775,6 +779,17 @@ def calculate_latest_highb(
             baseline_days=c2x_baseline_days,
         )
 
+        path_sig = c2x_path_signal(
+            ticker_df,
+            latest_time,
+            window_minutes=c2x_spike_collapse_window_minutes,
+            min_rise_percent=c2x_spike_collapse_min_rise_percent,
+            min_drawdown_percent=c2x_spike_collapse_min_drawdown_percent,
+        )
+        spike_collapse = bool(
+            c2x_spike_collapse_enabled and path_sig.excluded
+        )
+
         # C2X also protects the full CloseB window. A ticker that is already
         # more than the configured percentage above its 2h baseline is too
         # extended to enter, even when the last 30 minutes alone do not trip
@@ -824,7 +839,8 @@ def calculate_latest_highb(
 
         extra_trigger = (
             "closeb_too_high" if closeb_too_high
-            else ("stale_2h_peak" if stale_peak else None)
+            else ("stale_2h_peak" if stale_peak
+                  else (path_sig.trigger if spike_collapse else None))
         )
 
         results.append(
@@ -842,9 +858,15 @@ def calculate_latest_highb(
                 "c2x_peak_time120": peak_time,
                 "c2x_peak_age120_minutes": peak_age_minutes,
                 "c2x_peak_drawdown120_percent": peak_drawdown_percent,
+                "c2x_rise60_percent": path_sig.rise_percent,
+                "c2x_drawdown60_percent": path_sig.drawdown_percent,
+                "c2x_peak_age60_minutes": path_sig.peak_age_minutes,
                 "c2x_trigger": sig.trigger or extra_trigger,
                 "c2x_excluded": bool(
-                    sig.excluded or closeb_too_high or stale_peak
+                    sig.excluded
+                    or closeb_too_high
+                    or stale_peak
+                    or spike_collapse
                 ),
                 "system": latest.get(
                     "system"
@@ -955,6 +977,18 @@ def evaluate_buy(
         ),
         c2x_max_peak_drawdown_percent=float(
             rule.get("c2x_max_peak_drawdown_percent", 2.0)
+        ),
+        c2x_spike_collapse_enabled=bool(
+            rule.get("c2x_spike_collapse_enabled", True)
+        ),
+        c2x_spike_collapse_window_minutes=int(
+            rule.get("c2x_spike_collapse_window_minutes", 60)
+        ),
+        c2x_spike_collapse_min_rise_percent=float(
+            rule.get("c2x_spike_collapse_min_rise_percent", 25.0)
+        ),
+        c2x_spike_collapse_min_drawdown_percent=float(
+            rule.get("c2x_spike_collapse_min_drawdown_percent", 15.0)
         ),
     )
 
