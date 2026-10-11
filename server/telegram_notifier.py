@@ -613,6 +613,15 @@ def c6_holding_preexists_window(
     return bool(buy_ts < window_start)
 
 
+def c6_has_new_market_observation(buy_time, latest_time) -> bool:
+    """Return True only when SELL sees market data newer than the BUY signal."""
+    buy_ts = pd.to_datetime(buy_time, utc=True, errors="coerce")
+    latest_ts = pd.to_datetime(latest_time, utc=True, errors="coerce")
+    if pd.isna(buy_ts) or pd.isna(latest_ts):
+        return False
+    return bool(latest_ts > buy_ts)
+
+
 def inside_trading_window(
     timestamp,
     market_config: dict,
@@ -1402,6 +1411,14 @@ def evaluate_buy(
             )
             continue
 
+        # Require BOTH clocks to be actionable:
+        #
+        # 1. The market-data observation itself must belong to the configured
+        #    BUY window.
+        # 2. The actual notifier action time must still be inside the BUY
+        #    window when the delayed observation is processed.
+        #
+        # This prevents both stale pre-window data and late end-of-day BUYs.
         buy_window = trading_window_info(
             row["latest_time"],
             market_config,
@@ -1410,7 +1427,23 @@ def evaluate_buy(
 
         if not buy_window.is_open:
             logger.info(
-                "BUY skipped %s: outside %s "
+                "BUY skipped %s: market observation outside %s "
+                "preferred BUY window",
+                ticker,
+                market_region,
+            )
+            continue
+
+        buy_action_time = pd.Timestamp.now(tz="UTC")
+        buy_action_window = trading_window_info(
+            buy_action_time,
+            market_config,
+            "buy",
+        )
+
+        if not buy_action_window.is_open:
+            logger.info(
+                "BUY skipped %s: actual action time outside %s "
                 "preferred BUY window",
                 ticker,
                 market_region,
@@ -1433,10 +1466,7 @@ def evaluate_buy(
                 market_timezone = str(
                     market_config.get("timezone") or "UTC"
                 )
-                action_time = pd.to_datetime(
-                    row["latest_time"],
-                    utc=True,
-                )
+                action_time = buy_action_time
                 action_local = action_time.tz_convert(
                     market_timezone
                 )
@@ -2042,6 +2072,19 @@ def evaluate_sell(
             logger.warning("SELL %s skipped: invalid BuyTime=%r", ticker, trade.get("BuyTime"))
             continue
 
+        # BuyTime is the market-data timestamp that generated the BUY.
+        # BuyActionTime is when the simulator actually recorded that BUY.
+        # C6/C7 are wall-clock end-of-day rules, so use the actual action
+        # time when deciding whether the holding predates the liquidation
+        # window. Fall back to BuyTime for older API responses.
+        buy_action_time = pd.to_datetime(
+            trade.get("BuyActionTime"),
+            utc=True,
+            errors="coerce",
+        )
+        if pd.isna(buy_action_time):
+            buy_action_time = buy_time
+
         # C5 is measured in market-open hours, so resolve the ticker's market
         # schedule before evaluating the shared C4/C5 decision.
         market_region = market_region_for_row(
@@ -2168,10 +2211,14 @@ def evaluate_sell(
         # the BUY-side end-of-day block and prevents a fresh BUY from being
         # closed immediately (including BUY and SELL on the same timestamp).
         c6_preexisting_holding = c6_holding_preexists_window(
-            buy_time,
+            buy_action_time,
             action_time,
             c6_remaining_minutes,
             c6_close_minutes,
+        )
+        c6_new_market_observation = c6_has_new_market_observation(
+            buy_time,
+            latest_time,
         )
 
         c6_satisfied = bool(
@@ -2182,6 +2229,7 @@ def evaluate_sell(
             and c6_remaining_minutes is not None
             and 0.0 <= c6_remaining_minutes <= c6_close_minutes
             and c6_preexisting_holding
+            and c6_new_market_observation
             and c6_gain_percent is not None
             and c6_gain_percent < c6_min_gain_percent
         )
@@ -2193,6 +2241,7 @@ def evaluate_sell(
             and c6_remaining_minutes is not None
             and 0.0 <= c6_remaining_minutes <= c6_close_minutes
             and c6_preexisting_holding
+            and c6_new_market_observation
             and c6_gain_percent is not None
             and c6_gain_percent > c7_max_gain_percent
         )
