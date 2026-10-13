@@ -11,7 +11,7 @@ recipients:
   chat_id: '8370155930'
 buy:
   enabled: true
-  minimum_closeb_count: 5
+  minimum_closeb_count: 6
   minimum_closeb_percent: 1.5
   highb_threshold_percent: 3.0
   baseline_hours: 2
